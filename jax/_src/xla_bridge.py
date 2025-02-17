@@ -201,7 +201,7 @@ _plugin_callback_lock = threading.Lock()
 _nonexperimental_plugins: set[str] = {'cuda', 'rocm'}
 
 # The set of known experimental plugins that have registrations in JAX codebase.
-_experimental_plugins: set[str] = {"METAL"}
+_experimental_plugins: set[str] = {"METAL", "neuron"}
 
 def register_backend_factory(name: str, factory: BackendFactory, *,
                              priority: int = 0,

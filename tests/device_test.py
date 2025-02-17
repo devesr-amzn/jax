@@ -37,6 +37,9 @@ class DeviceTest(jtu.JaxTestCase):
     elif jtu.test_device_matches(['cpu']):
       self.assertEqual(device.platform, 'cpu')
       self.assertEqual(repr(device), 'CpuDevice(id=0)')
+    elif jtu.is_device_neuron():
+      self.assertEqual(device.platform, 'neuron')
+      self.assertEqual(repr(device), 'NeuronCore(id=0)')
 
   def test_str(self):
     device = jax.devices()[0]
@@ -48,6 +51,9 @@ class DeviceTest(jtu.JaxTestCase):
       self.assertEqual(str(device), 'TPU_0(process=0,(0,0,0,0))')
     elif jtu.test_device_matches(['cpu']):
       self.assertEqual(str(device), 'TFRT_CPU_0')
+    elif jtu.is_device_neuron():
+      self.assertEqual(device.platform, 'neuron')
+      self.assertEqual(str(device), 'NeuronCore(id=0, process_index=0, local_id=0)')
 
 
 if __name__ == '__main__':

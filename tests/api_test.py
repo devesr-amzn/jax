@@ -331,6 +331,7 @@ class JitTest(jtu.BufferDonationTestCase):
     self.assertEqual(result.device.platform, jax.default_backend())
     self.assertEqual(result.device, jax.local_devices()[0])
 
+  @jtu.skip_on_devices("neuron")
   def test_complex_support(self):
     self.assertEqual(jit(lambda x: x + 1)(1 + 1j), 2 + 1j)
 
@@ -2079,6 +2080,7 @@ class APITest(jtu.JaxTestCase):
     f = lambda x: jnp.tanh(jnp.dot(A, x))
     assert np.allclose(jacfwd(f)(x), jacrev(f)(x))
 
+  @jtu.skip_on_devices("neuron")
   @jax.default_matmul_precision("float32")
   def test_hessian(self):
     R = self.rng().randn
@@ -2088,6 +2090,7 @@ class APITest(jtu.JaxTestCase):
     f = lambda x: jnp.dot(x, jnp.dot(A, x))
     assert np.allclose(hessian(f)(x), A + A.T)
 
+  @jtu.skip_on_devices("neuron")
   @jax.default_matmul_precision("float32")
   def test_hessian_holomorphic(self):
     R = self.rng().randn
@@ -2097,6 +2100,7 @@ class APITest(jtu.JaxTestCase):
     f = lambda x: jnp.dot(x, jnp.dot(A.astype(x.dtype), x))
     assert np.allclose(hessian(f, holomorphic=True)(x), A + A.T)
 
+  @jtu.skip_on_devices("neuron")
   @jax.default_matmul_precision("float32")
   def test_hessian_aux(self):
     R = self.rng().randn
@@ -2429,6 +2433,7 @@ class APITest(jtu.JaxTestCase):
     with self.assertRaisesRegex(TypeError, "cotangent type does not match"):
       transpose_fun(1j)
 
+  @jtu.skip_on_devices("neuron")
   def test_linear_transpose_complex(self):
     f = lambda x: (1 + 2j) * x
     transpose = api.linear_transpose(f, 1j)
@@ -2443,6 +2448,7 @@ class APITest(jtu.JaxTestCase):
     expected = [3., 0.]
     self.assertEqual(actual, expected)
 
+  @jtu.skip_on_devices("neuron")
   def test_complex_grad_raises_error(self):
     self.assertRaises(TypeError, lambda: grad(lambda x: jnp.sin(x))(1 + 2j))
 
@@ -2451,6 +2457,7 @@ class APITest(jtu.JaxTestCase):
     expected = 2.0327230070196656 - 3.0518977991518j
     self.assertAllClose(out, expected, check_dtypes=False)
 
+  @jtu.skip_on_devices("neuron")
   def test_nonholomorphic_grad(self):
     zs = 0.5j * np.arange(5) + np.arange(5)
 
@@ -2467,9 +2474,11 @@ class APITest(jtu.JaxTestCase):
                         atol=jtu.default_gradient_tolerance,
                         rtol=jtu.default_gradient_tolerance)
 
+  @jtu.skip_on_devices("neuron")
   def test_complex_output_jacrev_raises_error(self):
     self.assertRaises(TypeError, lambda: jacrev(lambda x: jnp.sin(x))(1 + 2j))
 
+  @jtu.skip_on_devices("neuron")
   def test_nonholomorphic_jacrev(self):
     # code based on https://github.com/jax-ml/jax/issues/603
     zs = 0.5j * np.arange(5) + np.arange(5)
@@ -2521,6 +2530,7 @@ class APITest(jtu.JaxTestCase):
     jtu._check_dtypes_match(actual, desired)
     jtu.check_eq(actual, desired)
 
+  @jtu.skip_on_devices("neuron")
   def test_heterogeneous_grad(self):
     # See https://github.com/jax-ml/jax/issues/7157
     x = np.array(1.0+1j)
@@ -2544,6 +2554,7 @@ class APITest(jtu.JaxTestCase):
     dx = device_put(3.)
     str(dx.item())  # doesn't crash
 
+  @jtu.skip_on_devices("neuron")
   def test_devicearray_repr(self):
     x = device_put(jnp.zeros(3))
     _check_instance(self, x)
@@ -2926,6 +2937,7 @@ class APITest(jtu.JaxTestCase):
       # dispatch via lax
       _ = lax.add(float0_array, jnp.zeros(()))
 
+  @jtu.skip_on_devices("neuron")
   def test_grad_complex_result_errors(self):
     dfn = grad(lambda x: x ** 2 + 1j)
     self.assertRaisesRegex(
@@ -2934,6 +2946,7 @@ class APITest(jtu.JaxTestCase):
        r"sub-dtype of np.floating\), but got complex.*"),
       lambda: dfn(3.))
 
+  @jtu.skip_on_devices("neuron")
   def test_holomorphic_grad_of_float_errors(self):
     dfn = grad(lambda x: x ** 2, holomorphic=True)
     self.assertRaisesRegex(
@@ -2996,6 +3009,8 @@ class APITest(jtu.JaxTestCase):
 
   def test_dtype_from_builtin_types(self):
     for dtype in [bool, int, float, complex]:
+      if dtype == complex and jtu.device_under_test() == "neuron":
+        continue
       with self.assertNoWarnings():
         x = jnp.array(0, dtype=dtype)
       self.assertEqual(x.dtype, dtypes.canonicalize_dtype(dtype))
@@ -4355,6 +4370,7 @@ class APITest(jtu.JaxTestCase):
     self.assertEqual(inner_count, 1)
     self.assertEqual(outer_count, 1)
 
+  @jtu.skip_on_devices("neuron")
   def test_grad_conj_symbolic_zeros(self):
     # https://github.com/jax-ml/jax/issues/15400
     f = lambda x: jax.jit(lambda x, y: (x, y))(x, jax.lax.conj(x))[0]

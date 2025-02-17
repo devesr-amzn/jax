@@ -385,6 +385,11 @@ def supported_dtypes():
              _dtypes.float8_e5m2}
   elif device_under_test() == "METAL":
     types = {np.int32, np.uint32, np.float32}
+  elif device_under_test() == "neuron":
+    types = {np.bool_, np.int8, np.int16, np.int32, np.int64,
+             np.uint8, np.uint16, np.uint32, np.uint64,
+             _dtypes.bfloat16, np.float16, np.float32, np.float64,
+             _dtypes.float8_e4m3}
   else:
     types = {np.bool_, np.int8, np.int16, np.int32, np.int64,
              np.uint8, np.uint16, np.uint32, np.uint64,
@@ -399,6 +404,9 @@ def is_device_rocm():
 
 def is_device_cuda():
   return 'cuda' in xla_bridge.get_backend().platform_version
+
+def is_device_neuron():
+  return 'neuron' in xla_bridge.get_backend().platform_version
 
 def is_cloud_tpu():
   return running_in_cloud_tpu_vm
