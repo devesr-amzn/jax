@@ -389,7 +389,7 @@ def supported_dtypes():
     types = {np.bool_, np.int8, np.int16, np.int32, np.int64,
              np.uint8, np.uint16, np.uint32, np.uint64,
              _dtypes.bfloat16, np.float16, np.float32, np.float64,
-             _dtypes.float8_e4m3}
+             _dtypes.float8_e4m3, _dtypes.float8_e4m3fn}
   else:
     types = {np.bool_, np.int8, np.int16, np.int32, np.int64,
              np.uint8, np.uint16, np.uint32, np.uint64,
