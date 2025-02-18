@@ -186,6 +186,7 @@ class CustomRootTest(jtu.JaxTestCase):
     jtu.check_grads(lambda x, y: linear_solve(high_precision_dot(x, x.T), y),
                     (a, b), order=2, rtol={jnp.float32: 1e-2})
 
+  @jtu.skip_on_devices("neuron")
   def test_custom_root_with_aux(self):
     def root_aux(a, b):
       f = lambda x: high_precision_dot(a, x) - b

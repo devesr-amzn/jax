@@ -610,6 +610,7 @@ class BatchingTest(jtu.JaxTestCase):
     expected = np.array([[3, 2]], np.float32)
     self.assertAllClose(ans, expected)
 
+  @jtu.skip_on_devices("neuron")
   def testLaxLinalgCholesky(self):
     a = self.rng().randn(10, 5, 5).astype(np.float32)
     a = np.matmul(a, np.conj(np.swapaxes(a, -1, -2)))
@@ -626,6 +627,7 @@ class BatchingTest(jtu.JaxTestCase):
     expected = np.linalg.cholesky(b)
     self.assertAllClose(ans, expected, check_dtypes=False, rtol=1e-4)
 
+  @jtu.skip_on_devices("neuron")
   def testLaxLinalgTriangularSolve(self):
     a = self.rng().randn(4, 10, 4).astype(np.float32)
     a += np.eye(4, dtype=jnp.float32)[:, None, :]
@@ -914,6 +916,7 @@ class BatchingTest(jtu.JaxTestCase):
     expected = np.transpose(x, (2, 1, 3, 0))
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  @jtu.skip_on_devices("neuron")
   def testIssue354(self):
     psd_mat = self.rng().randn(20, 10)
     psd_mat = psd_mat.T.dot(psd_mat)

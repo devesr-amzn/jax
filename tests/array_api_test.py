@@ -333,6 +333,7 @@ class ArrayAPIErrors(absltest.TestCase):
 
   # TODO(micky774): Remove when jnp.clip deprecation is completed
   # (began 2024-4-2) and default behavior is Array API 2023 compliant
+  @jtu.skip_on_devices("neuron")
   def test_clip_complex(self):
     x = ARRAY_API_NAMESPACE.arange(5, dtype=ARRAY_API_NAMESPACE.complex64)
     complex_msg = "Complex values have no ordering and cannot be clipped"

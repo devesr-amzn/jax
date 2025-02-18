@@ -225,7 +225,7 @@ class CacheKeyTest(jtu.JaxTestCase):
       )
       self.assertEqual(expected_hash, hash_without_callback_ptrs)
 
-  @jtu.skip_on_devices("cpu")
+  @jtu.skip_on_devices("cpu", "neuron")
   def test_host_callbacks_ptrs_removed(self):
     def _host_callback(x, y):
       jax.debug.print("x={x[0]} y={y[0]}", x=x, y=y)

@@ -133,6 +133,8 @@ class DtypesTest(jtu.JaxTestCase):
     for type_ in python_scalar_types)
   def testDefaultTypes(self, type_):
     expected_dtype = dtypes.canonicalize_dtype(dtypes.python_scalar_dtypes[type_])
+    if expected_dtype == jnp.complex64 and jtu.test_device_matches(['neuron']):
+      self.skipTest("Neuron does not support complex Dtypes.")
     for f in [jnp.array, jax.jit(jnp.array), jax.jit(lambda x: x)]:
       y = f(type_(0))
       self.assertTrue(isinstance(y, jax.Array), msg=(f, y))
@@ -285,6 +287,8 @@ class DtypesTest(jtu.JaxTestCase):
 
   @parameterized.parameters([jnp.bool_, jnp.int32, jnp.bfloat16, jnp.float32, jnp.complex64])
   def testScalarInstantiation(self, scalar_type):
+    if scalar_type == jnp.complex64 and jtu.test_device_matches(['neuron']):
+      self.skipTest("Neuron does not support complex Dtypes.")
     a = scalar_type(1)
     self.assertEqual(a.dtype, jnp.dtype(scalar_type))
     self.assertIsInstance(a, jax.Array)
@@ -354,6 +358,8 @@ class DtypesTest(jtu.JaxTestCase):
 
   def testArrayCasts(self):
     for t in [jnp.bool_, jnp.int32, jnp.bfloat16, jnp.float32, jnp.complex64]:
+      if t == jnp.complex64 and jtu.test_device_matches(['neuron']):
+        continue
       a = np.array([1, 2.5, -3.7])
       self.assertEqual(a.astype(t).dtype, jnp.dtype(t))
       self.assertEqual(jnp.array(a).astype(t).dtype, jnp.dtype(t))
@@ -403,7 +409,8 @@ class DtypesTest(jtu.JaxTestCase):
     self.assertEqual(dtypes.int_, np.int32 if precision == '32' else np.int64)
     self.assertEqual(dtypes.uint, np.uint32 if precision == '32' else np.uint64)
     self.assertEqual(dtypes.float_, np.float32 if precision == '32' else np.float64)
-    self.assertEqual(dtypes.complex_, np.complex64 if precision == '32' else np.complex128)
+    if not jtu.test_device_matches(['neuron']):
+      self.assertEqual(dtypes.complex_, np.complex64 if precision == '32' else np.complex128)
 
   def test_check_dtype_non_hashable(self):
     # regression test for issue with checking non-hashable custom dtype
