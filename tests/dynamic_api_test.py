@@ -1549,6 +1549,7 @@ class JumbleTest(jtu.JaxTestCase):
       self.assertAllClose(y, np.tile(np.array([3, 1, 4])[:, None, None], (7, 7)),
                           check_dtypes=False)
 
+  @jtu.skip_on_devices("neuron")
   @parameterized.parameters((True,), (False,))
   def test_jumble_map_matrix_dot_ragged_tensor(self, disable_jit):
     with jax.disable_jit(disable_jit):
@@ -1653,6 +1654,7 @@ class JumbleTest(jtu.JaxTestCase):
     data = jax.lax.broadcasted_iota('int32', (3, 5, 7), 1)
     self.assertAllClose(p.data, data)
 
+  @jtu.skip_on_devices("neuron")
   def test_einsum_with_ragged_tensor_dimension(self):
     x_sizes = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
     def fprop_layer(x_size):
@@ -1666,6 +1668,7 @@ class JumbleTest(jtu.JaxTestCase):
     self.assertRegex(str(p.aval), r'Var[0-9]+:3 => i32\[3,bint\{≤5\}\[3\] with value: \[3 1 4\]\.Var[0-9]+,2,7\]')
     self.assertEqual(p.data.shape, (3, 3, 5, 2, 7))
 
+  @jtu.skip_on_devices("neuron")
   @parameterized.parameters((True,), (False,))
   def test_einsum_with_ragged_tensor_and_contract_dimensions(self, disable_jit):
     with jax.disable_jit(disable_jit):

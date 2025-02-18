@@ -507,7 +507,7 @@ register_pytree_node_serialization(
 def default_export_platform() -> str:
   """Retrieves the default export platform.
 
-  One of: `tpu`, `cpu`, `cuda`, `rocm`.
+  One of: `tpu`, `cpu`, `cuda`, `rocm`, `neuron`.
   """
   # Canonicalize to turn 'gpu' into 'cuda' or 'rocm'
   return xb.canonicalize_platform(jax.default_backend())

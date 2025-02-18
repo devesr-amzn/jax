@@ -53,7 +53,7 @@ class PrimitiveTest(jtu.JaxTestCase):
     # Pick one device from each available platform
     self.devices = []
     self.platforms = []
-    for backend in ["cpu", "gpu", "tpu"]:
+    for backend in ["cpu", "gpu", "tpu", "neuron"]:
       try:
         devices = jax.devices(backend)
       except RuntimeError:
@@ -136,7 +136,7 @@ class PrimitiveTest(jtu.JaxTestCase):
         gpu_platform = "rocm"
     lowering_platforms: list[str] = [
         p if p != "gpu" else gpu_platform
-        for p in ("cpu", "gpu", "tpu")
+        for p in ("cpu", "gpu", "tpu", "neuron")
         if p not in unimplemented_platforms
     ]
 
