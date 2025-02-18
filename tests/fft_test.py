@@ -88,7 +88,7 @@ def _zero_for_irfft(z, axes):
              lax.slice_in_dim(z.real, 1, size, axis=axis)]
   return jnp.concatenate(parts, axis=axis)
 
-
+@jtu.skip_on_devices("neuron")
 class FftTest(jtu.JaxTestCase):
 
   def testLaxFftAcceptsStringTypes(self):

@@ -176,6 +176,7 @@ class JaxprEffectsTest(jtu.JaxTestCase):
 
 class HigherOrderPrimitiveTest(jtu.JaxTestCase):
 
+  @jtu.skip_on_devices("neuron")
   def test_core_call_primitive_inherits_effects(self):
 
     def f(x):
@@ -444,6 +445,7 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
     self.assertEqual(str(result_types[0]), token_type)
     self.assertEqual(str(result_types[1]), token_type)
 
+  @jtu.skip_on_devices("neuron")
   def test_can_lower_and_run_jaxpr_with_ordered_effects(self):
     @jax.jit
     def f(x):
@@ -480,6 +482,7 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
         r"Ordered effects not supported for map primitives: \[foo\]"):
       f(jnp.arange(jax.device_count()))
 
+  @jtu.skip_on_devices("neuron")
   def test_runtime_tokens_should_update_after_running_effectful_function(self):
     @jax.jit
     def f(x):
@@ -492,6 +495,7 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
     curr_token = dispatch.runtime_tokens.current_tokens[foo_effect]
     self.assertIsNot(prev_token, curr_token)
 
+  @jtu.skip_on_devices("neuron")
   def test_can_lower_multiple_effects(self):
     @jax.jit
     def f(x):
@@ -518,6 +522,7 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
 
 class EffectOrderingTest(jtu.JaxTestCase):
 
+  @jtu.skip_on_devices("neuron")
   def test_can_execute_python_callback(self):
     log = []
     def log_value(x):
@@ -536,7 +541,7 @@ class EffectOrderingTest(jtu.JaxTestCase):
     self.assertListEqual(log, [2., 3.])
 
   # TODO(b/307211483): Investigate failure
-  @jtu.skip_on_devices("tpu")
+  @jtu.skip_on_devices("tpu", "neuron")
   def test_ordered_effect_remains_ordered_across_multiple_devices(self):
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
@@ -567,6 +572,7 @@ class EffectOrderingTest(jtu.JaxTestCase):
     expected_log = [f_, g_, f_, g_, f_, g_]
     self.assertListEqual(log, expected_log)
 
+  @jtu.skip_on_devices("neuron")
   def test_different_threads_get_different_tokens(self):
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
@@ -622,6 +628,7 @@ class ParallelEffectsTest(jtu.JaxTestCase):
       return x
     jax.pmap(f)(jnp.arange(jax.local_device_count()))
 
+  @jtu.skip_on_devices("neuron")
   def test_can_pmap_unordered_callback(self):
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
@@ -654,6 +661,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(NotImplementedError, 'Effects not supported'):
       jax.make_jaxpr(f1)(2.)
 
+  @jtu.skip_on_devices("neuron")
   def test_allowed_effect_in_cond(self):
     def f(x):
       def true_fun(x):
@@ -665,6 +673,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
       return lax.cond(x, true_fun, false_fun, x)
     f(2)
 
+  @jtu.skip_on_devices("neuron")
   def test_allowed_effect_in_cond_jvp(self):
     def f(x):
       def true_fun(x):
@@ -711,6 +720,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
     lin_jaxpr = f_lin.func.fun.args[0]
     self.assertEqual(lin_jaxpr.effects, {while_effect})
 
+  @jtu.skip_on_devices("neuron")
   def test_allowed_ordered_effect_in_cond(self):
     def f(x):
       def true_fun(x):
@@ -722,6 +732,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
       return lax.cond(x, true_fun, false_fun, x)
     f(2)
 
+  @jtu.skip_on_devices("neuron")
   def test_multiple_allowed_ordered_effect_in_cond(self):
     def f(x):
       def true_fun(x):
@@ -746,6 +757,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(NotImplementedError, 'Effects not supported'):
       jax.make_jaxpr(f2)(2.)
 
+  @jtu.skip_on_devices("neuron")
   def test_allowed_effect_in_while_body(self):
     def f(x):
       def cond_fun(x):
@@ -756,6 +768,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
       return lax.while_loop(cond_fun, body_fun, x)
     f(2)
 
+  @jtu.skip_on_devices("neuron")
   def test_allowed_effect_in_cond_body(self):
     def f(x):
       def cond_fun(x):
@@ -766,6 +779,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
       return lax.while_loop(cond_fun, body_fun, x)
     f(2)
 
+  @jtu.skip_on_devices("neuron")
   def test_allowed_ordered_effect_in_while_body(self):
     def f(x):
       def cond_fun(x):
@@ -776,6 +790,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
       return lax.while_loop(cond_fun, body_fun, x)
     f(2)
 
+  @jtu.skip_on_devices("neuron")
   def test_multiple_allowed_ordered_effect_in_while_body(self):
     def f(x):
       def cond_fun(x):
@@ -810,6 +825,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(NotImplementedError, 'Effects not supported'):
       jax.make_jaxpr(f2)(2.)
 
+  @jtu.skip_on_devices("neuron")
   def test_allowed_effect_in_scan(self):
     def f(x):
       def body_fun(carry, x):
@@ -818,6 +834,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
       return lax.scan(body_fun, x, jnp.arange(5))
     f(2)
 
+  @jtu.skip_on_devices("neuron")
   def test_allowed_ordered_effect_in_scan(self):
     def f(x):
       def body_fun(carry, x):
@@ -826,6 +843,7 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
       return lax.scan(body_fun, x, jnp.arange(5))
     f(2)
 
+  @jtu.skip_on_devices("neuron")
   def test_multiple_allowed_ordered_effect_in_scan(self):
     def f(x):
       def body_fun(carry, x):

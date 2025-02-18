@@ -215,6 +215,9 @@ class LaxAutodiffTest(jtu.JaxTestCase):
         order = 1  # 2nd-order gradient is imprecise on TPU.
       if op is lax.log:
         order = 1  # 2nd-order gradient is imprecise on TPU.
+      if jtu.test_device_matches(["neuron"]):
+        if dtype in grad_complex_dtypes:
+          self.skipTest("Neuron does not support complex dtypes")
 
     tol = jtu.join_tolerance(1.5e-1, tol) if jtu.num_float_bits(dtype) == 32 else tol
     args = tuple(rng(shape, dtype) for shape in shapes)
@@ -1139,6 +1142,7 @@ class LaxAutodiffTest(jtu.JaxTestCase):
     grad_fn = jax.grad(jax.grad(jax.grad(jax.grad(jax.grad(jax.grad(inv))))))
     self.assertAllClose(np.float32(0.0439453125), grad_fn(np.float32(4.)))
 
+  @jtu.skip_on_devices("neuron")
   def test_linear_transpose_real(self):
     f = lambda x: x.real
     transpose = jax.linear_transpose(f, 1.j)

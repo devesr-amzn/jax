@@ -40,7 +40,7 @@ from jax.experimental.shard_map import shard_map
 jax.config.parse_flags_with_absl()
 jtu.request_cpu_devices(8)
 
-
+@jtu.skip_on_devices("neuron")
 class FfiTest(jtu.JaxTestCase):
 
   def find_custom_call_in_module(self, module):

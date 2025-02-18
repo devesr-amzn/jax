@@ -137,10 +137,12 @@ class JaxJitTest(jtu.JaxTestCase):
     # Complex
     if not (config.enable_x64.value and jtu.test_device_matches(["tpu"])):
       # No TPU support for complex128.
-      res = np.asarray(_cpp_device_put(1 + 1j, device))
-      self.assertEqual(res, 1 + 1j)
-      self.assertEqual(res.dtype, complex_type)
-      self.assertEqual(jnp.asarray(1 + 1j).dtype, res.dtype)
+      if not jtu.test_device_matches(["neuron"]):
+        # No neuron support for complex.
+        res = np.asarray(_cpp_device_put(1 + 1j, device))
+        self.assertEqual(res, 1 + 1j)
+        self.assertEqual(res.dtype, complex_type)
+        self.assertEqual(jnp.asarray(1 + 1j).dtype, res.dtype)
 
   def test_arg_signature_of_value(self):
     """Tests the C++ code-path."""
@@ -190,13 +192,15 @@ class JaxJitTest(jtu.JaxTestCase):
       self.assertEqual(signature.shape, ())
       self.assertTrue(signature.weak_type)
     # Complex
-    if not (jax_enable_x64 and jtu.test_device_matches(["tpu"])):
+    if not (config.enable_x64.value and jtu.test_device_matches(["tpu"])):
       # No TPU support for complex128.
-      signature = jaxlib.jax_jit._ArgSignatureOfValue(1 + 1j, jax_enable_x64)
-      self.assertEqual(signature.dtype, jax.device_put(1 + 1j).dtype)
-      self.assertEqual(signature.dtype, complex_type)
-      self.assertEqual(signature.shape, ())
-      self.assertTrue(signature.weak_type)
+      if not jtu.test_device_matches(["neuron"]):
+        # No neuron support for complex.
+        signature = jaxlib.jax_jit._ArgSignatureOfValue(1 + 1j, jax_enable_x64)
+        self.assertEqual(signature.dtype, jax.device_put(1 + 1j).dtype)
+        self.assertEqual(signature.dtype, complex_type)
+        self.assertEqual(signature.shape, ())
+        self.assertTrue(signature.weak_type)
 
   def test_signature_support(self):
     def f(a, b, c):
