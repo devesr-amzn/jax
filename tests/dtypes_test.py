@@ -814,6 +814,8 @@ class TestPromotionTables(jtu.JaxTestCase):
       {"testcase_name": f"_{typ}", "typ": typ}
        for typ in [bool, int, float, complex])
   def testScalarWeakTypes(self, typ):
+    if typ in complex_dtypes and jtu.test_device_matches(['neuron']):
+      self.skipTest("Neuron does not support complex Dtypes.")
     # Regression test for https://github.com/jax-ml/jax/issues/11377
     val = typ(0)
 
@@ -953,11 +955,15 @@ class TestPromotionTables(jtu.JaxTestCase):
     for weak_type in [True, False]
   )
   def testUnaryPromotion(self, dtype, weak_type):
+    if dtype in complex_dtypes and jtu.test_device_matches(['neuron']):
+      self.skipTest("Neuron does not support complex Dtypes.")
     # Regression test for https://github.com/jax-ml/jax/issues/6051
     if dtype in intn_dtypes:
       self.skipTest("XLA support for int2 and int4 is incomplete.")
     if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu']):
       self.skipTest("TPU does not support float8_e8m0fnu.")
+    if dtype in fp8_dtypes and dtype not in (dtypes.float8_e4m3, dtypes.float8_e4m3fn) and jtu.test_device_matches(['neuron']):
+      self.skipTest(f'{dtype} is not supported on neuron')
     x = lax_internal._convert_element_type(0, dtype, weak_type=weak_type)
     if weak_type:
       expected = dtypes.canonicalize_dtype(
@@ -971,6 +977,8 @@ class TestPromotionTables(jtu.JaxTestCase):
     for dtype in fp8_dtypes:
       if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu']):
         # TPU does not support float8_e8m0fnu.
+        continue
+      if dtype in fp8_dtypes and dtype not in (dtypes.float8_e4m3, dtypes.float8_e4m3fn) and jtu.test_device_matches(['neuron']):
         continue
       x = jnp.array(1, dtype=dtype)
       y = jnp.array(1, dtype='float32')
@@ -1027,13 +1035,17 @@ class TestPromotionTables(jtu.JaxTestCase):
 
   @parameterized.product(dtype=all_dtypes, weak_type=[True, False])
   def testArrayRepr(self, dtype, weak_type):
+    if dtype in complex_dtypes and jtu.test_device_matches(['neuron']):
+      self.skipTest("Neuron does not support complex Dtypes.")
     if dtype in intn_dtypes:
       if not jtu.test_device_matches(['tpu']):
         self.skipTest('XLA support for int4 is incomplete.')
       if dtypes.iinfo(dtype).bits == 2:
         self.skipTest('XLA support for int2 is incomplete.')
-    if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu']):
-      self.skipTest('TPU does not support float8_e8m0fnu.')
+    if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu', 'neuron']):
+      self.skipTest('TPU and neuron do not support float8_e8m0fnu.')
+    if dtype in fp8_dtypes and dtype not in (dtypes.float8_e4m3, dtypes.float8_e4m3fn) and jtu.test_device_matches(['neuron']):
+      self.skipTest(f'{dtype} is not supported on neuron')
     val = lax_internal._convert_element_type(0, dtype, weak_type=weak_type)
     rep = repr(val)
     self.assertStartsWith(rep, 'Array(')
