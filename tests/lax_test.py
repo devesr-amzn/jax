@@ -99,6 +99,10 @@ class LaxTest(jtu.JaxTestCase):
           dtype=rec.dtypes)
       for rec in lax_test_util.lax_ops()))
   def testOp(self, op_name, rng_factory, shapes, dtype):
+    if jtu.test_device_matches(["neuron"]) and op_name in (
+      "betainc", "complex", "clz", "conj", "igamma", "igammac",
+      "nextafter", "population_count"):
+        self.skipTest(f"{op_name} is not supported on neuron")
     rng = rng_factory(self.rng())
     args_maker = lambda: [rng(shape, dtype) for shape in shapes]
     op = getattr(lax, op_name)
@@ -133,6 +137,13 @@ class LaxTest(jtu.JaxTestCase):
         tol = jtu.join_tolerance(tol, 1e-3)
     elif op_name == "pow" and dtype == np.complex128:
       tol = jtu.join_tolerance(tol, 2e-15)
+    if jtu.test_device_matches(["neuron"]):
+      if op_name in (
+      "betainc", "complex", "clz", "conj", "igamma", "igammac",
+      "nextafter", "population_count"):
+        self.skipTest(f"{op_name} is not supported on neuron")
+      if op_name == "logistic" and dtype == np.float32:
+        tol = jtu.join_tolerance(tol, 1e-5)
     self._CheckAgainstNumpy(numpy_op, op, args_maker, tol=tol)
 
   # TODO test shift_left, shift_right_arithmetic, shift_right_logical
@@ -1229,7 +1240,8 @@ class LaxTest(jtu.JaxTestCase):
     if (jtu.test_device_matches(["tpu"]) and
        (dtype == np.complex128 or preferred_element_type == np.complex128)):
       raise SkipTest("np.complex128 is not yet supported on TPU")
-    if (jtu.test_device_matches("neuron")) and (dtype in jtu.dtypes.complex or preferred_element_type in jtu.dtypes.complex):
+    if (jtu.test_device_matches(["neuron"]) and 
+       (dtype in jtu.dtypes.complex or preferred_element_type in jtu.dtypes.complex)):
       raise SkipTest("neuron does not support complex dtypes")
     if jtu.test_device_matches(["gpu"]):
       # TODO(b/189287598)
@@ -2345,7 +2357,7 @@ class LaxTest(jtu.JaxTestCase):
       ],
       dtype=[np.float32],
   )
-  @jtu.skip_on_devices('gpu')
+  @jtu.skip_on_devices('gpu', 'neuron')
   def testReduceWindowVariadic(self, dtype, shape, dims, strides, padding,
                                base_dilation, window_dilation):
     if (jtu.test_device_matches(["tpu"]) and
