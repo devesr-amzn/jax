@@ -134,7 +134,7 @@ class DtypesTest(jtu.JaxTestCase):
   def testDefaultTypes(self, type_):
     expected_dtype = dtypes.canonicalize_dtype(dtypes.python_scalar_dtypes[type_])
     if expected_dtype == jnp.complex64 and jtu.test_device_matches(['neuron']):
-      self.skipTest("Neuron does not support complex Dtypes.")
+      self.skipTest("neuron does not support complex dtypes")
     for f in [jnp.array, jax.jit(jnp.array), jax.jit(lambda x: x)]:
       y = f(type_(0))
       self.assertTrue(isinstance(y, jax.Array), msg=(f, y))
@@ -288,7 +288,7 @@ class DtypesTest(jtu.JaxTestCase):
   @parameterized.parameters([jnp.bool_, jnp.int32, jnp.bfloat16, jnp.float32, jnp.complex64])
   def testScalarInstantiation(self, scalar_type):
     if scalar_type == jnp.complex64 and jtu.test_device_matches(['neuron']):
-      self.skipTest("Neuron does not support complex Dtypes.")
+      self.skipTest("neuron does not support complex dtypes")
     a = scalar_type(1)
     self.assertEqual(a.dtype, jnp.dtype(scalar_type))
     self.assertIsInstance(a, jax.Array)
@@ -815,7 +815,7 @@ class TestPromotionTables(jtu.JaxTestCase):
        for typ in [bool, int, float, complex])
   def testScalarWeakTypes(self, typ):
     if typ in complex_dtypes and jtu.test_device_matches(['neuron']):
-      self.skipTest("Neuron does not support complex Dtypes.")
+      self.skipTest("neuron does not support complex dtypes")
     # Regression test for https://github.com/jax-ml/jax/issues/11377
     val = typ(0)
 
@@ -956,7 +956,7 @@ class TestPromotionTables(jtu.JaxTestCase):
   )
   def testUnaryPromotion(self, dtype, weak_type):
     if dtype in complex_dtypes and jtu.test_device_matches(['neuron']):
-      self.skipTest("Neuron does not support complex Dtypes.")
+      self.skipTest("neuron does not support complex dtypes")
     # Regression test for https://github.com/jax-ml/jax/issues/6051
     if dtype in intn_dtypes:
       self.skipTest("XLA support for int2 and int4 is incomplete.")
@@ -1036,7 +1036,7 @@ class TestPromotionTables(jtu.JaxTestCase):
   @parameterized.product(dtype=all_dtypes, weak_type=[True, False])
   def testArrayRepr(self, dtype, weak_type):
     if dtype in complex_dtypes and jtu.test_device_matches(['neuron']):
-      self.skipTest("Neuron does not support complex Dtypes.")
+      self.skipTest("neuron does not support complex dtypes")
     if dtype in intn_dtypes:
       if not jtu.test_device_matches(['tpu']):
         self.skipTest('XLA support for int4 is incomplete.')

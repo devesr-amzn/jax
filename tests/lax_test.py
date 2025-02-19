@@ -1229,6 +1229,8 @@ class LaxTest(jtu.JaxTestCase):
     if (jtu.test_device_matches(["tpu"]) and
        (dtype == np.complex128 or preferred_element_type == np.complex128)):
       raise SkipTest("np.complex128 is not yet supported on TPU")
+    if (jtu.test_device_matches("neuron")) and (dtype in jtu.dtypes.complex or preferred_element_type in jtu.dtypes.complex):
+      raise SkipTest("neuron does not support complex dtypes")
     if jtu.test_device_matches(["gpu"]):
       # TODO(b/189287598)
       raise SkipTest("dot_general with preferred_element_type returns NaN "
@@ -3565,6 +3567,7 @@ class LaxTest(jtu.JaxTestCase):
 
     jax.hessian(f)(1.0)  # don't crash
 
+  @jtu.skip_on_devices("neuron")
   def test_constant_folding_complex_to_real_scan_regression(self):
     # regression test for github.com/jax-ml/jax/issues/19059
     def g(hiddens):

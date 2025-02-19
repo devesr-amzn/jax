@@ -255,7 +255,7 @@ class EinsumTest(jtu.JaxTestCase):
       for dtype in [jnp.float32, jnp.int32, jnp.complex64, jnp.bool_])
   def test_from_dask(self, einstr, dtype):
     if dtype == jnp.complex64 and jtu.test_device_matches(["neuron"]):
-      self.skipTest("Neuron does not support complex dtypes")
+      self.skipTest("neuron does not support complex dtypes")
     r = jtu.rand_default(self.rng())
     if '->' in einstr:
       input_str, result_names = einstr.split('->')

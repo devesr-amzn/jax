@@ -6194,6 +6194,8 @@ class NumpyGradTests(jtu.JaxTestCase):
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
   @jax.numpy_dtype_promotion('standard')  # This test explicitly exercises mixed type promotion
   def testOpGrad(self, op, rng_factory, shapes, dtype, order, tol):
+    if dtype in complex_dtypes and jtu.test_device_matches("neuron"):
+      self.skipTest("neuron does not support complex dtypes")
     rng = rng_factory(self.rng())
     tol = jtu.join_tolerance(tol, {np.float32: 1e-1, np.float64: 1e-3,
                                    np.complex64: 1e-1, np.complex128: 1e-3})
@@ -6254,6 +6256,7 @@ class NumpyGradTests(jtu.JaxTestCase):
 
     check_grads(f, (1.,), order=1)
 
+  @jtu.skip_on_devices("neuron")
   @jtu.sample_product(
     shapes=filter(_shapes_are_broadcast_compatible,
                   itertools.combinations_with_replacement(nonempty_shapes, 2)),
@@ -6269,6 +6272,7 @@ class NumpyGradTests(jtu.JaxTestCase):
       tol = 3e-2
     check_grads(jnp.logaddexp, args, 1, ["fwd", "rev"], tol, tol)
 
+  @jtu.skip_on_devices("neuron")
   @jtu.sample_product(
     shapes=filter(_shapes_are_broadcast_compatible,
                   itertools.combinations_with_replacement(nonempty_shapes, 2)),

@@ -217,7 +217,7 @@ class LaxAutodiffTest(jtu.JaxTestCase):
         order = 1  # 2nd-order gradient is imprecise on TPU.
       if jtu.test_device_matches(["neuron"]):
         if dtype in grad_complex_dtypes:
-          self.skipTest("Neuron does not support complex dtypes")
+          self.skipTest("neuron does not support complex dtypes")
 
     tol = jtu.join_tolerance(1.5e-1, tol) if jtu.num_float_bits(dtype) == 32 else tol
     args = tuple(rng(shape, dtype) for shape in shapes)
