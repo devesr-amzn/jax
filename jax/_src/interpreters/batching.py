@@ -28,6 +28,7 @@ from jax._src import source_info_util
 from jax._src import linear_util as lu
 from jax._src.partition_spec import PartitionSpec as P
 from jax._src.sharding_impls import NamedSharding
+from jax._src import mesh as mesh_lib
 from jax._src.ad_util import (Zero, instantiate, SymbolicZero,
                               replace_rule_output_symbolic_zeros,
                               add_jaxvals, add_jaxvals_p)
@@ -321,12 +322,15 @@ vmappables: dict[type, tuple[type, type]] = {}
 spec_types: set[type] = {JumbleAxis}
 
 def unregister_vmappable(data_type: type) -> None:
-  spec_type, axis_size_type = vmappables.pop(data_type)
-  spec_types.remove(spec_type)
+  _, axis_size_type = vmappables.pop(data_type)
   del to_elt_handlers[data_type]
   del from_elt_handlers[data_type]
   if axis_size_type in make_iota_handlers:
     del make_iota_handlers[axis_size_type]
+  global spec_types
+  spec_types = (
+      {JumbleAxis} | {spec_type for spec_type, _ in vmappables.values()}
+  )
 
 def is_vmappable(x: Any) -> bool:
   return type(x) is Jumble or type(x) in vmappables
@@ -459,6 +463,7 @@ def get_sharding_for_vmap(axis_data, orig_sharding, axis):
 class BatchTrace(Trace):
 
   def __init__(self, parent_trace, tag, axis_data):
+    super().__init__()
     self.parent_trace = parent_trace
     assert isinstance(axis_data, AxisData)
     self.axis_data = axis_data
@@ -1052,6 +1057,15 @@ def reducer_batcher(prim, ident, batched_args, batch_dims, axes, **params):
   else:
     assert False
 
+def expand_dims_batcher(prim, args, dims, **params):
+  """A batching rule for primitives that support matching leading batch
+  dimensions in all arguments.
+  """
+  size, = {x.shape[bd] for x, bd in zip(args, dims) if bd is not not_mapped}
+  args = [bdim_at_front(x, bd, size) for x, bd in zip(args, dims)]
+  out = prim.bind(*args, **params)
+  return (out, (0,) * len(out)) if prim.multiple_results else (out, 0)
+
 def mask_ragged_axes(operand: Array, ident, axis_spec: RaggedAxis) -> Array:
   # TODO(mattjj, axch) Can we mask multiple axes more efficiently at
   # once, rather than one at a time?
@@ -1091,13 +1105,14 @@ def broadcast(x, sz, axis, mesh_axis=None):
   shape = list(np.shape(x))
   shape.insert(axis, sz)
   broadcast_dims = tuple(np.delete(np.arange(len(shape)), axis))
-  if config.sharding_in_types.value:
-    x_aval = core.get_aval(x)
-    new_spec = P(*tuple_insert(x_aval.sharding.spec, axis, mesh_axis))
-    sharding = x_aval.sharding.with_spec(new_spec)
-  else:
-    sharding = None
-  return jax.lax.broadcast_in_dim(x, shape, broadcast_dims, out_sharding=sharding)
+  x_aval = core.get_aval(x)
+  new_spec = P(*tuple_insert(x_aval.sharding.spec, axis, mesh_axis))
+  sharding = x_aval.sharding.with_spec(new_spec)
+  # TODO(dougalm, yashkatariya): Delete this context manager once we figure
+  # out how to ensure jaxpr arguments always have the context mesh.
+  with mesh_lib.use_abstract_mesh(sharding.mesh):
+    return jax.lax.broadcast_in_dim(x, shape, broadcast_dims,
+                                    out_sharding=sharding)
 
 def matchaxis(axis_name, sz, mesh_axis, src, dst, x, sum_match=False):
   if dst == jumble_axis:
@@ -1154,3 +1169,8 @@ def add_batched(batched_args, batch_dims):
     x = moveaxis(x, bdx, bdy)
     return add_jaxvals(x, y), bdy
 primitive_batchers[add_jaxvals_p] = add_batched
+
+
+### mutable arrays
+
+defvectorized(core.mutable_array_p)

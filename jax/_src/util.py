@@ -90,6 +90,27 @@ if TYPE_CHECKING:
 else:
   safe_map = jaxlib_utils.safe_map
 
+if TYPE_CHECKING:
+  @overload
+  def foreach(f: Callable[[T1], Any], __arg1: Iterable[T1]) -> None: ...
+
+  @overload
+  def foreach(f: Callable[[T1, T2], Any], __arg1: Iterable[T1], __arg2: Iterable[T2]) -> None: ...
+
+  @overload
+  def foreach(f: Callable[[T1, T2, T3], Any], __arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3]) -> None: ...
+
+  @overload
+  def foreach(f: Callable[..., Any], __arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], *args) -> None: ...
+
+  def foreach(f, *args):
+    safe_map(f, *args)
+    return None
+
+else:
+  foreach = jaxlib_utils.foreach
+
+
 def unzip2(xys: Iterable[tuple[T1, T2]]
     ) -> tuple[tuple[T1, ...], tuple[T2, ...]]:
   """Unzip sequence of length-2 tuples into two tuples."""
@@ -219,52 +240,9 @@ def curry(f):
   """
   return wraps(f)(partial(partial, f))
 
-def toposort(end_nodes):
-  if not end_nodes: return []
-  end_nodes = _remove_duplicates(end_nodes)
+toposort: Callable[[Iterable[Any]], list[Any]]
+toposort = partial(jaxlib_utils.topological_sort, "parents")
 
-  child_counts = {}
-  stack = list(end_nodes)
-  while stack:
-    node = stack.pop()
-    if id(node) in child_counts:
-      child_counts[id(node)] += 1
-    else:
-      child_counts[id(node)] = 1
-      stack.extend(node.parents)
-  for node in end_nodes:
-    child_counts[id(node)] -= 1
-
-  sorted_nodes = []
-  childless_nodes = [node for node in end_nodes if child_counts[id(node)] == 0]
-  assert childless_nodes
-  while childless_nodes:
-    node = childless_nodes.pop()
-    sorted_nodes.append(node)
-    for parent in node.parents:
-      if child_counts[id(parent)] == 1:
-        childless_nodes.append(parent)
-      else:
-        child_counts[id(parent)] -= 1
-  sorted_nodes = sorted_nodes[::-1]
-
-  check_toposort(sorted_nodes)
-  return sorted_nodes
-
-def check_toposort(nodes):
-  visited = set()
-  for node in nodes:
-    assert all(id(parent) in visited for parent in node.parents)
-    visited.add(id(node))
-
-def _remove_duplicates(node_list):
-  seen = set()
-  out = []
-  for n in node_list:
-    if id(n) not in seen:
-      seen.add(id(n))
-      out.append(n)
-  return out
 
 def split_merge(predicate, xs):
   sides = list(map(predicate, xs))
@@ -284,7 +262,6 @@ def split_merge(predicate, xs):
     return out
 
   return lhs, rhs, merge
-
 
 def _ignore(): return None
 
@@ -440,8 +417,9 @@ def wraps(
                      else docstr.format(fun=name, doc=doc, **kwargs))
       fun.__qualname__ = getattr(wrapped, "__qualname__", fun.__name__)
       fun.__wrapped__ = wrapped
-    finally:
-      return fun
+    except Exception:
+      pass
+    return fun
   return wrapper
 
 
@@ -633,17 +611,12 @@ def use_cpp_class(cpp_cls: type[Any]) -> Callable[[type[T]], type[T]]:
 
     exclude_methods = {'__module__', '__dict__', '__doc__'}
 
-    originals = {}
     for attr_name, attr in cls.__dict__.items():
       if attr_name not in exclude_methods:
-        if hasattr(_original_func(attr), "_use_cpp"):
-          originals[attr_name] = attr
-        else:
+        if not hasattr(_original_func(attr), "_use_cpp"):
           setattr(cpp_cls, attr_name, attr)
 
     cpp_cls.__doc__ = cls.__doc__
-    # TODO(pschuh): Remove once fastpath is gone.
-    cpp_cls._original_py_fns = originals
     return cpp_cls
 
   return wrapper

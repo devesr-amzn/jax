@@ -234,8 +234,8 @@ def trace_context():
           default_device.value, random_seed_offset.value,
           threefry_partitionable.value,
           threefry_gpu_kernel_lowering.value,
-          sharding_in_types.value,
           use_direct_linearize.value,
+          varying_axes_in_types.value,
           softmax_custom_jvp.value,
           disable_jit.value,
           debug_key_reuse.value,
@@ -244,7 +244,11 @@ def trace_context():
           hlo_source_file_canonicalization_regex.value,
           pgle_profiling_runs.value,
           enable_pgle.value,
-          use_shardy_partitioner.value)
+          use_shardy_partitioner.value,
+          use_high_dynamic_range_gumbel.value,
+          error_checking_behavior_nan.value,
+          error_checking_behavior_divide.value,
+          error_checking_behavior_oob.value)
 
 config = Config()
 
@@ -305,31 +309,8 @@ class State(config_ext.Config[_T]):
     if self._update_global_hook:
       self._update_global_hook(value)
 
-  @contextlib.contextmanager
   def __call__(self, new_val: Any = no_default):
-    if new_val is no_default:
-      if self._default_context_manager_value is not no_default:
-        new_val = self._default_context_manager_value  # default_context_manager_value provided to constructor
-      else:
-        # no default_value provided to constructor and no value provided as an
-        # argument, so we raise an error
-        raise TypeError(f"Context manager for {self.__name__} config option "
-                        "requires an argument representing the new value for "
-                        "the config option.")
-    if self._validator:
-      self._validator(new_val)
-    prev_val = self.swap_local(new_val)
-    if self._update_thread_local_hook:
-      self._update_thread_local_hook(new_val)
-    try:
-      yield
-    finally:
-      self.set_local(prev_val)
-      if self._update_thread_local_hook:
-        if prev_val is config_ext.unset:
-          self._update_thread_local_hook(None)
-        else:
-          self._update_thread_local_hook(cast(Optional[Any], prev_val))
+    return StateContextManager(self, new_val)
 
   def _add_hooks(self, update_global_hook, update_thread_local_hook):
     """Private method that adds hooks to an existing context-manager.
@@ -338,6 +319,40 @@ class State(config_ext.Config[_T]):
     self._update_thread_local_hook = update_thread_local_hook
     self._update_global_hook = update_global_hook
     update_global_hook(self.get_global())
+
+
+class StateContextManager(contextlib.ContextDecorator):
+  __slots__ = ['state', 'new_val', 'prev']
+
+  def __init__(self, state, new_val):
+    self.state = state
+    self.new_val = new_val
+
+    if new_val is no_default:
+      if state._default_context_manager_value is not no_default:
+        new_val = state._default_context_manager_value  # default_context_manager_value provided to constructor
+      else:
+        # no default_value provided to constructor and no value provided as an
+        # argument, so we raise an error
+        raise TypeError(f"Context manager for {state.__name__} config option "
+                        "requires an argument representing the new value for "
+                        "the config option.")
+    if state._validator:
+      state._validator(new_val)
+
+
+  def __enter__(self):
+    self.prev = self.state.swap_local(self.new_val)
+    if self.state._update_thread_local_hook:
+      self.state._update_thread_local_hook(self.new_val)
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    self.state.set_local(self.prev)
+    if self.state._update_thread_local_hook:
+      if self.prev is config_ext.unset:
+        self.state._update_thread_local_hook(None)
+      else:
+        self.state._update_thread_local_hook(cast(Optional[Any], self.prev))
 
 
 UPGRADE_BOOL_HELP = (
@@ -552,6 +567,7 @@ def int_state(
     update_global_hook: Callable[[int], None] | None = None,
     update_thread_local_hook: Callable[[int | None], None] | None = None,
     include_in_jit_key: bool = False,
+    validator: Callable[[Any], None] | None = None,
 ) -> State[int]:
   """Set up thread-local state and return a contextmanager for managing it.
 
@@ -584,6 +600,8 @@ def int_state(
     if new_val is not None and not isinstance(new_val, int):
       raise ValueError(f'new int config value must be None or of type int, '
                        f'got {new_val} of type {type(new_val)}')
+    if new_val is not None and validator is not None:
+      validator(new_val)
 
   s = State[int](name, default, help, update_global_hook,
                  update_thread_local_hook, validate,
@@ -1067,17 +1085,18 @@ threefry_gpu_kernel_lowering = bool_state(
           'cost.'),
     include_in_jit_key=True)
 
-sharding_in_types = bool_state(
-    name='jax_sharding_in_types',
-    default=False,
-    help=('When True, enables forward only sharding propagation in JAX and '
-          'avals have sharding on them.'),
-    include_in_jit_key=True)
-
 use_direct_linearize = bool_state(
     name='jax_use_direct_linearize',
     default=False,
     help=('Use direct linearization instead JVP followed by partial eval'),
+    include_in_jit_key=True)
+
+varying_axes_in_types = bool_state(
+    name='jax_varying_axes_in_types',
+    default=False,
+    help=('Adds varying manual axes to ShapedArray to track which mesh axes the'
+          ' array is varying over. This will help to remove the efficient'
+          ' transpose rewrite machinery in shard_map'),
     include_in_jit_key=True)
 
 data_dependent_tracing_fallback = bool_state(
@@ -1301,6 +1320,41 @@ disallow_mesh_context_manager = bool_state(
     ),
 )
 
+# TODO(ayx): Move these 3 flags out of config once we have a user-level
+# extension mechanism for adding contexts to which the jit cache is sensitive.
+error_checking_behavior_nan = enum_state(
+    name='jax_error_checking_behavior_nan',
+    enum_values=['ignore', 'raise'],
+    default='ignore',
+    help=(
+        'Specify the behavior when a NaN is encountered. Options are "ignore"'
+        ' or "raise".'
+    ),
+    include_in_jit_key=True,
+)
+
+error_checking_behavior_divide = enum_state(
+    name='jax_error_checking_behavior_divide',
+    enum_values=['ignore', 'raise'],
+    default='ignore',
+    help=(
+        'Specify the behavior when a divide by zero is encountered. Options are'
+        ' "ignore" or "raise".'
+    ),
+    include_in_jit_key=True,
+)
+
+error_checking_behavior_oob = enum_state(
+    name='jax_error_checking_behavior_oob',
+    enum_values=['ignore', 'raise'],
+    default='ignore',
+    help=(
+        'Specify the behavior when an out of bounds access is encountered.'
+        ' Options are "ignore" or "raise".'
+    ),
+    include_in_jit_key=True,
+)
+
 def _update_x64_global(val):
   jax_jit.global_state().enable_x64 = val
 
@@ -1388,8 +1442,8 @@ default_matmul_precision = optional_enum_state(
         'ANY_F8_ANY_F8_F32', 'ANY_F8_ANY_F8_F32_FAST_ACCUM', 'ANY_F8_ANY_F8_ANY',
         'ANY_F8_ANY_F8_ANY_FAST_ACCUM', 'F16_F16_F16', 'F16_F16_F32',
         'BF16_BF16_BF16', 'BF16_BF16_F32', 'BF16_BF16_F32_X3',
-        'BF16_BF16_F32_X6', 'TF32_TF32_F32', 'TF32_TF32_F32_X3', 'F32_F32_F32',
-        'F64_F64_F64',
+        'BF16_BF16_F32_X6', 'BF16_BF16_F32_X9', 'TF32_TF32_F32',
+        'TF32_TF32_F32_X3', 'F32_F32_F32', 'F64_F64_F64',
     ],
     default=None,
     help=('Control the default matmul and conv precision for 32bit inputs.\n\n'
@@ -1791,11 +1845,18 @@ cpu_collectives_implementation = optional_enum_state(
         '("gloo", "mpi")'),
 )
 
-num_cpu_devices = int_state(
-    name="jax_num_cpu_devices",
-    default=-1,
+enable_empty_arrays = bool_state(
+    name='jax_enable_empty_arrays',
+    default=False,
     help=(
-        "Number of CPU devices to use. If not provided, the value of "
-        "the XLA flag --xla_force_host_platform_device_count is used."
-        " Must be set before JAX is initialized."),
+        "Enable the creation of an Array from an empty list of single-device "
+        "arrays. This is to support MPMD/pipeline parallelism in McJAX (WIP)."
+    )
+)
+
+use_high_dynamic_range_gumbel = bool_state(
+    name='jax_high_dynamic_range_gumbel',
+    default=False,
+    help='If True, gumble noise draws two samples to cover low probability '
+         'events with more precision.',
 )

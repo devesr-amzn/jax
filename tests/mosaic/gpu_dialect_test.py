@@ -18,6 +18,7 @@ from typing import Callable
 
 from absl.testing import parameterized
 import jax
+from jax import numpy as jnp
 from jax._src import config
 from jax._src import test_util as jtu
 from jax._src.interpreters import mlir as mlir_interpreter
@@ -478,7 +479,7 @@ class DialectTest(MosaicGpuTest):
           ir.MemRefType.get([128, 128], ir.F16Type.get()),
           ir.MemRefType.get([128, 160], ir.BF16Type.get()),
           name="wgmma",
-      )(lambda accumulator, a, b: mgpu.dialect.wgmma(accumulator, a, b))
+      )(mgpu.dialect.wgmma)
 
     with self.assertRaisesRegex(
         ir.MLIRError,
@@ -493,7 +494,7 @@ class DialectTest(MosaicGpuTest):
           ir.MemRefType.get([3, 128, 128], ir.BF16Type.get()),
           ir.MemRefType.get([128, 160], ir.BF16Type.get()),
           name="wgmma",
-      )(lambda accumulator, a, b: mgpu.dialect.wgmma(accumulator, a, b))
+      )(mgpu.dialect.wgmma)
 
     with self.assertRaisesRegex(
         ir.MLIRError,
@@ -508,7 +509,7 @@ class DialectTest(MosaicGpuTest):
           ir.MemRefType.get([128, 128], ir.BF16Type.get()),
           ir.MemRefType.get([2, 128, 160], ir.BF16Type.get()),
           name="wgmma",
-      )(lambda accumulator, a, b: mgpu.dialect.wgmma(accumulator, a, b))
+      )(mgpu.dialect.wgmma)
 
     with self.assertRaisesRegex(
         ir.MLIRError,
@@ -523,7 +524,7 @@ class DialectTest(MosaicGpuTest):
           ir.MemRefType.get([128, 128], ir.BF16Type.get()),
           ir.MemRefType.get([128, 160], ir.BF16Type.get()),
           name="wgmma",
-      )(lambda accumulator, a, b: mgpu.dialect.wgmma(accumulator, a, b))
+      )(mgpu.dialect.wgmma)
 
     with self.assertRaisesRegex(
         ir.MLIRError,
@@ -538,7 +539,7 @@ class DialectTest(MosaicGpuTest):
           ir.MemRefType.get([128, 128], ir.BF16Type.get()),
           ir.MemRefType.get([128, 160], ir.BF16Type.get()),
           name="wgmma",
-      )(lambda accumulator, a, b: mgpu.dialect.wgmma(accumulator, a, b))
+      )(mgpu.dialect.wgmma)
 
     with self.assertRaisesRegex(
         ir.MLIRError,
@@ -553,7 +554,7 @@ class DialectTest(MosaicGpuTest):
           ir.MemRefType.get([512, 128], ir.BF16Type.get()),
           ir.MemRefType.get([128, 160], ir.BF16Type.get()),
           name="wgmma",
-      )(lambda accumulator, a, b: mgpu.dialect.wgmma(accumulator, a, b))
+      )(mgpu.dialect.wgmma)
 
     with self.assertRaisesRegex(
         ir.MLIRError,
@@ -568,7 +569,7 @@ class DialectTest(MosaicGpuTest):
           ir.MemRefType.get([128, 128], ir.BF16Type.get()),
           ir.MemRefType.get([160, 160], ir.BF16Type.get()),
           name="wgmma",
-      )(lambda accumulator, a, b: mgpu.dialect.wgmma(accumulator, a, b))
+      )(mgpu.dialect.wgmma)
 
     with self.assertRaisesRegex(
         ir.MLIRError,
@@ -583,7 +584,7 @@ class DialectTest(MosaicGpuTest):
           ir.MemRefType.get([128, 128], ir.BF16Type.get()),
           ir.MemRefType.get([128, 192], ir.BF16Type.get()),
           name="wgmma",
-      )(lambda accumulator, a, b: mgpu.dialect.wgmma(accumulator, a, b))
+      )(mgpu.dialect.wgmma)
 
     with self.assertRaisesRegex(
         ir.MLIRError,
@@ -693,6 +694,35 @@ class DialectLoweringTest(MosaicGpuTest):
     )
     self.assertEmpty(all_ops_with_layouts)
 
+  def test_lowering_splat_constant(self):
+    cst = None
+    elt_ty = ir.BF16Type.get()
+
+    def body():
+      vec_ty = ir.VectorType.get((16, 8), elt_ty)
+      zero = ir.FloatAttr.get(elt_ty, 0)
+      nonlocal cst
+      cst = arith.ConstantOp(
+          vec_ty, ir.DenseElementsAttr.get_splat(vec_ty, zero)
+      )
+      cst.attributes["out_layouts"] = ir.ArrayAttr.get([
+          layouts.to_layout_attr(
+              mgpu.WGStridedFragLayout.from_shaped_type(vec_ty)
+          )
+      ])
+
+    with ir.InsertionPoint(self.module.body):
+      func.FuncOp.from_py_func()(body)
+
+    mgpu.lower_mgpu_dialect(self.module, None)
+
+    cst_ops = find_if(
+        self.module,
+        lambda op: isinstance(op, arith.ConstantOp),
+    )
+    self.assertLen(cst_ops, 1)
+    self.assertEqual(cst_ops[0].result.type, elt_ty)
+
   def test_lowering_vector_load_and_store_ops(self):
     shape = (8, 128)
     elt_ty = ir.BF16Type.get()
@@ -731,6 +761,106 @@ class DialectLoweringTest(MosaicGpuTest):
     store1, store2, *_ = all_stores  # Variadic unpacking to silence linter.
     check_type(store1.valueToStore.type)
     check_type(store2.valueToStore.type)
+
+  def test_lowering_for(self):
+    shape = (4, 128)
+    i32 = ir.IntegerType.get_signless(32)
+    vec_ty = ir.VectorType.get(shape, i32)
+    splat_layout_attr = layouts.to_layout_attr(mgpu.WGSplatFragLayout(shape))
+    strided_layout_attr = layouts.to_layout_attr(
+        mgpu.WGStridedFragLayout.from_shaped_type(vec_ty)
+    )
+    with ir.InsertionPoint(self.module.body):
+      i1 = arith.constant(ir.IndexType.get(), 1)
+      c1 = arith.constant(i32, 1)
+      splat = vector.SplatOp(
+          ir.VectorType.get(shape, i32), arith.constant(i32, 1234),
+      )
+      splat.attributes["out_layouts"] = ir.ArrayAttr.get([
+          splat_layout_attr
+      ])
+      ptr = llvm.mlir_undef(ir.Type.parse("!llvm.ptr"))
+      ref = mgpu_utils.ptr_as_memref(ptr, ir.MemRefType.get(shape, i32))
+      i0 = arith.constant(ir.IndexType.get(), 0)
+      other_vec = vector.LoadOp(vec_ty, ref, [i0, i0])
+      other_vec.attributes["out_layouts"] = ir.ArrayAttr.get([strided_layout_attr])
+      for_op = scf.ForOp(i1, i1, i1, [c1, splat.result])
+      for_op.attributes["in_layouts"] = ir.ArrayAttr.get([strided_layout_attr])
+      for_op.attributes["out_layouts"] = ir.ArrayAttr.get([strided_layout_attr])
+      with ir.InsertionPoint(for_op.body):
+        i, int_carry, vec_carry = for_op.body.arguments
+        new_int_carry = arith.addi(int_carry, arith.index_castui(i32, i))
+        new_vec_carry = arith.AddIOp(vec_carry, other_vec)
+        new_vec_carry.attributes["in_layouts"] = ir.ArrayAttr.get([strided_layout_attr] * 2)
+        new_vec_carry.attributes["out_layouts"] = ir.ArrayAttr.get([strided_layout_attr])
+        yield_op = scf.YieldOp([new_int_carry, new_vec_carry])
+        yield_op.attributes["in_layouts"] = ir.ArrayAttr.get([strided_layout_attr])
+
+    mgpu.lower_mgpu_dialect(self.module, None)
+    self.module.operation.verify()
+    [for_op] = find_if(self.module, lambda op: isinstance(op, scf.ForOp))
+    result_types = [r.type for r in for_op.results]
+    reg_vec_ty = ir.VectorType.get((2,), i32)
+    self.assertSequenceEqual(result_types, [i32, reg_vec_ty, reg_vec_ty])
+
+  def test_lowering_slice_smem_op(self):
+    shift = 1234
+    offset = None
+
+    def body():
+      nonlocal offset
+      i32 = ir.IntegerType.get_signless(32)
+      offset = arith.constant(i32, shift)
+      mgpu.dialect.slice_smem(i32, offset)
+
+    with ir.InsertionPoint(self.module.body):
+      func.FuncOp.from_py_func()(body)
+
+    mgpu.lower_mgpu_dialect(self.module, None)
+    # Avoid making a change detector, only validate that lowering runs as
+    # expected.
+    self.assertEmpty(
+        find_if(
+            self.module, lambda op: isinstance(op, mgpu.dialect.SliceSMEMOp)
+        )
+    )
+
+  @parameterized.parameters(
+      (arith.ExtFOp, jnp.bfloat16, jnp.float32),
+      (arith.ExtSIOp, jnp.int16, jnp.int32),
+      (arith.ExtUIOp, jnp.int16, jnp.uint32),
+      (arith.FPToSIOp, jnp.float32, jnp.int32),
+      (arith.FPToUIOp, jnp.float32, jnp.uint32),
+      (arith.SIToFPOp, jnp.int16, jnp.float32),
+      (arith.TruncFOp, jnp.float32, jnp.float16),
+      (arith.TruncIOp, jnp.int32, jnp.int16),
+      (arith.UIToFPOp, jnp.uint32, jnp.float32),
+  )
+  def test_lower_conversion_op_lowers_to_same_op(self, op, in_dtype, out_dtype):
+    shape = (4, 32)
+
+    with ir.InsertionPoint(self.module.body):
+      scalar_in_ty = mgpu_utils.dtype_to_ir_type(in_dtype)
+      scalar_out_ty = mgpu_utils.dtype_to_ir_type(out_dtype)
+      in_ty = ir.VectorType.get(shape, scalar_in_ty)
+      out_ty = ir.VectorType.get(shape, scalar_out_ty)
+      if ir.IntegerType.isinstance(scalar_in_ty):
+        zero = ir.IntegerAttr.get(scalar_in_ty, 0)
+      else:
+        zero = ir.FloatAttr.get(scalar_in_ty, 0)
+      splat_zero = arith.ConstantOp(
+          in_ty, ir.DenseElementsAttr.get_splat(in_ty, zero)
+      )
+      op(out_ty, splat_zero)
+
+    mgpu.infer_layout(self.module)
+    mgpu.lower_mgpu_dialect(self.module, None)
+
+    conversion_ops = find_if(self.module, lambda o: isinstance(o, op))
+    # This is a splat, so we expect a single conversion op involving a scalar
+    # after lowering.
+    self.assertLen(conversion_ops, 1)
+    self.assertEqual(conversion_ops[0].result.type, scalar_out_ty)
 
 
 if __name__ == "__main__":

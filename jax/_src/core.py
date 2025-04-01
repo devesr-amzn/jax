@@ -30,7 +30,7 @@ import types
 from typing import (Any, ClassVar, Generic, NamedTuple, TypeVar,
                     overload, Union)
 import warnings
-from weakref import ref
+import weakref
 
 import numpy as np
 
@@ -39,7 +39,7 @@ from jax._src import config
 from jax._src import effects
 from jax._src import compute_on
 from jax._src import mesh as mesh_lib
-from jax._src.mesh import AxisTypes
+from jax._src.mesh import AxisType
 from jax._src.partition_spec import PartitionSpec as P
 from jax._src.errors import (
     ConcretizationTypeError, TracerArrayConversionError, TracerBoolConversionError,
@@ -48,9 +48,9 @@ from jax._src import linear_util as lu
 
 from jax._src import source_info_util
 from jax._src.util import (safe_zip, safe_map, curry, tuple_insert,
-                           tuple_delete,
+                           tuple_delete, cache,
                            HashableFunction, HashableWrapper, weakref_lru_cache,
-                           partition_list, StrictABCMeta)
+                           partition_list, StrictABCMeta, foreach)
 import jax._src.pretty_printer as pp
 from jax._src.named_sharding import NamedSharding
 from jax._src.lib import jax_jit
@@ -149,8 +149,8 @@ class Jaxpr:
     debug_info = debug_info or lu._missing_debug_info("core.Jaxpr")
     self._debug_info = debug_info.resolve_result_paths()
     # TODO(necula): re-enable these safety checks
-    # assert (not debug_info or len(debug_info.arg_names) == len(invars)), (debug_info, invars)
-    # assert (not debug_info or len(debug_info.result_paths) == len(outvars)), (debug_info, outvars)
+    # assert (len(debug_info.arg_names) == len(invars)), (debug_info, invars)
+    # assert (len(debug_info.result_paths) == len(outvars)), (debug_info, outvars)
 
   def __str__(self):
     return str(self.pretty_print())
@@ -498,8 +498,6 @@ class Primitive:
     return f'{self.name}'
 
   def bind(self, *args, **params):
-    if not config.sharding_in_types.value:
-      return self._true_bind(*args, **params)
     args = args if self.skip_canonicalization else map(canonicalize_value, args)
     return self._true_bind(*args, **params)
 
@@ -576,12 +574,12 @@ def eval_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list[
 
   def write(v: Var, val: Any) -> None:
     if config.enable_checks.value and not config.dynamic_shapes.value:
-      assert typecheck(v.aval, val), (v.aval, val)
+      assert typecheck(v.aval, val), (v.aval, get_aval(val))
     env[v] = val
 
   env: dict[Var, Any] = {}
-  map(write, jaxpr.constvars, consts)
-  map(write, jaxpr.invars, args)
+  foreach(write, jaxpr.constvars, consts)
+  foreach(write, jaxpr.invars, args)
   lu = last_used(jaxpr)
   for eqn in jaxpr.eqns:
     subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
@@ -591,36 +589,40 @@ def eval_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list[
         traceback, name_stack=name_stack), eqn.ctx.manager:
       ans = eqn.primitive.bind(*subfuns, *map(read, eqn.invars), **bind_params)
     if eqn.primitive.multiple_results:
-      map(write, eqn.outvars, ans)
+      foreach(write, eqn.outvars, ans)
     else:
       write(eqn.outvars[0], ans)
     clean_up_dead_vars(eqn, env, lu)
   return map(read, jaxpr.outvars)
 
 def check_avals_context_mesh(avals, prim_name):
-  if config.sharding_in_types.value:
-    cur_mesh = mesh_lib.get_abstract_mesh()
-    for a in avals:
-      # TODO(yashkatariya): Should be cur_mesh.unset
-      if cur_mesh.empty or a.sharding.mesh.empty:
-        continue
-      # avals can have meshes with different axis_names so allow that in
-      # full auto mode.
-      if a.sharding.mesh._are_all_axes_auto and cur_mesh._are_all_axes_auto:
-        continue
-      if a.sharding.mesh != cur_mesh:
-        raise ValueError(
-            f"For primitive {prim_name}, context mesh {cur_mesh} should match"
-            f" the aval mesh {a.sharding.mesh} for shape {a.str_short()}. This"
-            " error occurs at source: "
-            f" {source_info_util.summarize(source_info_util.current())}")
+  cur_mesh = mesh_lib.get_abstract_mesh()
+  for a in avals:
+    # TODO(yashkatariya): Should be cur_mesh.unset
+    if cur_mesh.empty or a.sharding.mesh.empty:
+      continue
+    # avals can have meshes with different axis_names so allow that in
+    # full auto mode.
+    if a.sharding.mesh._are_all_axes_auto and cur_mesh._are_all_axes_auto:
+      continue
+    if a.sharding.mesh != cur_mesh:
+      raise ValueError(
+          f"For primitive {prim_name}, context mesh {cur_mesh} should match"
+          f" the aval mesh {a.sharding.mesh} for shape {a.str_short()}. This"
+          " error occurs at source: "
+          f" {source_info_util.summarize(source_info_util.current())}")
 
 # -------------------- tracing --------------------
 
 TracerType = TypeVar('TracerType', bound='Tracer')
 
 class Trace(Generic[TracerType]):
-  __slots__ = ("__weakref__", "_invalidated")
+  __slots__ = ("__weakref__", "_invalidated", "_weakref")
+
+  def __init__(self):
+    self._invalidated = False
+    # We frequently need a weakref to a trace, so let's precompute one.
+    self._weakref = weakref.ref(self)
 
   def process_primitive(self, primitive, tracers, params):
     raise NotImplementedError("must override")
@@ -629,7 +631,7 @@ class Trace(Generic[TracerType]):
     self._invalidated = True
 
   def is_valid(self):
-    return not hasattr(self, "_invalidated")
+    return not self._invalidated
 
   def __repr__(self):
     return '{}'.format(self.__class__.__name__)
@@ -1124,7 +1126,7 @@ class TracingContext(threading.local):
 
   def set_trace(self, trace):
     self.trace = trace
-    ts = ref(trace) if trace is not None else None
+    ts = trace._weakref if trace is not None else None
     config.trace_state.set_local(ts)
 
   def set_axis_env(self, axis_env):
@@ -1132,58 +1134,84 @@ class TracingContext(threading.local):
     config.axis_env_state.set_local(axis_env.as_hashable_key())
 
   def update_thread_local_jit_state(self):
-    ts = ref(self.trace) if self.trace is not None else None
+    ts = self.trace._weakref if self.trace is not None else None
     config.trace_state.set_local(ts)
     config.axis_env_state.set_local(self.axis_env.as_hashable_key())
 
 trace_ctx = TracingContext()
 
 
-@contextmanager
-def take_current_trace():
-  prev = trace_ctx.trace
-  try:
-    trace_ctx.set_trace(eval_trace)
-    yield prev
-  finally:
-    trace_ctx.set_trace(prev)
+class TakeCurrentTraceContextManager:
+  __slots__ = ['prev']
 
-@contextmanager
-def set_current_trace(trace, check_leaks=False):
-  prev = trace_ctx.trace
-  try:
-    trace_ctx.set_trace(trace)
-    yield
-  finally:
-    trace_ctx.set_trace(prev)
-    if check_leaks and config.check_tracer_leaks.value:
-      trace.invalidate()
-      trace_ref = ref(trace)
-      del trace
+  def __enter__(self):
+    self.prev = trace_ctx.trace
+    trace_ctx.set_trace(eval_trace)
+    return self.prev
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    trace_ctx.set_trace(self.prev)
+
+take_current_trace = TakeCurrentTraceContextManager
+
+
+class SetCurrentTraceContextManager:
+  __slots__ = ['trace', 'check_leaks', 'prev']
+
+  def __init__(self, trace, check_leaks=False):
+    self.trace = trace
+    self.check_leaks = check_leaks
+
+  def __enter__(self):
+    self.prev = trace_ctx.trace
+    trace_ctx.set_trace(self.trace)
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    trace_ctx.set_trace(self.prev)
+    if self.check_leaks and config.check_tracer_leaks.value:
+      self.trace.invalidate()
+      trace_ref = self.trace._weakref
+      del self.trace
       live_trace = trace_ref()
       if live_trace is not None:
         leaked_tracers = maybe_find_leaked_tracers(live_trace)
         if leaked_tracers:
           raise leaked_tracer_error("trace", live_trace, leaked_tracers)
 
-@contextmanager
-def extend_axis_env_nd(name_size_pairs : Iterable[tuple[AxisName, int]]):
-  prev = trace_ctx.axis_env
-  try:
-    trace_ctx.set_axis_env(prev.extend_pure(name_size_pairs))
-    yield
-  finally:
-    trace_ctx.set_axis_env(prev)
+set_current_trace = SetCurrentTraceContextManager
 
-@contextmanager
-def add_spmd_axis_names(axis_names: AxisName | None):
-  prev = trace_ctx.axis_env
-  try:
-    if axis_names is not None:
-      trace_ctx.set_axis_env(prev.add_spmd_axis_names(axis_names))
-    yield
-  finally:
-    trace_ctx.set_axis_env(prev)
+class ExtendAxisEnvNdContextManager:
+  __slots__ = ['prev', 'name_size_pairs']
+
+  def __init__(self, name_size_pairs: Iterable[tuple[AxisName, int]]):
+    self.name_size_pairs = name_size_pairs
+
+  def __enter__(self):
+    self.prev = trace_ctx.axis_env
+    trace_ctx.set_axis_env(self.prev.extend_pure(self.name_size_pairs))
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    trace_ctx.set_axis_env(self.prev)
+
+extend_axis_env_nd = ExtendAxisEnvNdContextManager
+
+
+class AddSpmdAxisNamesContextManager:
+  __slots__ = ['prev', 'axis_names']
+
+  def __init__(self, axis_names: AxisName | None):
+    self.axis_names = axis_names
+
+  def __enter__(self):
+    self.prev = trace_ctx.axis_env
+    if self.axis_names is not None:
+      trace_ctx.set_axis_env(self.prev.add_spmd_axis_names(self.axis_names))
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    trace_ctx.set_axis_env(self.prev)
+
+add_spmd_axis_names = AddSpmdAxisNamesContextManager
+
 
 def get_axis_env():
   return trace_ctx.axis_env
@@ -1228,13 +1256,14 @@ def ensure_no_leaks(trace:Trace):
   yield
   trace.invalidate()
   if config.check_tracer_leaks.value:
-    trace_ref = ref(trace)
+    trace_ref = trace._weakref
     del trace
     live_trace = trace_ref()
     if live_trace is not None:
       leaked_tracers = maybe_find_leaked_tracers(live_trace)
       if leaked_tracers:
         raise leaked_tracer_error("trace", live_trace, leaked_tracers)
+
 
 def maybe_find_leaked_tracers(trace: Trace) -> list[Tracer]:
   """Find the leaked tracers holding a reference to the Trace
@@ -1498,8 +1527,8 @@ def check_valid_jaxtype(x):
       f"Value {x!r} of type {type(x)} is not a valid JAX type")
 
 def update_aval_with_sharding(aval, sharding):
-  if config.sharding_in_types.value and isinstance(sharding, NamedSharding):
-    aval = aval.update(sharding=NamedSharding(
+  if isinstance(sharding, NamedSharding):
+    return aval.update(sharding=NamedSharding(
         sharding.mesh.abstract_mesh,
         sharding.spec._normalized_spec_for_aval(aval.ndim)))
   return aval
@@ -1552,6 +1581,7 @@ def get_aval(x):
     return get_aval(x.__jax_array__())
   raise TypeError(f"Argument '{x}' of type '{typ}' is not a valid JAX type")
 
+typeof = get_aval
 
 def is_concrete(x):
   return to_concrete_value(x) is not None
@@ -1628,9 +1658,16 @@ def physical_aval(aval):
       isinstance(aval.dtype, dtypes.ExtendedDType)):
     elt_aval = physical_element_aval(aval.dtype)
     if isinstance(aval, ShapedArray):
-      return ShapedArray((*aval.shape, *elt_aval.shape), elt_aval.dtype)
+      from jax._src.sharding_impls import physical_sharding  # type: ignore
+      return ShapedArray((*aval.shape, *elt_aval.shape), elt_aval.dtype,
+                         sharding=physical_sharding(aval, aval.sharding),
+                         vma=aval.vma)
     return DShapedArray((*aval.shape, *elt_aval.shape), elt_aval.dtype)
   return aval
+
+def physical_shape(logical_shape, dtype):
+  elt_aval = physical_element_aval(dtype)
+  return (*logical_shape, *elt_aval.shape)
 
 def physical_element_aval(edtype: dtypes.ExtendedDType) -> ShapedArray:
   duck = edtype._rules.physical_element_aval(edtype)  # type: ignore
@@ -1749,20 +1786,14 @@ def _invalid_shape_error(shape: Shape, context: str=""):
 
   return TypeError(msg)
 
-def _make_lengths_same(sharding, ndim):
-  if ndim > len(sharding.spec):
-    return sharding.with_spec(sharding.spec._normalized_spec_for_aval(ndim))
-  if ndim < len(sharding.spec):
-    return sharding.with_spec(sharding.spec[:ndim])
-  assert False, "unreachable"
+
+class ShardingTypeError(Exception):
+  pass
 
 
 # TODO(dougalm): Cast scalar, numpy arrays, etc to jax arrays so that values
 # passed to primitives are always have avals, etc i.e. they are canonical.
 def canonicalize_value(val):
-  if not config.sharding_in_types.value:
-    return val
-
   try:
     aval = get_aval(val)
   except TypeError:
@@ -1775,18 +1806,28 @@ def canonicalize_value(val):
   cur_mesh = mesh_lib.get_abstract_mesh()
   if cur_mesh == aval.sharding.mesh:
     return val
-  if cur_mesh._are_all_axes_manual and aval.sharding.mesh._are_all_axes_auto:
+  # Atleast 1 mesh axis should be Manual and all other axes should be
+  # Manual or Auto to allow casting.
+  # TODO(yashkatariy): Casting to Explicit is not yet allowed. Maybe we need
+  # cast_and_slice_p for it since shape might change?
+  if (cur_mesh._any_axis_manual and cur_mesh._are_all_axes_auto_or_manual and
+      aval.sharding.mesh._are_all_axes_auto):
     from jax._src.pjit import mesh_cast  # pytype: disable=import-error
     return mesh_cast(val, NamedSharding(cur_mesh, P(*[None] * aval.ndim)))
   return val
 
 
 def get_cur_mesh_sharding(spec=None):
-  if not config.sharding_in_types.value:
-    return None
   spec = P() if spec is None else spec
   return NamedSharding(mesh_lib.get_abstract_mesh(), spec)
 
+def _make_lengths_same(sharding, ndim):
+  if ndim > len(sharding.spec):
+    return sharding.with_spec(sharding.spec._normalized_spec_for_aval(ndim))
+  if ndim < len(sharding.spec):
+    assert all(s is None for s in sharding.spec[ndim:])
+    return sharding.with_spec(sharding.spec[:ndim])
+  assert False, "unreachable"
 
 # TODO(yashkatariya): Only works with User/Auto. Generalize it to work with
 # Collective too.
@@ -1799,7 +1840,7 @@ def modify_spec_for_auto_manual(spec, mesh) -> P:
       temp_s = s[0] if isinstance(s, tuple) else s
       new_spec.append(
           None
-          if mesh._name_to_type[temp_s] in (AxisTypes.Auto, AxisTypes.Manual)
+          if mesh._name_to_type[temp_s] in (AxisType.Auto, AxisType.Manual)
           else s)
   return P(*new_spec)
 
@@ -1810,18 +1851,42 @@ def _maybe_modify_sharding(sharding, ndim):
     return sharding
 
   if sharding.mesh._are_all_axes_explicit:
+    if ndim > len(sharding.spec):
+      return sharding.with_spec(sharding.spec._normalized_spec_for_aval(ndim))
     return sharding
 
   out = sharding.with_spec(modify_spec_for_auto_manual(
       sharding.spec, sharding.mesh))
   if (len(out.spec) != ndim and
-      (out.mesh.empty or out.mesh._are_all_axes_auto or
-       out.mesh._are_all_axes_manual)):
+      (out.mesh.empty or out.mesh._are_all_axes_auto_or_manual)):
     out = _make_lengths_same(out, ndim)
   return out
 
+def _check_divisibility(sharding, shape):
+  mesh = sharding.mesh
+  for dim, (spec, sh) in enumerate(zip(sharding.spec, shape)):
+    if spec is None:
+      continue
+    spec = spec if isinstance(spec, tuple) else (spec,)
+    size = math.prod(mesh.shape[s] for s in spec)
+    _, remainder = divmod(sh, size)
+    if remainder != 0:
+      raise ValueError(
+          f"Sharding spec {spec} implies that array axis {dim} is partitioned"
+          f" {size} times, but does not evenly divide the dimension size {sh}."
+          f" Got shape: {shape} and sharding {sharding}")
 
-def get_sharding(sharding, ndim):
+@cache(max_size=4096, trace_context_in_key=False)
+def get_sharding(sharding, shape):
+  """Modifies and checks the sharding.
+
+  Some modifications/checks include:
+    * Making the length of specs the same as ndim
+    * If a mesh axis is mentioned in pspec is Auto/Manual, replace it with None
+    * Checking for len(spec)-ndim match
+    * Checking if the mesh is an AbstractMesh.
+  """
+  ndim = len(shape)
   if sharding is None:
     return NamedSharding(mesh_lib.empty_abstract_mesh, P(*[None] * ndim))
 
@@ -1833,19 +1898,38 @@ def get_sharding(sharding, ndim):
   if not isinstance(out_s.mesh, mesh_lib.AbstractMesh):
     raise ValueError("Mesh of an aval must be an AbstractMesh. "
                      f"Got {out_s.mesh} of type {type(out_s.mesh)}")
+  _check_divisibility(out_s, shape)
   return out_s
 
+def str_short_aval(shape, dtype, mesh, spec, vma,
+                   short_dtypes=False, mesh_axis_types=False) -> str:
+  dt_str = dtypes.short_dtype_name(dtype) if short_dtypes else dtype.name
+  dt_str = dt_str.replace('void', 'float0')
+  shapestr = _get_shape_sharding_str(shape, spec)
+  mesh_axes = f'({mesh._axis_types_dict})' if mesh_axis_types else ''
+  vma = f"{{{','.join(i for i in vma)}}}" if vma else ''
+  return f'{dt_str}[{shapestr}]{vma}{mesh_axes}'
+
+def get_vma(vma, mesh):
+  for i in vma:
+    if mesh._name_to_type[i] != AxisType.Manual:
+      raise ValueError(
+          "Axes mentioned in `vma` field of ShapedArray should"
+          f" be of type `Manual`. Got axis: {i} of type {mesh._name_to_type[i]}")
+  assert isinstance(vma, frozenset)
+  return vma
 
 class ShapedArray(UnshapedArray):
-  __slots__ = ['shape', 'sharding']  # inherits slots from parent
+  __slots__ = ['shape', 'sharding', 'vma']  # inherits slots from parent
   array_abstraction_level = 2
 
-  def __init__(self, shape, dtype, weak_type=False, *, sharding=None):
+  def __init__(self, shape, dtype, weak_type=False, *, sharding=None,
+               vma: frozenset[AxisName] = frozenset()):
     self.shape = canonicalize_shape(shape)
     self.dtype = _dtype_object(dtype)
     self.weak_type = weak_type
-    if config.sharding_in_types.value:
-      self.sharding = get_sharding(sharding, len(self.shape))
+    self.sharding = get_sharding(sharding, self.shape)
+    self.vma = get_vma(vma, self.sharding.mesh)
 
   def update(self, shape=None, dtype=None, weak_type=None, **kwargs):
     if shape is None:
@@ -1855,7 +1939,9 @@ class ShapedArray(UnshapedArray):
     if weak_type is None:
       weak_type = self.weak_type
     if 'sharding' not in kwargs:
-      kwargs['sharding'] = getattr(self, 'sharding', None)
+      kwargs['sharding'] = self.sharding
+    if 'vma' not in kwargs:
+      kwargs['vma'] = self.vma
     return ShapedArray(shape, dtype, weak_type, **kwargs)
 
   ndim = property(lambda self: len(self.shape))
@@ -1872,33 +1958,25 @@ class ShapedArray(UnshapedArray):
     return (type(self) is type(other)
             and self.dtype == other.dtype and self.shape == other.shape
             and self.weak_type == other.weak_type
-            and getattr(self, 'sharding', None) == getattr(other, 'sharding', None))
+            and self.sharding == other.sharding
+            and self.vma == other.vma)
 
   def __hash__(self):
     # can use hash(self.dtype) and rely on the fact that numpy reuses base dtype
     # objects, e.g. `np.zeros(3).dtype is np.zeros(4).dtype`, or we can use
     # the unique character code via hash(self.dtype.char)
-    return hash((self.shape, self.dtype, self.weak_type,
-                 getattr(self, 'sharding', None)))
+    return hash((self.shape, self.dtype, self.weak_type, self.sharding,
+                 self.vma))
 
   def to_tangent_aval(self):
-    if config.sharding_in_types.value:
-      return ShapedArray(self.shape, primal_dtype_to_tangent_dtype(self.dtype),
-                         self.weak_type, sharding=self.sharding)
-    else:
-      return ShapedArray(self.shape, primal_dtype_to_tangent_dtype(self.dtype),
-                         self.weak_type)
+    return ShapedArray(
+        self.shape, primal_dtype_to_tangent_dtype(self.dtype),
+        self.weak_type, sharding=self.sharding, vma=self.vma)
 
-  def str_short(self, short_dtypes=False):
-    dt_str = (dtypes.short_dtype_name(self.dtype) if short_dtypes else
-              self.dtype.name)
-    dt_str = dt_str.replace('void', 'float0')
-    if hasattr(self, 'sharding') and self.sharding is not None:
-      shapestr = _get_shape_sharding_str(self.shape, self.sharding.spec)
-      return f'{dt_str}[{shapestr}]'
-    else:
-      shapestr = ','.join(map(str, self.shape))
-      return f'{dt_str}[{shapestr}]'
+  def str_short(self, short_dtypes=False, mesh_axis_types=False):
+    return str_short_aval(
+        self.shape, self.dtype, self.sharding.mesh, self.sharding.spec,
+        self.vma, short_dtypes, mesh_axis_types)
 
   def _len(self, ignored_tracer):
     try:
@@ -1928,6 +2006,32 @@ def primal_dtype_to_tangent_dtype(primal_dtype):
   else:
     return primal_dtype
 
+
+def standard_insert_pbroadcast(*args):
+  if not config.varying_axes_in_types.value:
+    return args
+  if not args:
+    return args
+  # TODO(yashkatariya): Move pbroadcast out of shard_map
+  from jax.experimental.shard_map import pbroadcast  # type: ignore
+  in_vma = [frozenset() if (aval := get_aval(a)) is abstract_token
+            else aval.vma for a in args]
+  out_vma = frozenset.union(*in_vma)
+  return [pbroadcast(arg, tuple(n for n in out_vma if n not in src))
+          if out_vma - src else arg for arg, src in zip(args, in_vma)]
+
+def standard_vma_rule(prim_name, *avals, **kwargs) -> frozenset[AxisName]:
+  avals = tuple(a for a in avals if a is not abstract_token)
+  if not avals:
+    return frozenset()
+  vma, *vmas = [a.vma for a in avals]
+  if not all(vma == vma_ for vma_ in vmas):
+    raise ValueError(
+        f'Primitive {prim_name} requires varying manual axes '
+        f'to match, but got {[vma, *vmas]}. Please open an issue at '
+        'https://github.com/jax-ml/jax/issues and as a temporary '
+        'workaround pass the check_rep=False argument to shard_map')
+  return vma
 
 # Dynamic shape stuff below here! We keep the abstract values distinct just so
 # as not to interfere with any static shape machinery.
@@ -1974,6 +2078,10 @@ class DShapedArray(UnshapedArray):
   @property
   def sharding(self):
     return NamedSharding(mesh_lib.empty_abstract_mesh, P())
+
+  @property
+  def vma(self):
+    return frozenset()
 
   def _len(self, tracer):
     return self.shape[0]
@@ -2079,6 +2187,7 @@ class MutableArray:
   def __getitem__(self, idx): return self._aval._getitem(self, idx)
   def __setitem__(self, idx, x): return self._aval._setitem(self, idx, x)
   def __repr__(self) -> str: return 'Mutable' + repr(self[...])
+  def __len__(self) -> int: return self._aval._len(self)
 pytype_aval_mappings[MutableArray] = lambda x: x._aval
 
 def mutable_array(init_val):
@@ -2455,8 +2564,8 @@ class MapPrimitive(Primitive):
   def get_bind_params(self, params):
     new_params = dict(params)
     jaxpr: Jaxpr = new_params.pop('call_jaxpr')
-    subfun = lu.hashable_partial(lu.wrap_init(eval_jaxpr,
-                                              debug_info=jaxpr.debug_info), jaxpr, ())
+    subfun = lu.hashable_partial(
+        lu.wrap_init(eval_jaxpr, debug_info=jaxpr.debug_info), jaxpr, ())
     axes = new_params.pop('out_axes')
     new_params['out_axes_thunk'] = HashableFunction(lambda: axes, closure=axes)
     return [subfun], new_params
@@ -2483,21 +2592,20 @@ def _map_shaped_array(
   assert axis is None or aval.shape[axis] == size
   # TODO: Extend the named shape
   if axis is None: return aval
-  sharding = (aval.sharding.with_spec(tuple_delete(aval.sharding.spec, axis))
-              if config.sharding_in_types.value else None)
+  sharding = aval.sharding.with_spec(tuple_delete(aval.sharding.spec, axis))
   return ShapedArray(tuple_delete(aval.shape, axis), aval.dtype,
-                     weak_type=aval.weak_type, sharding=sharding)
+                     weak_type=aval.weak_type, sharding=sharding, vma=aval.vma)
 
 def _unmap_shaped_array(
     size: int, axis: int | None, explicit_mesh_axis, aval: ShapedArray
     ) -> ShapedArray:
   if axis is None: return aval
   elif type(axis) is int:
-    sharding = (aval.sharding.with_spec(tuple_insert(aval.sharding.spec, axis,
-                                                     explicit_mesh_axis))
-                if config.sharding_in_types.value else None)
+    sharding = aval.sharding.with_spec(tuple_insert(
+        aval.sharding.spec, axis, explicit_mesh_axis))
     return ShapedArray(tuple_insert(aval.shape, axis, size), aval.dtype,
-                       weak_type=aval.weak_type, sharding=sharding)
+                       weak_type=aval.weak_type, sharding=sharding,
+                       vma=aval.vma)
   else: raise TypeError(axis)
 
 def _map_dshaped_array(
@@ -2609,7 +2717,8 @@ def typematch(t1: AbstractValue, t2: AbstractValue) -> bool:
     # could try normalizing first and then doing simple equality.
     # TODO(yashkatariya): Also check `sharding` here.
     # See https://github.com/jax-ml/jax/issues/26474
-    return t1.dtype == t2.dtype and definitely_equal_shape(t1.shape, t2.shape)
+    return (t1.dtype == t2.dtype and definitely_equal_shape(t1.shape, t2.shape)
+            and t1.vma == t2.vma)  # type: ignore
   else:
     return False
 
@@ -2772,7 +2881,7 @@ def _check_jaxpr(
 
       # Check out_type matches the let-binders' annotation (after substitution).
       out_type = substitute_vars_in_output_ty(out_type, eqn.invars, eqn.outvars)
-      map(write, eqn.outvars, out_type)
+      foreach(write, eqn.outvars, out_type)
 
     except JaxprTypeError as e:
       ctx, settings = ctx_factory()
@@ -2783,7 +2892,7 @@ def _check_jaxpr(
       raise JaxprTypeError(msg, eqn_idx) from None
 
   # TODO(mattjj): include output type annotation on jaxpr and check it here
-  map(read, jaxpr.outvars)
+  foreach(read, jaxpr.outvars)
 
 def check_type(
     ctx_factory: Callable[[], tuple[JaxprPpContext, JaxprPpSettings]],
@@ -2923,8 +3032,11 @@ def _check_map(ctx_factory, prim, in_avals, params):
 
 # ------------------- Jaxpr printed representation -------------------
 
-def pp_toplevel_jaxpr(jaxpr_to_print, *, source_info=False, print_shapes=True,
-                      custom_pp_eqn_rules=True, name_stack=False,
+def pp_toplevel_jaxpr(jaxpr_to_print: Jaxpr, *,
+                      source_info: bool = False,
+                      print_shapes: bool = True,
+                      custom_pp_eqn_rules : bool = True,
+                      name_stack: bool = False,
                       print_effects: bool = False) -> pp.Doc:
     context = JaxprPpContext()
     settings = JaxprPpSettings(
@@ -2966,9 +3078,9 @@ def pp_toplevel_jaxpr(jaxpr_to_print, *, source_info=False, print_shapes=True,
         name_counts[name] += 1
       else:
         name_counts[name] += 1
-      docs.append(pp_top_level_jaxpr(name, jaxpr, context, settings))
-      context.used_names.add(name)
-      context.top_level_jaxprs[jaxpr] = name
+      docs.append(pp_shared_jaxpr(name, jaxpr, context, settings))
+      context.shared_jaxpr_names.add(name)
+      context.shared_jaxprs[jaxpr] = name
     docs.append(pp_jaxpr(jaxpr_to_print, context, settings))
     return pp.concat(docs)
 
@@ -2993,18 +3105,40 @@ def _encode_digits_alphabetic(n: int) -> str:
 # Jaxprs.
 class JaxprPpContext:
   var_names: defaultdict[Var, str]
-  used_names: MutableSet[str]
-  top_level_jaxprs: MutableMapping[Jaxpr, str]
+  # Shared jaxprs are those that are used multiple times and are printed
+  # first.
+  shared_jaxprs: MutableMapping[Jaxpr, str]  # maps shared jaxpr to its name
+  shared_jaxpr_names: MutableSet[str]
 
   def __init__(self) -> None:
-    self.top_level_jaxprs = {}
-    self.used_names = set()
+    self.shared_jaxprs = {}
+    self.shared_jaxpr_names = set()
     fresh_names: Iterator[str] = (
         name
         for i in it.count()
-        if (name := _encode_digits_alphabetic(i)) not in self.used_names
+        if (name := _encode_digits_alphabetic(i)) not in self.shared_jaxpr_names
     )
     self.var_names = defaultdict(fresh_names.__next__)
+
+  def suggest_same_var_names(self,
+                             for_vars: Sequence[Atom],
+                             like_vars: Sequence[Atom]) -> None:
+    """Suggests the names for `for_vars` to match those of `like_vars`.
+
+    `for_vars` are distinct Vars, and are aliased with `like_vars`.
+    """
+    used_like_vars: set[Var] = set()
+    if len(for_vars) != len(like_vars):
+      # The mismatch can happen if a primitive containing a subjaxpr is invoked
+      # with the wrong number of arguments, e.g., when printing an invalid Jaxpr.
+      return
+    for for_v, like_v in zip(for_vars, like_vars):
+      if (isinstance(like_v, Var) and
+          like_v not in used_like_vars and
+          isinstance(for_v, Var) and
+          for_v not in self.var_names):
+        used_like_vars.add(like_v)
+        self.var_names[for_v] = pp_var(like_v, self)
 
 
 def pp_var(v: Var | Literal, context: JaxprPpContext) -> str:
@@ -3019,7 +3153,7 @@ def pp_aval(a: AbstractValue, context: JaxprPpContext) -> str:
   else:
     return a.str_short(short_dtypes=True)
 
-def pp_vars(vs: Sequence[Any], context: JaxprPpContext,
+def pp_vars(vs: Sequence[Atom], context: JaxprPpContext,
             *, separator="", print_shapes: bool = False) -> pp.Doc:
   if print_shapes:
     return pp.nest(2, pp.group(
@@ -3065,7 +3199,8 @@ def pp_eqn(eqn: JaxprEqn, context: JaxprPpContext, settings: JaxprPpSettings
   user_frame = source_info_util.user_frame(eqn.source_info)
   return doc if user_frame is None else pp.source_map(doc, user_frame)
 
-def _pp_eqn(eqn, context, settings, params=None) -> pp.Doc:
+def _pp_eqn(eqn: JaxprEqn, context: JaxprPpContext, settings: JaxprPpSettings,
+            params: Sequence[str] | None = None) -> pp.Doc:
   annotation = (source_info_util.summarize(eqn.source_info)
                 if settings.source_info else None)
   if params is None:
@@ -3080,9 +3215,10 @@ def _pp_eqn(eqn, context, settings, params=None) -> pp.Doc:
   else:
     return pp.concat(rhs)
 CustomPpEqnRule = Callable[[JaxprEqn, JaxprPpContext, JaxprPpSettings], pp.Doc]
-pp_eqn_rules: dict[Primitive, CustomPpEqnRule]  = {}
+pp_eqn_rules: dict[Primitive, CustomPpEqnRule] = {}
 
-def pp_eqns(eqns, context: JaxprPpContext, settings: JaxprPpSettings) -> pp.Doc:
+def pp_eqns(eqns: Sequence[JaxprEqn],
+            context: JaxprPpContext, settings: JaxprPpSettings) -> pp.Doc:
   return pp.join(
     pp.brk("; "),
     [pp_eqn(e, context, settings) for e in eqns])
@@ -3107,7 +3243,7 @@ custom_str_eqn_compact_rules: dict[
     Primitive, Callable[[Primitive, dict[Any, Any]], str]
 ] = {}
 
-def pp_jaxpr_skeleton(jaxpr, eqns_fn, context: JaxprPpContext,
+def pp_jaxpr_skeleton(jaxpr: Jaxpr, eqns_fn, context: JaxprPpContext,
                       settings: JaxprPpSettings) -> pp.Doc:
   constvars = pp_vars(jaxpr.constvars, context, print_shapes=settings.print_shapes)
   invars = pp_vars(jaxpr.invars, context, print_shapes=settings.print_shapes)
@@ -3141,7 +3277,7 @@ def pp_jaxpr_skeleton(jaxpr, eqns_fn, context: JaxprPpContext,
   ])) + pp.text(" }"))
 
 
-def pp_top_level_jaxpr(
+def pp_shared_jaxpr(
     name: str,
     jaxpr: Jaxpr,
     context: JaxprPpContext,
@@ -3160,13 +3296,14 @@ def pp_jaxpr(
     context: JaxprPpContext,
     settings: JaxprPpSettings,
 ) -> pp.Doc:
-  if name := context.top_level_jaxprs.get(jaxpr):
+  if name := context.shared_jaxprs.get(jaxpr):
     return pp.text(name)
   eqns_fn = lambda: pp_eqns(jaxpr.eqns, context, settings)
   return pp_jaxpr_skeleton(jaxpr, eqns_fn, context, settings)
 
 
-def pp_jaxprs(jaxprs, context: JaxprPpContext, settings: JaxprPpSettings) -> pp.Doc:
+def pp_jaxprs(jaxprs: Sequence[ClosedJaxpr | Jaxpr],
+              context: JaxprPpContext, settings: JaxprPpSettings) -> pp.Doc:
   jaxprs = [j.jaxpr if isinstance(j, ClosedJaxpr) else j for j in jaxprs]
   return pp.group(pp.nest(2, pp.concat([
       pp.text('('), pp.brk(""),
@@ -3239,7 +3376,7 @@ class OpaqueTraceState:
 
 def get_opaque_trace_state(convention):
   del convention
-  return OpaqueTraceState(ref(trace_ctx.trace))
+  return OpaqueTraceState(trace_ctx.trace._weakref)
 
 def nonempty_axis_env() -> bool:
   return bool(trace_ctx.axis_env.axis_sizes)

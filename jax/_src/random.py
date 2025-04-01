@@ -38,6 +38,8 @@ from jax._src.api import jit, vmap
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
+from jax._src.sharding_impls import canonicalize_sharding
+from jax._src.pjit import auto_axes
 from jax._src.lax import lax as lax_internal
 from jax._src.numpy.lax_numpy import _convert_and_clip_integer
 from jax._src.numpy.util import _arraylike, check_arraylike, promote_dtypes_inexact
@@ -379,7 +381,8 @@ def uniform(key: ArrayLike,
             shape: Shape = (),
             dtype: DTypeLikeFloat = float,
             minval: RealArray = 0.,
-            maxval: RealArray = 1.) -> Array:
+            maxval: RealArray = 1.,
+            out_sharding=None) -> Array:
   """Sample uniform random values in [minval, maxval) with given shape/dtype.
 
   Args:
@@ -397,14 +400,21 @@ def uniform(key: ArrayLike,
   key, _ = _check_prng_key("uniform", key)
   dtypes.check_user_dtype_supported(dtype)
   shape = core.canonicalize_shape(shape)
+  out_sharding = canonicalize_sharding(out_sharding, "uniform")
 
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError(f"dtype argument to `uniform` must be a float dtype, "
                      f"got {dtype}")
   dtype = dtypes.canonicalize_dtype(dtype)
-  return _uniform(key, shape, dtype, minval, maxval)
+  return _uniform_auto(key, shape, dtype, minval, maxval, out_sharding)
 
-@partial(jit, static_argnums=(1, 2))
+@partial(jit, static_argnums=(1, 2, 5))
+def _uniform_auto(key, shape, dtype, minval, maxval, out_sharding) -> Array:
+  if out_sharding is None:
+    return _uniform(key, shape, dtype, minval, maxval)
+  def f(key, minval, maxval): return _uniform(key, shape, dtype, minval, maxval)
+  return auto_axes(f, out_shardings=out_sharding)(key, minval, maxval)
+
 def _uniform(key, shape, dtype, minval, maxval) -> Array:
   _check_shape("uniform", shape)
   if not jnp.issubdtype(dtype, np.floating):
@@ -670,8 +680,8 @@ def choice(key: ArrayLike,
       ind = jnp.searchsorted(p_cuml, r).astype(int)
     else:
       # Gumbel top-k trick: https://timvieira.github.io/blog/post/2019/09/16/algorithms-for-sampling-without-replacement/
-      g = -gumbel(key, (n_inputs,), dtype=p_arr.dtype) - jnp.log(p_arr)
-      ind = jnp.argsort(g)[:n_draws]
+      g = gumbel(key, (n_inputs,), dtype=p_arr.dtype) + jnp.log(p_arr)
+      ind = lax.top_k(g, k=n_draws)[1].astype(int)
     result = ind if arr.ndim == 0 else jnp.take(arr, ind, axis)
 
   return result.reshape(shape if arr.ndim == 0 else
@@ -680,7 +690,8 @@ def choice(key: ArrayLike,
 
 def normal(key: ArrayLike,
            shape: Shape = (),
-           dtype: DTypeLikeFloat = float) -> Array:
+           dtype: DTypeLikeFloat = float,
+           out_sharding=None) -> Array:
   r"""Sample standard normal random values with given shape and float dtype.
 
   The values are returned according to the probability density function:
@@ -702,12 +713,16 @@ def normal(key: ArrayLike,
   """
   key, _ = _check_prng_key("normal", key)
   shape = core.canonicalize_shape(shape)
+  out_sharding = canonicalize_sharding(out_sharding, 'normal')
   dtypes.check_user_dtype_supported(dtype)
   if not dtypes.issubdtype(dtype, np.inexact):
     raise ValueError(f"dtype argument to `normal` must be a float or complex dtype, "
                      f"got {dtype}")
   dtype = dtypes.canonicalize_dtype(dtype)
-  return _normal(key, shape, dtype)
+  if out_sharding is None:
+    return _normal(key, shape, dtype)
+  return auto_axes(partial(_normal, shape=shape, dtype=dtype),
+                   out_shardings=out_sharding)(key)
 
 @partial(jit, static_argnums=(1, 2))
 def _normal(key, shape, dtype) -> Array:
@@ -1500,7 +1515,8 @@ def poisson(key: ArrayLike,
 
 def gumbel(key: ArrayLike,
            shape: Shape = (),
-           dtype: DTypeLikeFloat = float) -> Array:
+           dtype: DTypeLikeFloat = float,
+           mode: str | None =None) -> Array:
   """Sample Gumbel random values with given shape and float dtype.
 
   The values are distributed according to the probability density function:
@@ -1514,6 +1530,7 @@ def gumbel(key: ArrayLike,
       shape. Default ().
     dtype: optional, a float dtype for the returned values (default float64 if
       jax_enable_x64 is true, otherwise float32).
+    mode: optional, "high" or "low" for how many bits to use when sampling.
 
   Returns:
     A random array with the specified shape and dtype.
@@ -1525,20 +1542,38 @@ def gumbel(key: ArrayLike,
                      f"dtype, got {dtype}")
   dtype = dtypes.canonicalize_dtype(dtype)
   shape = core.canonicalize_shape(shape)
-  return _gumbel(key, shape, dtype)
+  if mode is None:
+    mode = "high" if config.use_high_dynamic_range_gumbel.value else "low"
+  if mode not in ("high", "low"):
+    raise ValueError("Must provide valid mode for gumbel got: %s" % mode)
+  return _gumbel(key, shape, dtype, mode)
 
-@partial(jit, static_argnums=(1, 2))
-def _gumbel(key, shape, dtype) -> Array:
+@partial(jit, static_argnums=(1, 2, 3))
+def _gumbel(key, shape, dtype, mode) -> Array:
   _check_shape("gumbel", shape)
-  return -jnp.log(-jnp.log(
-      uniform(key, shape, dtype, minval=jnp.finfo(dtype).tiny, maxval=1.)))
+  if mode == "high":
+    high, low = _uniform(key, (2,) + shape, dtype, minval=0., maxval=1.)
+    # TODO(parkers): The condition is to protect against rounding up but
+    # we should be able to add safely with the right addition operation.
+    x = jnp.where(high >= 0.5, high,
+        high + 2 ** -(jnp.finfo(dtype).nmant) * low + jnp.finfo(dtype).tiny)
+    return -jnp.log(-jnp.log1p(-x))
+  else:
+    return -jnp.log(-jnp.log(
+        _uniform(key, shape, dtype, minval=jnp.finfo(dtype).tiny, maxval=1.)))
 
 
-def categorical(key: ArrayLike,
-                logits: RealArray,
-                axis: int = -1,
-                shape: Shape | None = None) -> Array:
+def categorical(
+  key: ArrayLike,
+  logits: RealArray,
+  axis: int = -1,
+  shape: Shape | None = None,
+  replace: bool = True,
+) -> Array:
   """Sample random values from categorical distributions.
+
+  Sampling with replacement uses the Gumbel max trick. Sampling without replacement uses
+  the Gumbel top-k trick. See [1] for reference.
 
   Args:
     key: a PRNG key used as the random key.
@@ -1548,32 +1583,57 @@ def categorical(key: ArrayLike,
     shape: Optional, a tuple of nonnegative integers representing the result shape.
       Must be broadcast-compatible with ``np.delete(logits.shape, axis)``.
       The default (None) produces a result shape equal to ``np.delete(logits.shape, axis)``.
+    replace: If True (default), perform sampling with replacement. If False, perform
+      sampling without replacement.
 
   Returns:
     A random array with int dtype and shape given by ``shape`` if ``shape``
     is not None, or else ``np.delete(logits.shape, axis)``.
+
+  References:
+    .. [1] Wouter Kool, Herke van Hoof, Max Welling. "Stochastic Beams and Where to Find
+      Them: The Gumbel-Top-k Trick for Sampling Sequences Without Replacement".
+      Proceedings of the 36th International Conference on Machine Learning, PMLR
+      97:3499-3508, 2019. https://proceedings.mlr.press/v97/kool19a.html.
   """
   key, _ = _check_prng_key("categorical", key)
   check_arraylike("categorical", logits)
   logits_arr = jnp.asarray(logits)
-
-  if axis >= 0:
-    axis -= len(logits_arr.shape)
-
   batch_shape = tuple(np.delete(logits_arr.shape, axis))
   if shape is None:
     shape = batch_shape
   else:
     shape = core.canonicalize_shape(shape)
     _check_shape("categorical", shape, batch_shape)
-
   shape_prefix = shape[:len(shape)-len(batch_shape)]
-  logits_shape = list(shape[len(shape) - len(batch_shape):])
-  logits_shape.insert(axis % len(logits_arr.shape), logits_arr.shape[axis])
-  return jnp.argmax(
-      gumbel(key, (*shape_prefix, *logits_shape), logits_arr.dtype) +
-      lax.expand_dims(logits_arr, tuple(range(len(shape_prefix)))),
-      axis=axis)
+
+  if replace:
+    if axis >= 0:
+      axis -= len(logits_arr.shape)
+
+    logits_shape = list(shape[len(shape) - len(batch_shape):])
+    logits_shape.insert(axis % len(logits_arr.shape), logits_arr.shape[axis])
+    return jnp.argmax(
+        gumbel(key, (*shape_prefix, *logits_shape), logits_arr.dtype) +
+        lax.expand_dims(logits_arr, tuple(range(len(shape_prefix)))),
+        axis=axis)
+  else:
+    logits_arr += gumbel(key, logits_arr.shape, logits_arr.dtype)
+    k = math.prod(shape_prefix)
+    if k > logits_arr.shape[axis]:
+      raise ValueError(
+        f"Number of samples without replacement ({k}) cannot exceed number of "
+        f"categories ({logits_arr.shape[axis]})."
+      )
+
+    _, indices = lax.top_k(jnp.moveaxis(logits_arr, axis, -1), k)
+    assert indices.shape == batch_shape + (k,)
+    assert shape == shape_prefix + batch_shape
+
+    dimensions = (indices.ndim - 1, *range(indices.ndim - 1))
+    indices = lax.reshape(indices, shape, dimensions)
+    assert indices.shape == shape
+    return indices
 
 
 def laplace(key: ArrayLike,
@@ -2042,18 +2102,27 @@ def orthogonal(
   key: ArrayLike,
   n: int,
   shape: Shape = (),
-  dtype: DTypeLikeFloat = float
+  dtype: DTypeLikeFloat = float,
+  m: int | None = None,
 ) -> Array:
-  """Sample uniformly from the orthogonal group O(n).
+  r"""Sample uniformly from the orthogonal group O(n).
 
   If the dtype is complex, sample uniformly from the unitary group U(n).
 
+  For unequal rows and columns, this samples a semi-orthogonal matrix instead.
+  That is, if :math:`A` is the resulting matrix and :math:`A^*` is its conjugate
+  transpose, then:
+
+  - If :math:`n \leq m`, the rows are mutually orthonormal: :math:`A A^* = I_n`.
+  - If :math:`m \leq n`, the columns are mutually orthonormal: :math:`A^* A = I_m`.
+
   Args:
     key: a PRNG key used as the random key.
-    n: an integer indicating the resulting dimension.
+    n: an integer indicating the number of rows.
     shape: optional, the batch dimensions of the result. Default ().
     dtype: optional, a float dtype for the returned values (default float64 if
       jax_enable_x64 is true, otherwise float32).
+    m: an integer indicating the number of columns. Defaults to `n`.
 
   Returns:
     A random array of shape `(*shape, n, n)` and specified dtype.
@@ -2063,15 +2132,26 @@ def orthogonal(
            the classical compact groups". Notices of the American Mathematical
            Society, 54(5), 592-604. https://arxiv.org/abs/math-ph/0609050.
   """
+  if m is None:
+    _m = n
+  else:
+    _m = m
   shape = core.canonicalize_shape(shape)
   key, _ = _check_prng_key("orthogonal", key)
   dtypes.check_user_dtype_supported(dtype)
   _check_shape("orthogonal", shape)
   n = core.concrete_or_error(index, n, "The error occurred in jax.random.orthogonal()")
-  z = normal(key, (*shape, n, n), dtype)
+  _m = core.concrete_or_error(index, _m, "The error occurred in jax.random.orthogonal()")
+
+  z = normal(key, (*shape, max(n, _m), min(n, _m)), dtype)
   q, r = jnp.linalg.qr(z)
   d = jnp.linalg.diagonal(r)
-  return q * jnp.expand_dims(jnp.sign(d), -2)
+  x = q * jnp.expand_dims(jnp.sign(d), -2)
+
+  if n < _m:
+    return x.mT
+  else:
+    return x
 
 def generalized_normal(
   key: ArrayLike,
@@ -2612,7 +2692,7 @@ def binomial(
   dtypes.check_user_dtype_supported(dtype)
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError(
-        "dtype argument to `binomial` must be a float dtype, got {dtype}"
+        f"dtype argument to `binomial` must be a float dtype, got {dtype}"
       )
   dtype = dtypes.canonicalize_dtype(dtype)
   if shape is not None:
@@ -2626,6 +2706,67 @@ dispatch.simple_impl(random_clone_p)
 random_clone_p.def_abstract_eval(lambda x: x)
 batching.defvectorized(random_clone_p)
 mlir.register_lowering(random_clone_p, lambda _, k: [k])
+
+
+def multinomial(
+    key: Array,
+    n: RealArray,
+    p: RealArray,
+    *,
+    shape: Shape | None = None,
+    dtype: DTypeLikeFloat = float,
+    unroll: int | bool = 1,
+):
+  r"""Sample from a multinomial distribution.
+
+  The probability mass function is
+
+  .. math::
+      f(x;n,p) = \frac{n!}{x_1! \ldots x_k!} p_1^{x_1} \ldots p_k^{x_k}
+
+  Args:
+    key: PRNG key.
+    n: number of trials. Should have shape broadcastable to ``p.shape[:-1]``.
+    p: probability of each outcome, with outcomes along the last axis.
+    shape: optional, a tuple of nonnegative integers specifying the result batch
+      shape, that is, the prefix of the result shape excluding the last axis.
+      Must be broadcast-compatible with ``p.shape[:-1]``. The default (None)
+      produces a result shape equal to ``p.shape``.
+    dtype: optional, a float dtype for the returned values (default float64 if
+      jax_enable_x64 is true, otherwise float32).
+    unroll: optional, unroll parameter passed to :func:`jax.lax.scan` inside the
+      implementation of this function.
+
+  Returns:
+    An array of counts for each outcome with the specified dtype and with shape
+      ``p.shape`` if ``shape`` is None, otherwise ``shape + (p.shape[-1],)``.
+  """
+
+  key, _ = _check_prng_key("multinomial", key)
+  check_arraylike("multinomial", n, p)
+  n, p = promote_dtypes_inexact(n, p)
+
+  if shape is None:
+    shape = p.shape
+  n = jnp.broadcast_to(n, shape[:-1])
+  p = jnp.broadcast_to(p, shape)
+
+  def f(remainder, ratio_key):
+    ratio, key = ratio_key
+    count = binomial(key, remainder, ratio.clip(0, 1), dtype=remainder.dtype)
+    return remainder - count, count
+
+  p = jnp.moveaxis(p, -1, 0)
+
+  remaining_probs = lax.cumsum(p, 0, reverse=True)
+  ratios = p / jnp.where(remaining_probs == 0, 1, remaining_probs)
+
+  keys = split(key, ratios.shape[0])
+  remainder, counts = lax.scan(f, n, (ratios, keys), unroll=unroll)
+  # final remainder should be zero
+
+  return jnp.moveaxis(counts, 0, -1).astype(dtype)
+
 
 def clone(key):
   """Clone a key for reuse

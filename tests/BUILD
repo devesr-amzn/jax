@@ -80,6 +80,15 @@ jax_py_test(
     ] + py_deps("absl/testing"),
 )
 
+jax_py_test(
+    name = "array_extensibility_test",
+    srcs = ["array_extensibility_test.py"],
+    deps = [
+        "//jax",
+        "//jax:test_util",
+    ] + py_deps("absl/testing"),
+)
+
 jax_multiplatform_test(
     name = "array_interoperability_test",
     srcs = ["array_interoperability_test.py"],
@@ -88,8 +97,11 @@ jax_multiplatform_test(
         "gpu",
     ],
     enable_configs = [
-        "gpu_p100x2",
+        "gpu_h100x2",
     ],
+    env = {
+        "PYTHONWARNINGS": "default",  # TODO(b/394123878): protobuf, via TensorFlow, issues a Python warning under Python 3.12+ sometimes.
+    },
     tags = ["multiaccelerator"],
     deps = py_deps("tensorflow_core"),
 )
@@ -123,6 +135,22 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "debug_nans_test",
     srcs = ["debug_nans_test.py"],
+)
+
+jax_py_test(
+    name = "distributed_initialize_test",
+    srcs = ["distributed_initialize_test.py"],
+    deps = [
+        "//jax",
+        "//jax:test_util",
+    ] + py_deps("portpicker"),
+)
+
+jax_multiplatform_test(
+    name = "distributed_test",
+    srcs = ["distributed_test.py"],
+    enable_backends = ["gpu"],
+    deps = py_deps("portpicker"),
 )
 
 jax_py_test(
@@ -162,7 +190,7 @@ jax_multiplatform_test(
     name = "ffi_test",
     srcs = ["ffi_test.py"],
     enable_configs = [
-        "gpu_p100x2",
+        "gpu_h100x2",
     ],
     # TODO(dfm): Remove after removal of jex.ffi imports.
     deps = ["//jax:extend"],
@@ -246,7 +274,7 @@ jax_multiplatform_test(
     srcs = ["memories_test.py"],
     enable_configs = [
         "cpu",
-        "gpu_p100x2",
+        "gpu_h100x2",
         "tpu_v3_2x2",
         "tpu_v4_2x2",
         "tpu_v5p_2x2",
@@ -273,7 +301,7 @@ jax_multiplatform_test(
         "gpu_p100x2_shardy",
         "tpu_v3_2x2_shardy",
         "tpu_v3_2x2",
-        "gpu_p100x2",
+        "gpu_h100x2",
     ],
     shard_count = {
         "cpu": 5,
@@ -468,6 +496,7 @@ jax_multiplatform_test(
     name = "lax_numpy_test",
     srcs = ["lax_numpy_test.py"],
     backend_tags = {
+        "tpu": ["notsan"],  # Test times out.
         "cpu": ["notsan"],  # Test times out.
     },
     shard_count = {
@@ -579,9 +608,9 @@ jax_multiplatform_test(
     name = "lax_scipy_spectral_dac_test",
     srcs = ["lax_scipy_spectral_dac_test.py"],
     shard_count = {
-        "cpu": 40,
-        "gpu": 40,
-        "tpu": 40,
+        "cpu": 20,
+        "gpu": 10,
+        "tpu": 10,
     },
     deps = [
         "//jax:internal_test_util",
@@ -691,6 +720,22 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "linalg_sharding_test",
+    srcs = ["linalg_sharding_test.py"],
+    enable_backends = [
+        "cpu",
+    ],
+    enable_configs = [
+        "gpu_h100x2",
+        "gpu_p100x2_shardy",
+        "gpu_p100x2_pjrt_c_api",
+    ],
+    tags = [
+        "multiaccelerator",
+    ],
+)
+
+jax_multiplatform_test(
     name = "magma_linalg_test",
     srcs = ["magma_linalg_test.py"],
     enable_backends = ["gpu"],
@@ -722,7 +767,7 @@ jax_multiplatform_test(
     srcs = ["multibackend_test.py"],
     enable_configs = [
         "tpu_v3_2x2",
-        "gpu_p100x2",
+        "gpu_h100x2",
     ],
 )
 
@@ -814,7 +859,20 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "profiler_test",
     srcs = ["profiler_test.py"],
-    enable_backends = ["cpu"],
+    backend_tags = {
+        "gpu": [
+            # disable suspicious leaking in cupti/cuda,
+            # TODO: remove this once b/372714955 is resolved.
+            "noasan",
+        ],
+    },
+    enable_backends = [
+        "cpu",
+        "gpu",
+    ],
+    deps = [
+        "//jax:profiler",
+    ],
 )
 
 jax_multiplatform_test(
@@ -1065,20 +1123,6 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
-    name = "sparse_nm_test",
-    srcs = ["sparse_nm_test.py"],
-    enable_backends = [],
-    enable_configs = [
-        "gpu_a100",
-        "gpu_h100",
-    ],
-    deps = [
-        "//jax:experimental_sparse",
-        "//jax:pallas_gpu",
-    ],
-)
-
-jax_multiplatform_test(
     name = "sparsify_test",
     srcs = ["sparsify_test.py"],
     args = ["--jax_bcoo_cusparse_lowering=true"],
@@ -1120,6 +1164,11 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "error_check_test",
     srcs = ["error_check_test.py"],
+)
+
+jax_multiplatform_test(
+    name = "jax_numpy_error_test",
+    srcs = ["jax_numpy_error_test.py"],
 )
 
 jax_multiplatform_test(
@@ -1400,8 +1449,8 @@ jax_multiplatform_test(
         "gpu_p100x2_shardy",
     ],
     shard_count = {
-        "gpu": 10,
-        "tpu": 10,
+        "gpu": 5,
+        "tpu": 5,
     },
     tags = [
         "multiaccelerator",
@@ -1510,6 +1559,9 @@ jax_multiplatform_test(
         "cpu_shardy",  # TODO(b/355263220): enable once export is supported.
     ],
     enable_configs = [
+        "cpu_shardy",
+        "gpu_p100x2_shardy",
+        "tpu_v3_2x2_shardy",
         "tpu_v3_2x2",
     ],
     tags = [],
@@ -1588,6 +1640,20 @@ jax_multiplatform_test(
     deps = ["//jax:experimental"],
 )
 
+jax_multiplatform_test(
+    name = "unary_ops_accuracy_test",
+    srcs = ["unary_ops_accuracy_test.py"],
+    disable_configs = [
+        "tpu_pjrt_c_api",
+    ],
+    enable_backends = [
+        "tpu",
+    ],
+    deps = [
+        "//jax:experimental",
+    ],
+)
+
 jax_py_test(
     name = "pretty_printer_test",
     srcs = ["pretty_printer_test.py"],
@@ -1630,6 +1696,15 @@ jax_multiplatform_test(
         "gpu_h100",
     ],
     tags = ["multiaccelerator"],
+)
+
+jax_multiplatform_test(
+    name = "scaled_matmul_stablehlo_test",
+    srcs = ["scaled_matmul_stablehlo_test.py"],
+    enable_backends = ["gpu"],
+    shard_count = {
+        "gpu": 4,
+    },
 )
 
 jax_py_test(

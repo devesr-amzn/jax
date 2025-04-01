@@ -22,6 +22,7 @@ from functools import partial
 import itertools
 import math
 
+import jax
 from jax import tree_util
 from jax._src import core
 from jax._src import config
@@ -34,6 +35,7 @@ from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
+from jax._src.mesh import get_abstract_mesh
 from jax._src.lax import lax
 from jax._src.lax import slicing
 from jax._src.lib.mlir import ir
@@ -202,6 +204,7 @@ def pmax(x, axis_name, *, axis_index_groups=None):
   _validate_reduce_axis_index_groups(axis_index_groups)
   leaves, treedef = tree_util.tree_flatten(x)
   axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
+  leaves = map(partial(insert_collective_pbroadcast, axis_name), leaves)
   out_flat = pmax_p.bind(*leaves, axes=axis_name,
                          axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, out_flat)
@@ -232,6 +235,7 @@ def pmin(x, axis_name, *, axis_index_groups=None):
   _validate_reduce_axis_index_groups(axis_index_groups)
   leaves, treedef = tree_util.tree_flatten(x)
   axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
+  leaves = map(partial(insert_collective_pbroadcast, axis_name), leaves)
   out_flat = pmin_p.bind(*leaves, axes=axis_name,
                          axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, out_flat)
@@ -325,9 +329,10 @@ def ppermute(x, axis_name, perm):
   """
   if not isinstance(axis_name, (list, tuple)):
     axis_name = (axis_name,)
-  return tree_util.tree_map(
-      partial(ppermute_p.bind, axis_name=axis_name,
-              perm=tuple(map(tuple, perm))), x)
+  def bind(leaf):
+    leaf = insert_collective_pbroadcast(axis_name, leaf)
+    return ppermute_p.bind(leaf, axis_name=axis_name, perm=tuple(map(tuple, perm)))
+  return tree_util.tree_map(bind, x)
 
 def pshuffle(x, axis_name, perm):
   """Convenience wrapper of jax.lax.ppermute with alternate permutation encoding
@@ -447,6 +452,7 @@ def all_to_all(x, axis_name, split_axis, concat_axis, *, axis_index_groups=None,
       else:  # concat_axis < split_axis
         x = lax.expand_dims(x, (concat_axis,))  # insert the new axis
         split_axis += 1   # we have a new axis before split_axis now
+    x = insert_collective_pbroadcast(axis_name, x)
     result = all_to_all_p.bind(x, split_axis=split_axis, concat_axis=concat_axis,
                                axis_name=axis_name,
                                axis_index_groups=axis_index_groups,
@@ -460,78 +466,135 @@ def all_to_all(x, axis_name, split_axis, concat_axis, *, axis_index_groups=None,
 def ragged_all_to_all(
     operand, output, input_offsets, send_sizes, output_offsets, recv_sizes, *,
     axis_name, axis_index_groups = None):
-  """Ragged version of :func:`all_to_all`.
+  """Ragged version of :func:`all_to_all` collective.
 
-  For now, ``split_axis`` and ``concat_axis`` from `all_to_all` are equivalent
-  and the outermost (ragged) dimension. ``axis_index_groups`` is default to all
-  replicas (e.g. there is only one group and covers all axis indices).
+  We say data are "ragged" when they can be represented as a list of arrays
+  whose shapes differ only in the size of the leading axis. For example, these
+  data are ragged, comprising four component arrays::
 
-  Ragged arrays are defined by a set of three arrays:
-  * ``data``: the ``data`` array is "ragged" along its outermost dimension,
-    along which each indexed element has variable size.
-  * ``offsets``: the ``offsets`` array indexes the outermost dimension of the
-    ``data`` array, and represents the starting offset of each ragged element of
-    the ``data`` array.
-  * ``sizes``: the ``sizes`` array represents the size of each ragged element of
-    the ``data`` array, where the size is specified in units of sub-elements. A
-    sub-element is defined as the suffix of the ``data`` array shape obtained by
-    removing the outermost "ragged" dimension.
-  The ``offsets`` and ``sizes`` arrays must have the same size.
+    ragged_data = [jnp.arange(3), jnp.arange(1), jnp.arange(4), jnp.arange(1)]
 
-  # Example ragged tensor
-  data: [8,3] = {{a,b,c},{d,e,f},{g,h,i},{j,k,l},{m,n,o},{p,q,r},{s,t,u},{v,w,x}}
-  offsets: [3] = {0, 1, 4}
-  sizes: [3] = {1, 3, 4}
+  We often instead want a contiguous representation, e.g. for batching. But
+  because the shapes of the components differ, we can't apply ``jnp.stack`` to
+  represent these data by a single rectangular array with the leading axis
+  indexing the component arrays. So instead of stacking, we concatenate along
+  the leading axis and keep track of offsets and sizes.
 
-  # Index 'data' at 'offsets'[0], 'sizes'[0]'
-  {a,b,c}
+  That is, we can represent ragged data contiguously using a triple of dense
+  arrays ``(data, offsets, sizes)``:
+    * ``data``: the concatenated component arrays,
+    * ``offsets``: 1D array of indices into the leading axis of ``data``
+      indicating where the data for each component array begins,
+    * ``sizes``: 1D array of sizes of the leading axis of each component array.
+  We refer to this triple as a ragged array. (Offsets can't be computed from
+  sizes in general to allow for internal padding.)
 
-  # Index 'data' at 'offsets'[1], 'sizes'[1]'
-  {d,e,f},{g,h,i},{j,k,l}
+  For example::
+    data: f32[8,3] = jnp.array([
+        [a,b,c], [d,e,f], [g,h,i], [j,k,l], [m,n,o], [p,q,r], [s,t,u], [v,w,x],
+    ])
+    offsets: i32[3] = jnp.array([0, 1, 4])
+    sizes: i32[3] = jnp.array([1, 3, 4])
 
-  # Index 'data' at 'offsets'[2], 'sizes'[2]'
-  {m,n,o},{p,q,r},{s,t,u},{v,w,x}
+    # To extract the first component array, of type f32[1,3]
+    data[offsets[0]:offsets[0]+sizes[0]]
 
+    # To extract the second component array, of type f32[3,3]
+    data[offsets[1]:offsets[1]+sizes[1]]
 
-  ``output_offsets`` must be sharded in a way that each replica has offsets in
-  the target replica output perspective.
+    # To extract the third component array, of type f32[4,3]
+    data[offsets[2]:offsets[2]+sizes[2]]
 
-  For i-th output offset, the current replica will send
-  `operand[input_offsets[i]:input_offsets[i]+input_sizes[i]]` update to `i`-th
-  replica that will be written to
-  `output_i[output_offsets[i]:output_offsets[i]+send_sizes[i]]` in `i`-th
-  replica ``output``.
+  The ``ragged_all_to_all`` collective operation communicates slices of ragged
+  arrays between devices. Each caller is both a sender and a receiver. The
+  ``input_offsets`` and ``send_sizes`` arguments indicate the slices of the
+  caller's ``operand`` to be sent. Received results are returned in an array
+  that has the same value of the argument ``output`` except with received values
+  written at some slices. The ``output_offsets`` argument does *not* indicate
+  the offsets at which all the received results are written; instead,
+  ``output_offsets`` indicates the offsets at which the *sent* slices are
+  written on their corresponding receivers. The sizes of received slices are
+  indicated by ``recv_sizes``. See below for details.
 
-  For example, if we have 2 replicas:
+  The arrays ``input_offsets``, ``send_sizes``,``output_offsets``, and
+  ``recv_sizes`` must all be the same length, and that length must be divisible
+  by the size of the mapped axis ``axis_name``. Moreover, ``send_sizes`` and
+  ``recv_sizes`` must satisfy::
 
-  replica 0:
-    operand: [1, 2, 2]
-    output: [0, 0, 0, 0]
-    input_offsets: [0, 1]
-    send_sizes: [1, 2]
-    output_offsets: [0, 0]
-    recv_sizes: [1, 1]
+    jnp.all(send_sizes == jax.lax.all_to_all(recv_sizes, axis_name, 0, 0, tiled=True))
 
-  replica 1:
-    operand: [3, 4, 0]
-    output: [0, 0, 0, 0]
-    input_offsets: [0, 1]
-    send_sizes: [1, 1]
-    output_offsets: [1, 2]
-    recv_sizes: [2, 1]
+  Specifically, given a call::
 
-  replica 0's result will be: [1, 3, 0, 0]
-  replica 1's result will be: [2, 2, 4, 0]
+    result = ragged_all_to_all(operand, output, input_offsets, send_sizes,
+                               output_offsets, recv_sizes, axis_name)
+
+  the caller sends data like::
+
+    assert len(input_offsets) == len(send_sizes) == len(output_offsets) == len(recv_sizes)
+    N = len(input_offsets)
+    slices_per_device, leftover = divmod(N, lax.axis_size(axis_name))
+    assert not leftover
+
+    for i in range(N):
+      dst_idx = i // slices_per_device
+      SEND(data=operand[input_offsets[i]:input_offsets[i]+send_sizes[i]],
+           axis_name=axis_name, to_axis_index=dst_idx)
+
+  and receives data in ``result`` like::
+
+    result = output
+    output_offsets_ = jax.lax.all_to_all(output_offsets, axis_name, 0, 0, tiled=True)
+    for i in range(N):
+      src_idx = i // slices_per_device
+      result = result.at[output_offsets_[i]:output_offsets_[i]+recv_sizes[i]
+                    ].set(RECEIVE(axis_name=axis_name, from_axis_index=src_idx))
+
+  where ``SEND`` and ``RECEIVE`` are pseudocode. Notice that a caller's local
+  ``output_offsets`` does not indicate the offsets at which its local ``result``
+  is updated; instead, it indicates where the corresponding sent slices are
+  written on their destination instances. To compute the local offsets at which
+  received data are written, we apply an ``all_to_all`` on ``output_offsets``.
+
+  For example, if we apply a ``ragged_all_to_all`` along an axis of size 2, with
+  these arguments in each mapped function instance::
+
+    axis index 0:
+      operand = [1, 2, 2]
+      output = [0, 0, 0, 0]
+      input_offsets = [0, 1]
+      send_sizes = [1, 2]
+      output_offsets = [0, 0]
+      recv_sizes = [1, 1]
+
+    axis index 1:
+      operand = [3, 4, 0]
+      output = [0, 0, 0, 0]
+      input_offsets = [0, 1]
+      send_sizes = [1, 1]
+      output_offsets = [1, 2]
+      recv_sizes = [2, 1]
+
+  then::
+
+    axis index 0:
+      result = [1, 3, 0, 0]
+
+    axis index 1:
+      result = [2, 2, 4, 0]
 
   Args:
-    operand: array with ragged dimension along its outermost dimension.
-    output: array of ragged input offsets.
-    input_offsets: array of ragged input send sizes.
-    send_sizes: array of ragged output data.
-    output_offsets: array of ragged offsets in the target replica output.
-    recv_sizes: array of ragged output receive sizes.
-    axis_name: hashable Python object used to name a pmapped axis (see the
-      :func:`jax.pmap` documentation for more details).
+    operand: data array of shape (N, A, B, ...) representing concatenated
+      (possibly padded) ragged data to be sent.
+    output: data array of shape (M, A, B, ...) to update with received data.
+    input_offsets: 1D integer array of shape (K,) representing the offsets of
+      leading-axis slices into ``operand`` to be sent.
+    send_sizes: 1D integer array array of shape (K,) representing the sizes of
+      leading-axis slices into ``operand`` to be sent.
+    output_offsets: 1D integer array of shape (K,) representing where the
+      corresponding sent data is written on each corresponding receiver.
+    recv_sizes: 1D integer array of shape (K,) representing sizes of
+      leading-axis slices into ``output`` to update with received data.
+    axis_name: name of the mapped axis over which to perform the communication.
     axis_index_groups: optional list of lists containing axis indices (e.g. for
       an axis of size 4, [[0, 1], [2, 3]] would run ragged all to all over the
       first two and last two replicas). Groups must cover all axis indices
@@ -539,7 +602,10 @@ def ragged_all_to_all(
       behavior is undefined.
 
   Returns:
-    array with shape equal to ``output``.
+    Array of shape (M, A, B, ...) with the same value as the ``output`` except
+    with received data written into slices starting at
+    ``all_to_all(output_offsets, axis_name, 0, 0, tiled=True)`` and with size
+    ``recv_sizes``.
   """
 
   if not isinstance(axis_name, (tuple, list)):
@@ -732,17 +798,55 @@ def _allreduce_effectful_abstract_eval(*args, axes, axis_index_groups):
     if len(pos_axes) != 0:
       raise ValueError(f"axis_index_groups can only be used with reductions over "
                        f"named axes, but got: {axes}")
-  if config.sharding_in_types.value:
-    core.check_avals_context_mesh(args, 'all_reduce')
-    out_avals = [
-        ShapedArray(lax._reduce_op_shape_rule(arg, axes=pos_axes), arg.dtype,
-                    sharding=lax._reduce_op_sharding_rule(arg, axes=pos_axes))
-        for arg in args
-    ]
-  else:
-    out_avals = [ShapedArray(lax._reduce_op_shape_rule(arg, axes=pos_axes), arg.dtype)
-                 for arg in args]
+  core.check_avals_context_mesh(args, 'all_reduce')
+  out_avals = [
+      ShapedArray(lax._reduce_op_shape_rule(arg, axes=pos_axes), arg.dtype,
+                  sharding=lax._reduce_op_sharding_rule(arg, axes=pos_axes))
+      for arg in args
+  ]
   return out_avals, {core.NamedAxisEffect(axis) for axis in named_axes}
+
+def _psum2_abstract_eval(name, *args, axes, axis_index_groups):
+  if not config.varying_axes_in_types.value:
+    return psum_p.abstract_eval(
+        *args, axes=axes, axis_index_groups=axis_index_groups)
+
+  assert isinstance(axes, tuple)
+  _check_axis_names(axes)
+  arg_vma = [a.vma for a in args]
+  # If intersection between arg_vma and axes is empty, error
+  if any(not set(axes) & a for a in arg_vma):
+    raise ValueError(
+        f"Collective {name} must be applied to a device-varying "
+        f"type, but got {arg_vma} for collective acting "
+        f"over axis name {axes}. Please open an issue at "
+        "https://github.com/jax-ml/jax/issues, and as a temporary "
+        "workaround pass the check_rep=False argument to shard_map")
+
+  named_axes = tuple(axis for axis in axes if not isinstance(axis, int))
+  pos_axes = tuple(axis for axis in axes if isinstance(axis, int))
+  if axis_index_groups is not None:
+    if len(pos_axes) != 0:
+      raise ValueError(
+          "axis_index_groups can only be used with reductions over "
+          f"named axes, but got: {axes}")
+  core.check_avals_context_mesh(args, 'all_reduce')
+  out_avals = [
+      core.ShapedArray(
+          lax._reduce_op_shape_rule(arg, axes=pos_axes), arg.dtype,
+          sharding=lax._reduce_op_sharding_rule(arg, axes=pos_axes),
+          vma=frozenset(a for a in arg.vma if a not in named_axes))
+      for arg in args
+  ]
+  return out_avals, {core.NamedAxisEffect(axis) for axis in named_axes}
+
+# TODO(yashkatariya): Replace this with _psum2_abstract_eval
+def _pmin_pmax_abstract_eval(name, *args, axes, axis_index_groups):
+  if not config.varying_axes_in_types.value:
+    return _allreduce_effectful_abstract_eval(
+        *args, axes=axes, axis_index_groups=axis_index_groups)
+  return _psum2_abstract_eval(name, *args, axes=axes,
+                              axis_index_groups=axis_index_groups)
 
 def _check_axis_names(axes):
   named_axes = tuple(axis for axis in axes if not isinstance(axis, int))
@@ -795,11 +899,8 @@ def _allreduce_lowering(prim, pos_fn, ctx, *args, axes, axis_index_groups):
     else:
       op = hlo.AllReduceOp(
           [x.type], [x], replica_groups=replica_groups, **other_args)
-    if config.sharding_in_types.value:
-      scalar_aval = core.ShapedArray(
-          (), aval.dtype, sharding=NamedSharding(aval.sharding.mesh, P()))
-    else:
-      scalar_aval = core.ShapedArray((), aval.dtype)
+    scalar_aval = core.ShapedArray(
+        (), aval.dtype, sharding=NamedSharding(aval.sharding.mesh, P()))
     scalar_type = mlir.aval_to_ir_type(scalar_aval)
     reducer_block = op.regions[0].blocks.append(scalar_type, scalar_type)
     with ir.InsertionPoint(reducer_block):
@@ -846,7 +947,7 @@ batching.skippable_batchers[psum_p] = partial(_names_in_param, 'axes')
 pmax_p = core.Primitive('pmax')
 pmax_p.multiple_results = True
 pmax_p.def_impl(partial(_allreduce_impl, pmax_p, lax.reduce_max))
-pmax_p.def_effectful_abstract_eval(_allreduce_effectful_abstract_eval)
+pmax_p.def_effectful_abstract_eval(partial(_pmin_pmax_abstract_eval, 'pmax'))
 mlir.register_lowering(
     pmax_p, partial(_allreduce_lowering, lax.max_p, lax.reduce_max))
 batching.fancy_primitive_batchers[pmax_p] = \
@@ -857,7 +958,7 @@ batching.skippable_batchers[pmax_p] = partial(_names_in_param, 'axes')
 pmin_p = core.Primitive('pmin')
 pmin_p.multiple_results = True
 pmin_p.def_impl(partial(_allreduce_impl, pmin_p, lax.reduce_min))
-pmin_p.def_effectful_abstract_eval(_allreduce_effectful_abstract_eval)
+pmin_p.def_effectful_abstract_eval(partial(_pmin_pmax_abstract_eval, 'pmin'))
 mlir.register_lowering(
     pmin_p, partial(_allreduce_lowering, lax.min_p, lax.reduce_min))
 batching.fancy_primitive_batchers[pmin_p] = \
@@ -922,6 +1023,7 @@ def _ppermute_batcher(axis_data, vals_in, dims_in, axis_name, perm):
 
 def _raise_to_shaped_abstract_eval(x, *, axis_name, **params):
   _check_axis_names(axis_name)
+  collective_vma_rule('ppermute', axis_name, x)
   return x
 
 ppermute_p = core.Primitive('ppermute')
@@ -1056,15 +1158,15 @@ def _all_to_all_batcher(vals_in, dims_in, *, axis_name, split_axis, concat_axis,
 def _all_to_all_batched_collective(axis_data, vals_in, dims_in,
                                    axis_name, split_axis, concat_axis,
                                    axis_index_groups, tiled):
-  axis_size, frame_name = axis_data.size, axis_data.name
   if axis_index_groups is not None:
     raise NotImplementedError("Please open a feature request!")
 
+  axis_size, frame_name = axis_data.size, axis_data.name
   if isinstance(axis_name, (list, tuple)):
     axes_names = axis_name
   else:
     axes_names = [axis_name]
-  if axis_data.name not in axes_names:
+  if frame_name not in axes_names:
     return _all_to_all_batcher(
       vals_in, dims_in, axis_name=axis_name, split_axis=split_axis,
       concat_axis=concat_axis, axis_index_groups=axis_index_groups, tiled=tiled)
@@ -1104,6 +1206,7 @@ def _all_to_all_batched_collective(axis_data, vals_in, dims_in,
                           axis_index_groups=axis_index_groups,
                           tiled=tiled)
   # Split out the local part into axis new_d (NOTE: d is already in axis 1)
+  assert d == 1
   x = _splitaxis(split_axis, axis_size, x)
   new_d = split_axis
   concat_axis += (split_axis <= concat_axis)  # Offset the existing axes by the new batch axis
@@ -1135,7 +1238,8 @@ def _all_to_all_effectful_abstract_eval(
   assert shape[split_axis] % axis_size == 0, (shape[split_axis], axis_size)
   shape[split_axis] //= axis_size
   shape[concat_axis] *= axis_size
-  out_aval = input_aval.update(shape=tuple(shape), weak_type=False)
+  vma = collective_vma_rule('all_to_all', axis_name, input_aval)
+  out_aval = input_aval.update(shape=tuple(shape), weak_type=False, vma=vma)
   effects = {*map(core.NamedAxisEffect, axis_name)}
   return out_aval, effects
 
@@ -1218,10 +1322,59 @@ def _ragged_all_to_all_effectful_abstract_eval(
   effects = {*map(core.NamedAxisEffect, axis_name)}
   return out_aval, effects
 
+def _ragged_all_to_all_jvp(primals, tangents, **params):
+  operand, output, *sizes_and_offsets = primals
+  operand_dot, output_dot, *_ = tangents
+  result = ragged_all_to_all_p.bind(
+      operand, output, *sizes_and_offsets, **params)
+  if type(operand_dot) is type(output_dot) is ad.Zero:
+    result_dot = ad.Zero.from_primal_value(result)
+  else:
+    operand_dot = ad.instantiate_zeros(operand_dot)
+    output_dot = ad.instantiate_zeros(output_dot)
+    result_dot = ragged_all_to_all_p.bind(
+        operand_dot, output_dot, *sizes_and_offsets, **params)
+  return result, result_dot
+
+def _ragged_all_to_all_transpose(
+    t, operand, output, input_offsets, send_sizes, output_offsets, recv_sizes,
+    *, axis_name, axis_index_groups):
+  if type(t) is ad.Zero:
+    operand_t = ad.Zero(operand.aval) if ad.is_undefined_primal(operand) else None
+    output_t = ad.Zero(output.aval) if ad.is_undefined_primal(output) else None
+  else:
+    zero = ad.zeros_like_aval(operand.aval)
+    output_offsets_ = all_to_all(output_offsets, axis_name, 0, 0, tiled=True)
+    input_offsets_ = all_to_all(input_offsets, axis_name, 0, 0, tiled=True)
+    operand_t = ragged_all_to_all_p.bind(
+        t, zero, output_offsets_, recv_sizes, input_offsets_, send_sizes,
+        axis_name=axis_name, axis_index_groups=axis_index_groups)
+    mask = jax.numpy.cumsum(
+        jax.numpy.zeros(t.shape[0], dtype='int32').at[output_offsets_].set(1)\
+        .at[output_offsets_ + recv_sizes].add(-1))
+    mask = jax.numpy.expand_dims(mask, (*range(1, t.ndim),))
+    output_t = jax.numpy.where(mask, 0, t)
+  return [operand_t, output_t] + [None] * 4
+
 ragged_all_to_all_p = core.Primitive('ragged_all_to_all')
 ragged_all_to_all_p.def_effectful_abstract_eval(_ragged_all_to_all_effectful_abstract_eval)
+ad.primitive_jvps[ragged_all_to_all_p] = _ragged_all_to_all_jvp
+ad.primitive_transposes[ragged_all_to_all_p] = _ragged_all_to_all_transpose
 mlir.register_lowering(ragged_all_to_all_p, _ragged_all_to_all_lowering)
 batching.skippable_batchers[ragged_all_to_all_p] = partial(_names_in_param, 'axis_name')
+
+def insert_collective_pbroadcast(axis_name, x):
+  if not config.varying_axes_in_types.value:
+    return x
+
+  from jax.experimental import shard_map
+  axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
+  aval = core.get_aval(x)
+  names_union = set(axis_name) | aval.vma
+  pbroadcast_axis_name = tuple(n for n in names_union if n not in aval.vma)
+  if pbroadcast_axis_name:
+    x = shard_map.pbroadcast(x, pbroadcast_axis_name)
+  return x
 
 def all_gather(x, axis_name, *, axis_index_groups=None, axis=0, tiled=False):
   """Gather values of x across all replicas.
@@ -1292,6 +1445,7 @@ def all_gather(x, axis_name, *, axis_index_groups=None, axis=0, tiled=False):
   axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
   axis_size = psum(1, axis_name, axis_index_groups=axis_index_groups)
   def bind(leaf):
+    leaf = insert_collective_pbroadcast(axis_name, leaf)
     return all_gather_p.bind(
         leaf,
         all_gather_dimension=canonicalize_axis(
@@ -1344,6 +1498,19 @@ def _all_gather_lowering(ctx, x, *, all_gather_dimension, axis_name,
       **other_args).results
 
 
+def collective_vma_rule(prim_name, axis_name, x_aval):
+  if not config.varying_axes_in_types.value:
+    return frozenset()
+  axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
+  if any(a not in x_aval.vma for a in axis_name):
+    raise ValueError(
+        f"Collective {prim_name} must be applied to a device-varying "
+        f" type, but got {x_aval.vma} for collective acting "
+        f"over axis name {axis_name}. Please open an issue at "
+        "https://github.com/jax-ml/jax/issues and as a temporary "
+        "workaround pass the check_rep=False argument to shard_map")
+  return x_aval.vma
+
 def _all_gather_effectful_abstract_eval(
     x_aval, *, all_gather_dimension, axis_name, axis_index_groups, axis_size, tiled
 ):
@@ -1355,7 +1522,9 @@ def _all_gather_effectful_abstract_eval(
     new_shape[all_gather_dimension] *= axis_size
   else:
     new_shape.insert(all_gather_dimension, axis_size)
-  return x_aval.update(shape=new_shape), {*map(core.NamedAxisEffect, axis_name)}
+  out_vma = collective_vma_rule('all_gather', axis_name, x_aval)
+  return (x_aval.update(shape=new_shape, vma=out_vma),
+          {*map(core.NamedAxisEffect, axis_name)})
 
 def _all_gather_transpose_rule(cts, x, *, all_gather_dimension, axis_name, axis_index_groups, axis_size, tiled):
   return (psum_scatter(cts, axis_name=axis_name,
@@ -1492,7 +1661,9 @@ def _reduce_scatter_effectful_abstract_eval(
                        f"{scatter_dim_input_size} must match shard count "
                        f"{axis_size}")
     del new_shape[scatter_dimension]
-  return x_aval.update(shape=new_shape), {*map(core.NamedAxisEffect, axis_name)}
+  vma = collective_vma_rule('reduce_scatter', axis_name, x_aval)
+  return (x_aval.update(shape=new_shape, vma=vma),
+          {*map(core.NamedAxisEffect, axis_name)})
 
 
 def _reduce_scatter_transpose_rule(cts, x, *, axis_name, scatter_dimension,
@@ -1636,13 +1807,11 @@ def psum_scatter(x, axis_name, *, scatter_dimension=0, axis_index_groups=None,
     axis_name = axis_name,
   axis_size = psum(1, axis_name, axis_index_groups=axis_index_groups)
   axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
-  bind = partial(
-      reduce_scatter_p.bind,
-      axis_name=axis_name,
-      scatter_dimension=scatter_dimension,
-      axis_index_groups=axis_index_groups,
-      axis_size=axis_size,
-      tiled=tiled)
+  def bind(leaf):
+    leaf = insert_collective_pbroadcast(axis_name, leaf)
+    return reduce_scatter_p.bind(
+        leaf, axis_name=axis_name, scatter_dimension=scatter_dimension,
+        axis_index_groups=axis_index_groups, axis_size=axis_size, tiled=tiled)
   return tree_util.tree_map(bind, x)
 
 
@@ -1692,8 +1861,14 @@ def _axis_index_lowering(ctx, *, axis_name):
                                          ctx.module_context.axis_env)]
 
 def _axis_index_effectful_abstract_eval(*, axis_name):
-  _check_axis_names([axis_name])
-  return ShapedArray((), np.int32), {core.NamedAxisEffect(axis_name)}
+  axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
+  effect = {core.NamedAxisEffect(axis_name)}
+  _check_axis_names(axis_name)
+  mesh = get_abstract_mesh()
+  sharding = NamedSharding(mesh, P())
+  vma = ((frozenset(axis_name) if mesh._any_axis_manual else frozenset())
+         if config.varying_axes_in_types.value else frozenset())
+  return ShapedArray((), np.int32, sharding=sharding, vma=vma), effect
 
 def _axis_index_batcher(axis_data, vals_in, dims_in, *, axis_name):
   return lax.iota(np.int32, axis_data.size), 0

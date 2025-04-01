@@ -69,7 +69,7 @@ def dots_saveable(prim, *_, **__) -> bool:
                   lax_convolution.conv_general_dilated_p}
 checkpoint_dots = dots_saveable
 
-def dot_with_no_batch_dims_saveable(prim, *_, **params) -> bool:
+def dots_with_no_batch_dims_saveable(prim, *_, **params) -> bool:
   # This is a useful heuristic for transformers.
   if prim is lax_internal.dot_general_p:
     (_, _), (lhs_b, rhs_b) = params['dimension_numbers']
@@ -160,8 +160,8 @@ checkpoint_policies = types.SimpleNamespace(
     nothing_saveable=nothing_saveable,
     dots_saveable=dots_saveable,
     checkpoint_dots=dots_saveable,
-    dots_with_no_batch_dims_saveable=dot_with_no_batch_dims_saveable,
-    checkpoint_dots_with_no_batch_dims=dot_with_no_batch_dims_saveable,
+    dots_with_no_batch_dims_saveable=dots_with_no_batch_dims_saveable,
+    checkpoint_dots_with_no_batch_dims=dots_with_no_batch_dims_saveable,
     offload_dot_with_no_batch_dims=offload_dot_with_no_batch_dims,
     save_anything_except_these_names=save_anything_except_these_names,
     save_any_names_but_these=save_any_names_but_these,
@@ -355,7 +355,7 @@ def _remat_static_argnums(fun, static_argnums, args):
     raise ValueError("the `static_argnums` argument to `jax.checkpoint` / "
                      "`jax.remat` can only take integer values greater than or "
                      "equal to `-len(args)` and less than `len(args)`, but got "
-                     f"{static_argnums}")
+                     f"{static_argnums}, while `len(args)` = {len(args)}")
 
   if not static_argnums:
     return fun, args
@@ -458,7 +458,7 @@ def saved_residuals(f: Callable,
   return _saved_residuals(jaxpr, debug_info.arg_names)
 
 def _saved_residuals(jaxpr: core.Jaxpr,
-                     arg_names: tuple[str | None, ...]) -> list[tuple[core.AbstractValue, str]]:
+                     arg_names: Sequence[str]) -> list[tuple[core.AbstractValue, str]]:
   res_lits = [x for x in jaxpr.outvars if     isinstance(x, core.Literal)]
   res_vars = {x for x in jaxpr.outvars if not isinstance(x, core.Literal)}
 
@@ -473,7 +473,7 @@ def _saved_residuals(jaxpr: core.Jaxpr,
 
   for i, v in enumerate(jaxpr.invars):
     if v in res_vars:
-      if arg_names[i] is not None:
+      if arg_names[i]:
         src = f'from the argument {arg_names[i]}'
       else:
         src = 'from the argument at flattened index {i}'

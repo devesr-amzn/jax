@@ -183,6 +183,8 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
   the two branches is executed (up to compiler rewrites and optimizations).
   However, when transformed with :func:`~jax.vmap` to operate over a batch of
   predicates, ``cond`` is converted to :func:`~jax.lax.select`.
+  Both branches will be traced in all cases (see :ref:`Key concepts: tracing <key-concepts-tracing>`
+  for a discussion of JAX's tracing model).
 
   Args:
     pred: Boolean scalar type, indicating which branch function to apply.
@@ -279,8 +281,9 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
   num_consts = len(consts)
   out_ = iter(out)
 
+  all_inputs = [*consts, *ops]
   out = [
-    next(out_) if fwd is None else lax.asarray(ops[fwd - num_consts])
+    next(out_) if fwd is None else lax.asarray(all_inputs[fwd])
     for fwd in in_fwd
   ]
   assert next(out_, None) is None
@@ -344,6 +347,15 @@ def _cond_abstract_eval(*avals: core.AbstractValue,
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `cond`: {disallowed_effects}')
+  b0_vma = [o.vma for o in branches[0].out_avals]
+  for branch in branches[1:]:
+    b_vma = [o.vma for o in branch.out_avals]
+    if b0_vma != b_vma:
+      raise Exception("The branches of cond produced mismatched varying manual "
+                      f"axes. Got {b0_vma} and {b_vma}. Please open an issue "
+                      "at https://github.com/jax-ml/jax/issues, and as a "
+                      "temporary workaround pass the check_rep=False argument "
+                      "to shard_map")
   return branches[0].out_avals, joined_effects
 
 def _bcast_select(pred, on_true, on_false):

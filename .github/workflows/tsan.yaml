@@ -13,6 +13,7 @@ on:
       - main
     paths:
       - '**/workflows/tsan.yaml'
+      - '**/workflows/tsan-suppressions.txt'
 
 jobs:
   tsan:
@@ -35,7 +36,7 @@ jobs:
           apt install -y clang-18 libstdc++-14-dev build-essential libssl-dev \
             zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev curl git \
             libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
-            libffi-dev liblzma-dev
+            libffi-dev liblzma-dev file zip
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: jax
@@ -111,9 +112,9 @@ jobs:
 
           export PATH=${GITHUB_WORKSPACE}/cpython-tsan/bin/:$PATH
 
-          python3 -m pip install -r requirements/build_requirements.txt
+          python3 -m pip install uv~=0.5.30
           # Make sure to install a compatible Cython version (master branch is best for now)
-          python3 -m pip install -U git+https://github.com/cython/cython
+          python3 -m uv pip install -r requirements/build_requirements.txt -U git+https://github.com/cython/cython
 
           CC=clang-18 CXX=clang++-18 python3 -m pip wheel --wheel-dir dist -v . --no-build-isolation -Csetup-args=-Db_sanitize=thread -Csetup-args=-Dbuildtype=debugoptimized
 
@@ -173,12 +174,18 @@ jobs:
             --bazel_options=--copt=-g \
             --clang_path=/usr/bin/clang-18
 
-          # Update the patch to use TSAN instrumented numpy
+          # Patch build/requirements_lock_3_13_ft.txt to use TSAN instrumented NumPy
           sed -i "s|+--extra-index-url.*|+--extra-index-url file://${GITHUB_WORKSPACE}/wheelhouse/|" .github/workflows/requirements_lock_3_13_ft.patch
           cat .github/workflows/requirements_lock_3_13_ft.patch
+          git apply .github/workflows/requirements_lock_3_13_ft.patch || exit 1
 
-          # Apply a patch to numpy in requirements lock 3.13 ft to use the nightly version
-          git apply .github/workflows/requirements_lock_3_13_ft.patch
+          # Display the content for debugging in logs
+          cat build/requirements_lock_3_13_ft.txt | head -15
+          # Check the patch
+          cat build/requirements_lock_3_13_ft.txt | head -15 | grep -E "(--pre|.*${GITHUB_WORKSPACE}/wheelhouse/|numpy)"
+          if [ "$?" == "1" ]; then echo "Could not find the patch in the requirements_lock_3_13_ft.txt"; exit 1; fi
+          cat build/requirements_lock_3_13_ft.txt | grep -E "(numpy==)"
+          if [ "$?" == "0" ]; then "Found original numpy dependency in the requirements_lock_3_13_ft.txt"; exit 1; fi
 
           echo "JAX_NUM_GENERATED_CASES=$JAX_NUM_GENERATED_CASES"
           echo "JAX_ENABLE_X64=$JAX_ENABLE_X64"
@@ -188,6 +195,13 @@ jobs:
           bazel_exec=($(ls bazel-*))
           ln -s ${bazel_exec} bazel
 
+          # Check python version
+          ./bazel run --@rules_python//python/config_settings:py_freethreaded="yes" @python//:python3 -- -VV
+
+          # Check numpy version
+          ./bazel cquery @pypi_numpy//:* | grep whl
+
+          # Build JAX and run tests
           ./bazel test \
               --test_env=JAX_NUM_GENERATED_CASES=$JAX_NUM_GENERATED_CASES \
               --test_env=JAX_ENABLE_X64=$JAX_ENABLE_X64 \
@@ -197,9 +211,7 @@ jobs:
               --test_env=JAX_TEST_NUM_THREADS=8 \
               --test_output=errors \
               --local_test_jobs=32 \
-              --test_timeout=600 \
+              --test_timeout=1800 \
               --config=resultstore \
-              --spawn_strategy=local \
-              --remote_cache=remotebuildexecution.googleapis.com \
-              --remote_instance_name=projects/tensorflow-testing/instances/default_instance \
+              --config=rbe_cache \
               //tests:cpu_tests

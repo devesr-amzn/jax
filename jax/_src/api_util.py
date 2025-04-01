@@ -382,6 +382,9 @@ def is_hashable(arg):
     return False
 
 
+SENTINEL = object()
+
+
 def flatten_axes(name, treedef, axis_tree, *, kws=False, tupled_args=False):
   # given an axis spec tree axis_tree (a pytree with integers and Nones at the
   # leaves, i.e. the Nones are to be considered leaves) that is a tree prefix of
@@ -389,7 +392,7 @@ def flatten_axes(name, treedef, axis_tree, *, kws=False, tupled_args=False):
   # and return the flattened result
   # TODO(mattjj,phawkins): improve this implementation
   proxy = object()
-  dummy = tree_unflatten(treedef, [object()] * treedef.num_leaves)
+  dummy = tree_unflatten(treedef, [SENTINEL] * treedef.num_leaves)
   axes = []
   add_leaves = lambda i, x: axes.extend([i] * len(tree_flatten(x)[0]))
   try:
@@ -564,8 +567,9 @@ def resolve_kwargs(fun: Callable, args, kwargs) -> tuple[Any, ...]:
     passed_kwargs = [k for k in ba.kwargs if k in kwargs]
     if passed_kwargs:
       raise TypeError(
-          f"keyword arguments ({passed_kwargs}) could not be resolved to "
-          "positions")
+          "The following keyword arguments could not be resolved to positions: "
+          f"{', '.join(passed_kwargs)}"
+      )
   return ba.args
 
 
@@ -662,7 +666,7 @@ def _non_static_arg_names(fn_signature: inspect.Signature | None,
                           args: Sequence[Any], kwargs: dict[str, Any],
                           static_argnums: Sequence[int],
                           static_argnames: Sequence[str],
-                          ) -> tuple[str | None, ...]:
+                          ) -> tuple[str, ...]:
   """Returns the names of the non-static arguments.
 
   If the `fn_signature` is given then we get from it the names of the

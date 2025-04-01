@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for TPU specific operations within pallas_call."""
 
 import functools
 import math
@@ -437,6 +436,59 @@ class OpsTest(PallasBaseTest):
     x = jax.random.normal(k1, (8, 128), dtype=dtype)
     y = jax.random.normal(k2, (8, 128), dtype=dtype)
     np.testing.assert_allclose(run(x, y), jax.lax.div(x, y), **kwargs)
+
+  @parameterized.product(
+      dtype=[jnp.float32, jnp.bfloat16, jnp.int8],
+  )
+  def test_concat_mask(self, dtype):
+    if not jtu.if_cloud_tpu_at_least(2025, 2, 19):
+      self.skipTest("Requires libtpu built after 2025-02-19")
+    bitwidth = pallas_utils.dtype_bitwidth(dtype)
+    if jtu.get_tpu_version() < 5 and bitwidth < 32:
+      self.skipTest(
+          f"Not implemented: cast vector to mask with bitwidth == {bitwidth}"
+      )
+    shape = (128, 128)
+
+    def kernel(x, out):
+      mask = x[...] != 0
+      concated_mask = jnp.concatenate([mask, mask], axis=0)
+      concated_x = jnp.concatenate([x[:], x[:]], axis=0)
+      out[:] = lax.select(concated_mask, concated_x, jnp.zeros_like(concated_x))
+
+    x = jax.random.normal(jax.random.key(1234), shape, dtype=jnp.float32)
+    if dtype == jnp.int8:
+      x = (x * 100).astype(jnp.int8)
+    else:
+      x = x.astype(dtype)
+    out = self.pallas_call(
+        kernel, out_shape=jax.ShapeDtypeStruct((shape[0] * 2, shape[1]), dtype)
+    )(x)
+    concated_mask = jnp.concatenate([x != 0, x != 0], axis=0)
+    concated_x = jnp.concatenate([x, x], axis=0)
+    expected = lax.select(concated_mask, concated_x, jnp.zeros_like(concated_x))
+    np.testing.assert_array_equal(out, expected)
+
+  def test_reduce_with_const(self):
+    m = 1
+    d = 1024
+    x = jnp.ones((m, d), jnp.bfloat16)
+
+    def dot(x, y):
+      return jax.lax.dot_general(
+          x,
+          y,
+          (((1,), (1,)), ((), ())),
+          preferred_element_type=jnp.float32,
+      )
+
+    def kernel(x, out):
+      out[:] = dot(x[:], jnp.ones((1, d), jnp.bfloat16))
+
+    run = pl.pallas_call(kernel, jax.ShapeDtypeStruct((m, 1), jnp.float32))
+    output = run(x)
+    expected = dot(x[:], jnp.ones((1, d), jnp.bfloat16))
+    np.testing.assert_array_equal(output, expected)
 
 
 class OpsInterpretTest(OpsTest):

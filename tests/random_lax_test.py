@@ -365,6 +365,38 @@ class LaxRandomTest(jtu.JaxTestCase):
         pmf = lambda x: np.where(x < len(p), p[np.minimum(len(p) - 1, x)], 0.0)
         self._CheckChiSquared(samples, pmf=pmf)
 
+  @jtu.sample_product(
+    logits_shape=[(7,), (8, 9), (10, 11, 12)],
+    prefix_shape=[(2,), (3, 4), (5, 6)],
+  )
+  def testCategoricalWithoutReplacement(self, logits_shape, prefix_shape):
+    key = random.key(0)
+
+    key, subkey = random.split(key)
+    logits = random.normal(subkey, logits_shape)
+
+    key, subkey = random.split(key)
+    axis = random.randint(subkey, (), -len(logits_shape), len(logits_shape))
+
+    dists_shape = tuple(np.delete(logits_shape, axis))
+    n_categories = logits_shape[axis]
+    shape = prefix_shape + dists_shape
+    prefix_size = math.prod(prefix_shape)
+
+    if n_categories < prefix_size:
+      with self.assertRaisesRegex(ValueError, "Number of samples without replacement"):
+        random.categorical(key, logits, axis=axis, shape=shape, replace=False)
+
+    else:
+      output = random.categorical(key, logits, axis=axis, shape=shape, replace=False)
+      self.assertEqual(output.shape, shape)
+      assert (0 <= output).all()
+      assert (output < n_categories).all()
+      flat = output.reshape((prefix_size, math.prod(dists_shape)))
+      counts = jax.vmap(partial(jnp.bincount, length=n_categories), 1)(flat)
+      assert (counts <= 1).all()
+
+
   def testBernoulliShape(self):
     key = self.make_key(0)
     with jax.numpy_rank_promotion('allow'):
@@ -599,6 +631,25 @@ class LaxRandomTest(jtu.JaxTestCase):
     for samples in [uncompiled_samples, compiled_samples]:
       self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.gumbel_r().cdf)
 
+  def testLowProbabilityGumbel(self):
+    dtype = jnp.bfloat16
+
+    nmant = jnp.finfo(dtype).nmant
+    probs = [x * 2 ** -nmant for x in [0.125, 0.75, 1.25, 2.125]]
+    num_samples = 1024 * 128
+    num_groups = 128
+    key = jax.random.key(0)
+
+    def compute_counts(key):
+      v = jax.random.gumbel(key, (num_samples, 1), dtype=dtype, mode="high")
+      thresholds = np.array([[-np.log(-np.log(1 - x)) for x in probs]],
+                            dtype=dtype)
+      return (v > thresholds).sum(axis=0)
+    pts = [float(x) for x in jax.lax.map(
+        compute_counts, jax.random.split(key, num_groups)).sum(axis=0)]
+    cdf_probs = [x / (num_samples * num_groups) for x in pts]
+    np.testing.assert_allclose(cdf_probs, probs, rtol=0.25, atol=0)
+
   @jtu.sample_product(dtype=float_dtypes)
   def testLaplace(self, dtype):
     key = lambda: self.make_key(0)
@@ -624,21 +675,31 @@ class LaxRandomTest(jtu.JaxTestCase):
       self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.logistic().cdf)
 
   @jtu.sample_product(
-    n=range(1, 5),
+    n=range(5),
     shape=[(), (5,), (10, 5)],
     dtype=jtu.dtypes.floating + jtu.dtypes.complex,
+    m=list(range(5)) + [None],
   )
   @jax.default_matmul_precision("float32")
-  def testOrthogonal(self, n, shape, dtype):
+  def testOrthogonal(self, n, shape, dtype, m):
+    if m is None:
+      m = n
+
     key = self.make_key(0)
-    q = random.orthogonal(key, n, shape, dtype)
-    self.assertEqual(q.shape, (*shape, n, n))
+
+    q = random.orthogonal(key, n, shape, dtype, m)
+    self.assertEqual(q.shape, (*shape, n, m))
     self.assertEqual(q.dtype, dtype)
-    with jax.numpy_rank_promotion('allow'):
-      self.assertAllClose(
-        jnp.einsum('...ij,...jk->...ik', q, jnp.conj(q).swapaxes(-2, -1)),
-        jnp.broadcast_to(jnp.eye(n, dtype=dtype), (*shape, n, n))
-      )
+
+    qT = jnp.conj(q).mT
+
+    if n <= m:
+      I_n = jnp.broadcast_to(jnp.eye(n, dtype=dtype), (*shape, n, n))
+      self.assertAllClose(jnp.linalg.matmul(q, qT), I_n, atol={jnp.complex128: 1e-14})
+
+    if n >= m:
+      I_m = jnp.broadcast_to(jnp.eye(m, dtype=dtype), (*shape, m, m))
+      self.assertAllClose(jnp.linalg.matmul(qT, q), I_m, atol={jnp.complex128: 1e-14})
 
   @jtu.sample_product(
     p=[.5, 1., 1.5, 2., 2.5],
@@ -1250,6 +1311,78 @@ class LaxRandomTest(jtu.JaxTestCase):
     p = jax.numpy.float16(0.5)
     jax.random.binomial(key, n, p)  # doesn't error
 
+  def testMultinomialExample(self):
+    key = random.key(0)
+    probs = jnp.array([
+      [0.5, 0.2, 0.3],
+      [0.1, 0.2, 0.7],
+      [1.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0],
+      [0.0, 0.0, 1.0],
+      [0.5, 0.0, 0.5],
+    ])
+    trials = 1e5
+    counts = random.multinomial(key, trials, probs)
+    freqs = counts / trials
+    self.assertAllClose(freqs, probs, atol=1e-2)
+
+  @jtu.sample_product(
+    categories=[1, 2, 3, 5, 7, 11],
+    trials=[1, 2, 3, 5, 7, 11],
+    dtype=[jnp.float32],
+  )
+  def testMultinomialNumpy(
+    self,
+    categories,
+    trials,
+    dtype,
+    test_samples=10**6,
+    tolerance=1e-1,
+  ):
+    probs = jnp.linspace(-1, 2, categories)[::-1] ** 2
+    probs /= probs.sum(-1, keepdims=True)
+
+    rng = np.random.default_rng(0)
+    counts_numpy = jnp.array(rng.multinomial(trials, probs, size=test_samples), dtype)
+
+    shape = (test_samples,) + probs.shape
+    key = random.key(0)
+    counts_jax = random.multinomial(key, trials, probs, shape=shape, dtype=dtype)
+    assert counts_jax.shape == shape
+
+    energy_distance = get_energy_distance(counts_numpy, counts_jax)
+    assert energy_distance < tolerance
+
+  @jtu.sample_product([
+      dict(shape=shape, outcomes=outcomes)
+      for shape in [(5,), (2, 3), (2, 3, 5)]
+      for outcomes in [2, 3, 4]
+  ])
+  def testMultinomialShape(self, shape, outcomes):
+    key = random.key(0)
+
+    key, subkey = random.split(key)
+    probs = random.dirichlet(subkey, jnp.ones(outcomes))
+
+    trials = 1e5
+    counts = random.multinomial(key, trials, probs, shape=(*shape, *probs.shape))
+    freqs = counts / trials
+
+    self.assertAllClose(freqs, jnp.broadcast_to(probs, freqs.shape), atol=1e-2)
+
+  @jtu.sample_product([
+      dict(n_dtype=n_dtype, p_dtype=p_dtype, dtype=dtype)
+      for n_dtype in jtu.dtypes.all_floating
+      for p_dtype in jtu.dtypes.all_floating
+      for dtype in jtu.dtypes.all_floating
+  ])
+  @jax.numpy_dtype_promotion('standard')
+  def testMultinomialDtype(self, n_dtype, p_dtype, dtype):
+    key = random.key(0)
+    n = jnp.astype(10, n_dtype)
+    p = jnp.astype(jnp.ones(3) / 3, p_dtype)
+    random.multinomial(key, n, p)
+
   def test_batched_key_errors(self):
     keys = lambda: jax.random.split(self.make_key(0))
     msg = "{} accepts a single key, but was given a key array of shape.*"
@@ -1274,6 +1407,21 @@ class LaxRandomTest(jtu.JaxTestCase):
     with self.assertNoWarnings():
       jax.random.key_data(keys())
       jax.random.key_impl(keys())
+
+
+def get_energy_distance(samples_1, samples_2):
+  """
+  Estimates the energy distance between two distributions, given
+  batches of independent samples from each.
+  For more information, see https://en.wikipedia.org/wiki/Energy_distance.
+  """
+  x, xp = jnp.split(samples_1, 2)
+  y, yp = jnp.split(samples_2, 2)
+  return (
+      2 * jnp.linalg.norm(x - y, axis=-1)
+      - jnp.linalg.norm(x - xp, axis=-1)
+      - jnp.linalg.norm(y - yp, axis=-1)
+  ).mean(0)
 
 
 threefry_seed = prng_internal.threefry_seed

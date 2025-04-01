@@ -128,7 +128,6 @@ def MosaicGPU_WGStridedFragLayout : AttrDef<MosaicGPU_Dialect, "WGStridedFragLay
   let assemblyFormat = "`<` $shape`,` $vector_size `>`";
 }
 
-
 def MosaicGPU_WGSplatFragLayout : AttrDef<MosaicGPU_Dialect, "WGSplatFragLayout", []> {
   let summary = "Annotates an array that is the result of a splat.";
   let description = [{
@@ -143,20 +142,6 @@ def MosaicGPU_WGSplatFragLayout : AttrDef<MosaicGPU_Dialect, "WGSplatFragLayout"
   let assemblyFormat = "`<` $shape `>`";
 }
 
-def MosaicGPU_WGMMAFragLayout : AttrDef<MosaicGPU_Dialect, "WGMMAFragLayout", []> {
-  let summary = "2D array that can be tiled by supported WGMMA shapes.";
-  let description = [{
-    This layout annotates arrays that are fragmented across all threads in a
-    warpgroup that is executing a WGMMA operation. The shape of the array is
-    (m, n) where:
-      - m % 64 == 0
-      - n %  8 == 0
-  }];
-
-  let mnemonic = "WGMMAFragLayout";
-  let assemblyFormat = "";
-}
-
 def MosaicGPU_WGMMARowFragLayout : AttrDef<MosaicGPU_Dialect, "WGMMARowFragLayout", []> {
   let summary = "1D array that is a row that can be tiled by supported WGMMA shapes.";
   let description = [{
@@ -168,6 +153,24 @@ def MosaicGPU_WGMMARowFragLayout : AttrDef<MosaicGPU_Dialect, "WGMMARowFragLayou
   let mnemonic = "WGMMARowFragLayout";
   let assemblyFormat = "";
 }
+
+def MosaicGPU_TiledLayout : AttrDef<MosaicGPU_Dialect, "TiledLayout", []> {
+  let summary = "A layout derived from a tiling expression.";
+  let description = [{
+    See mosaic/gpu/fragmented_array.py -> TiledLayout for more details.
+  }];
+
+  let parameters = (ins
+    "::mlir::ArrayAttr":$tiling,
+    "int":$warp_dim,
+    "::mlir::ArrayAttr":$lane_dims,
+    "int":$vector_dim
+  );
+  let mnemonic = "TiledLayout";
+  let assemblyFormat = "`<` $tiling `,` `warp_dim` `=` $warp_dim `,` "
+      "`lane_dims` `=` $lane_dims `,` `vector_dim` `=` $vector_dim `>`";
+}
+
 
 // Note: This duplicates the Dimension enum in mlir/Dialect/GPU/IR/GPUOps.td
 // but it was not possible to reuse that definition. Including that file
@@ -243,10 +246,8 @@ def LayoutAttr : MosaicGPU_Attr<"Layout", "layout",
   let assemblyFormat = "`<` $num_dimensions `,` $transforms `>`";
 }
 
-def GlobalMemory : Resource<"::mosaic_gpu::GlobalMemory">;
-
 def MosaicGPU_AsyncLoadOp : Op<MosaicGPU_Dialect, "async_load",
-      [AttrSizedOperandSegments, MemoryEffects<[MemRead<GlobalMemory>]>]> {
+      [AttrSizedOperandSegments]> {
   let summary = "Schedules an async load of a MemRef from GMEM to SMEM";
   let description = [{
     Schedules an async copy of the contents of the `source` MemRef in GMEM to
@@ -280,12 +281,11 @@ def MosaicGPU_AsyncLoadOp : Op<MosaicGPU_Dialect, "async_load",
     grouped together in a cluster and need to load the same data. Each block in
     a cluster will first load a slice from GMEM to SMEM and then the slices will
     be multicast to all other blocks in the cluster. In this way TMA multicast
-    guarnatees L2 cache hits. The `collective` attribute is the list of
+    guarantees L2 cache hits. The `collective` attribute is the list of
     cluster dimensions along which to partition the input data loads.
 
-    The `predicate` input should be set to `true` by a single thread in the
-    warpgroup so that it schedules the load operation. All other threads in the
-    warpgroup should set the `predicate` to `false`.
+    The `predicate` allows scheduling the transfer conditionally. The async copy
+   is always scheduled by at most a single lane in the warpgroup.
   }];
 
   let arguments = (ins
@@ -313,7 +313,7 @@ def MosaicGPU_AsyncLoadOp : Op<MosaicGPU_Dialect, "async_load",
 }
 
 def MosaicGPU_AsyncStoreOp : Op<MosaicGPU_Dialect, "async_store",
-      [AttrSizedOperandSegments, MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+      [AttrSizedOperandSegments]> {
   let summary = "Schedules an async store of a MemRef from SMEM to GMEM";
   let description = [{
     Schedules an async store of the contents of the `source` MemRef in SMEM to
@@ -337,9 +337,8 @@ def MosaicGPU_AsyncStoreOp : Op<MosaicGPU_Dialect, "async_store",
     contiguous and the transformed data is written to the `destination` GMEM
     which does not need to be contiguous.
 
-    The `predicate` input should be set to `true` by a single thread in the
-    warpgroup so that it schedules the store operation. All other threads in the
-    warpgroup should set the `predicate` to `false`.
+    The `predicate` allows scheduling the transfer conditionally. The async copy
+    is always scheduled by at most a single lane in the warpgroup.
   }];
 
   let arguments = (ins
@@ -349,7 +348,8 @@ def MosaicGPU_AsyncStoreOp : Op<MosaicGPU_Dialect, "async_store",
     PtxPredicate:$predicate,
 
     // Attributes
-    DenseI64ArrayAttr:$slice_lengths
+    DenseI64ArrayAttr:$slice_lengths,
+    DefaultValuedOptionalAttr<BoolAttr, "true">:$commit_group
   );
 
   let assemblyFormat = [{
@@ -374,6 +374,14 @@ def MosaicGPU_WGMMALayout :
   let cppNamespace = "::mosaic_gpu";
 }
 
+
+def MosaicGPU_SliceSMEMOp : Op<MosaicGPU_Dialect, "slice_smem", []> {
+  let summary = "Constructs an SMEM MemRef with the requested type that begins at the specified SMEM offset address.";
+
+  let arguments = (ins I32:$offset);
+  let results = (outs MemRefOf<[AnyType]>);
+}
+
 def MosaicGPU_WGMMAOp : Op<MosaicGPU_Dialect, "wgmma", [InferTypeOpInterface]> {
   let summary = "Multiply two matrices asyncronously using warpgroup level matrix multiply operations.";
   let description = [{
@@ -384,17 +392,14 @@ def MosaicGPU_WGMMAOp : Op<MosaicGPU_Dialect, "wgmma", [InferTypeOpInterface]> {
 
     This operation supports larger inputs than the PTX-level WGMMA operation
     and will schedule as many PTX-level WGMMA operations as needed to
-    accomplish the calculation. The `b` matrix, and optionally `a`, needs to be
-    provided as a 2-dimensional memref. All memrefs may have transforms that
-    define swizzling, tiling, and transposition.
+    accomplish the calculation. The `b` matrix, and optionally `a`, need to be
+    provided as a 2-dimensional memref.
 
     The inputs should have the following shapes:
       - a: [groups_m * 64, groups_k * s]
       - b: [groups_k * s, groups_n * s]
       - accumulator: [groups_m * 64, groups_n * s]
-    Where:
-      - `s == swizzle/element_bytediwth` (for `kNoSwizzle`, `swizzle` is 16.)
-        and the tilings are [64, s] for `a` and [s, s] for `b`.
+    where `s == swizzle / element_bytewidth`.
 
     The output has an identical shape and type as the input accumulator.
 
@@ -448,6 +453,35 @@ def MosaicGPU_WGMMAOp : Op<MosaicGPU_Dialect, "wgmma", [InferTypeOpInterface]> {
   }];
 
   let hasVerifier = 1;
+}
+
+def MosaicGPU_OptimizationBarrierOp : Op<MosaicGPU_Dialect, "optimization_barrier",
+    [InferTypeOpInterface]> {
+  let summary = "Prevents MLIR from moving operations across the barrier.";
+
+  let arguments = (ins
+    Variadic<AnyType>:$operands
+  );
+  let results = (outs Variadic<AnyType>);
+
+  let extraClassDeclaration = [{
+    static llvm::LogicalResult inferReturnTypes(
+        mlir::MLIRContext *,
+        std::optional<mlir::Location> location,
+        mlir::ValueRange operands,
+        mlir::DictionaryAttr attributes,
+        mlir::OpaqueProperties properties,
+        mlir::RegionRange regions,
+        llvm::SmallVectorImpl<mlir::Type> &inferredReturnTypes) {
+      if (operands.empty()) {
+        return ::mlir::emitOptionalError(
+          location, "expected non-empty operands");
+      }
+      ::mlir::TypeRange operand_types = operands.getTypes();
+      inferredReturnTypes.assign(operand_types.begin(), operand_types.end());
+      return ::mlir::success();
+    }
+  }];
 }
 
 #endif // THIRD_PARTY_PY_JAX_JAXLIB_MOSAIC_DIALECT_GPU_MOSAIC_GPU_TD_

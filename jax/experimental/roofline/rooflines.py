@@ -36,6 +36,8 @@ from jax.experimental import roofline
 from jax.experimental import shard_map
 
 
+_FMA_FLOPS_FACTOR = 2
+
 for prim in it.chain(
   ad_util.__dict__.values(),
   ann.__dict__.values(),
@@ -55,6 +57,95 @@ for prim in it.chain(
     roofline.register_standard_roofline(prim)
 
 
+def _unary_p_roofline(
+    ctx: roofline.RooflineRuleContext,
+    *args,
+    **kw,
+) -> roofline.RooflineResult:
+  (x,) = (roofline.RooflineShape.from_aval(aval) for aval in ctx.avals_in)
+  out = roofline.RooflineShape.from_aval(ctx.avals_out[0])
+  return roofline.RooflineResult(
+      unfused_flops=x.size,
+      unfused_hbm_bytes=(
+          x.dtype.itemsize * x.size + out.dtype.itemsize * out.size
+      ),
+  )
+
+roofline.register_roofline(lax.abs_p)(_unary_p_roofline)
+roofline.register_roofline(lax.acos_p)(_unary_p_roofline)
+roofline.register_roofline(lax.asin_p)(_unary_p_roofline)
+roofline.register_roofline(lax.atan_p)(_unary_p_roofline)
+roofline.register_roofline(lax.cbrt_p)(_unary_p_roofline)
+roofline.register_roofline(lax.ceil_p)(_unary_p_roofline)
+roofline.register_roofline(lax.conj_p)(_unary_p_roofline)
+roofline.register_roofline(lax.cos_p)(_unary_p_roofline)
+roofline.register_roofline(lax.cosh_p)(_unary_p_roofline)
+roofline.register_roofline(lax.exp_p)(_unary_p_roofline)
+roofline.register_roofline(lax.expm1_p)(_unary_p_roofline)
+roofline.register_roofline(lax.floor_p)(_unary_p_roofline)
+roofline.register_roofline(lax.imag_p)(_unary_p_roofline)
+roofline.register_roofline(lax.integer_pow_p)(_unary_p_roofline)
+roofline.register_roofline(lax.is_finite_p)(_unary_p_roofline)
+roofline.register_roofline(lax.log_p)(_unary_p_roofline)
+roofline.register_roofline(lax.log1p_p)(_unary_p_roofline)
+roofline.register_roofline(lax.logistic_p)(_unary_p_roofline)
+roofline.register_roofline(lax.neg_p)(_unary_p_roofline)
+roofline.register_roofline(lax.not_p)(_unary_p_roofline)
+roofline.register_roofline(lax.real_p)(_unary_p_roofline)
+roofline.register_roofline(lax.round_p)(_unary_p_roofline)
+roofline.register_roofline(lax.rsqrt_p)(_unary_p_roofline)
+roofline.register_roofline(lax.sign_p)(_unary_p_roofline)
+roofline.register_roofline(lax.sin_p)(_unary_p_roofline)
+roofline.register_roofline(lax.sinh_p)(_unary_p_roofline)
+roofline.register_roofline(lax.sqrt_p)(_unary_p_roofline)
+roofline.register_roofline(lax.square_p)(_unary_p_roofline)
+roofline.register_roofline(lax.tan_p)(_unary_p_roofline)
+roofline.register_roofline(special.bessel_i0e_p)(_unary_p_roofline)
+roofline.register_roofline(special.bessel_i1e_p)(_unary_p_roofline)
+roofline.register_roofline(special.digamma_p)(_unary_p_roofline)
+roofline.register_roofline(special.erf_inv_p)(_unary_p_roofline)
+roofline.register_roofline(special.erf_p)(_unary_p_roofline)
+roofline.register_roofline(special.erfc_p)(_unary_p_roofline)
+roofline.register_roofline(special.lgamma_p)(_unary_p_roofline)
+
+def _binary_p_roofline(
+    ctx: roofline.RooflineRuleContext,
+    *args,
+    **kw,
+) -> roofline.RooflineResult:
+  lhs, rhs = (roofline.RooflineShape.from_aval(aval) for aval in ctx.avals_in)
+  broadcasted_shape = [
+      max(l, r) for l, r in it.zip_longest(lhs.shape, rhs.shape, fillvalue=1)
+  ]
+  out = roofline.RooflineShape.from_aval(ctx.avals_out[0])
+  return roofline.RooflineResult(
+      unfused_flops=int(np.prod(broadcasted_shape)),
+      unfused_hbm_bytes=(
+          lhs.dtype.itemsize * lhs.size
+          + rhs.dtype.itemsize * rhs.size
+          + out.dtype.itemsize * out.size
+      ),
+  )
+
+
+roofline.register_roofline(lax.add_p)(_binary_p_roofline)
+roofline.register_roofline(lax.sub_p)(_binary_p_roofline)
+roofline.register_roofline(lax.mul_p)(_binary_p_roofline)
+roofline.register_roofline(lax.div_p)(_binary_p_roofline)
+roofline.register_roofline(lax.rem_p)(_binary_p_roofline)
+roofline.register_roofline(lax.and_p)(_binary_p_roofline)
+roofline.register_roofline(lax.or_p)(_binary_p_roofline)
+roofline.register_roofline(lax.xor_p)(_binary_p_roofline)
+roofline.register_roofline(lax.gt_p)(_binary_p_roofline)
+roofline.register_roofline(lax.lt_p)(_binary_p_roofline)
+roofline.register_roofline(lax.ge_p)(_binary_p_roofline)
+roofline.register_roofline(lax.le_p)(_binary_p_roofline)
+roofline.register_roofline(lax.eq_p)(_binary_p_roofline)
+roofline.register_roofline(lax.ne_p)(_binary_p_roofline)
+roofline.register_roofline(lax.min_p)(_binary_p_roofline)
+roofline.register_roofline(lax.max_p)(_binary_p_roofline)
+
+
 @roofline.register_roofline(lax.dot_general_p)
 def _dot_general_roofline(
   ctx: roofline.RooflineRuleContext,
@@ -67,7 +158,7 @@ def _dot_general_roofline(
   (lhs_contract, _), (lhs_batch, _) = dimension_numbers
 
   flops = (
-    2
+    _FMA_FLOPS_FACTOR
     * lhs.size
     * rhs.size
     / np.prod([lhs.shape[i] for i in lhs_contract])
@@ -81,12 +172,35 @@ def _dot_general_roofline(
   if not ctx.pin_rhs_in_vmem:
     hbm_bytes += rhs.bytes
 
-  return roofline.RooflineResult(flops=int(flops), hbm_bytes=hbm_bytes)
+  return roofline.RooflineResult(
+      flops=int(flops),
+      unfused_flops=int(flops),
+      hbm_bytes=hbm_bytes,
+      unfused_hbm_bytes=hbm_bytes,
+  )
+
+@roofline.register_roofline(convolution.conv_general_dilated_p)
+def _conv_general_dilated_roofline(
+  ctx: roofline.RooflineRuleContext,
+  *args,
+  **kw,
+) -> roofline.RooflineResult:
+  lhs, rhs = (roofline.RooflineShape.from_aval(aval) for aval in ctx.avals_in)
+  out = roofline.RooflineShape.from_aval(ctx.avals_out[0])
+  # TODO(b/394648206): support computing unfused_flops for conv.
+  return roofline.RooflineResult(
+      unfused_hbm_bytes=(
+          lhs.dtype.itemsize * lhs.size
+          + rhs.dtype.itemsize * rhs.size
+          + out.dtype.itemsize * out.size
+      ),
+  )
 
 
 def _return_zeros_if_one_sized_axis(
   ctx: roofline.RooflineRuleContext, axes: tuple[str, ...]
 ) -> roofline.RooflineResult | None:
+  assert ctx.mesh
   axes_size = np.prod([ctx.mesh.shape[axis] for axis in axes])
   if axes_size > 1:
     return None
@@ -106,6 +220,7 @@ def _ring_collective_roofline(
   if zeros_result := _return_zeros_if_one_sized_axis(ctx, axes):
     return zeros_result
 
+  assert ctx.mesh
   mesh = ctx.mesh.shape
   current_shard_size = roofline.RooflineShape.total_bytes(ctx.avals_in)
   if is_reduce:
@@ -187,6 +302,7 @@ def _all_to_all_roofline(
   if zeros_result := _return_zeros_if_one_sized_axis(ctx, axis_name):
     return zeros_result
 
+  assert ctx.mesh
   mesh = ctx.mesh.shape
   size = roofline.RooflineShape.total_bytes(ctx.avals_in) * np.prod([
     mesh[axis] for axis in axis_name
@@ -222,6 +338,7 @@ def _ppermute_roofline(
   if zeros_result := _return_zeros_if_one_sized_axis(ctx, axis_name):
     return zeros_result
 
+  assert ctx.mesh
   mesh = ctx.mesh.shape
   mesh_dims: list[int] = [mesh.get(axis, 1) for axis in axis_name]
   shard_size = roofline.RooflineShape.total_bytes(ctx.avals_in)
@@ -267,4 +384,26 @@ def _ppermute_roofline(
   return roofline.RooflineResult(
     ici_bytes={axis: int(ici_bytes) for axis in axis_name},
     ici_latency={axis: int(ici_latency) for axis in axis_name},
+  )
+
+
+@roofline.register_roofline(lax.reduce_sum_p)
+def _reduce_sum_p_roofline(
+    ctx: roofline.RooflineRuleContext,
+    *args,
+    axes: tuple[int, ...],
+    **kw,
+) -> roofline.RooflineResult:
+  (x,) = (roofline.RooflineShape.from_aval(aval) for aval in ctx.avals_in)
+  domain_size = np.prod([x.shape[i] for i in axes])
+  other_axes = set(range(len(x.shape))) - set(axes)
+  result_size = np.prod([x.shape[i] for i in other_axes])
+
+  return roofline.RooflineResult(
+      # To add n values, we do n - 1 add operations, and we have to do that
+      # for every element in the result.
+      unfused_flops=int((domain_size - 1) * result_size),
+      # Size of input, plus output. (We assume that the output is also used
+      # as accumulator.)
+      unfused_hbm_bytes=int(x.dtype.itemsize * (x.size + result_size)),
   )

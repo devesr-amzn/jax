@@ -17,6 +17,7 @@
 
 from jax._src.lax.lax import (
   DotDimensionNumbers as DotDimensionNumbers,
+  RaggedDotDimensionNumbers as RaggedDotDimensionNumbers,
   Precision as Precision,
   PrecisionLike as PrecisionLike,
   DotAlgorithm as DotAlgorithm,
@@ -158,6 +159,7 @@ from jax._src.lax.lax import (
   pow as pow,
   pow_p as pow_p,
   ragged_dot as ragged_dot,
+  ragged_dot_general as ragged_dot_general,
   real as real,
   real_p as real_p,
   reciprocal as reciprocal,
@@ -196,6 +198,7 @@ from jax._src.lax.lax import (
   select as select,
   select_n as select_n,
   select_n_p as select_n_p,
+  shape_as_value as shape_as_value,
   shift_left as shift_left,
   shift_left_p as shift_left_p,
   shift_right_arithmetic as shift_right_arithmetic,

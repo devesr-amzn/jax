@@ -16,6 +16,55 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
 
 ## Unreleased
 
+* Changes
+  * The minimum CuDNN version is v9.8.
+  * JAX is now built using CUDA 12.8. All versions of CUDA 12.1 or newer remain
+    supported.
+
+* Deprecations
+
+  * {func}`jax.tree_util.build_tree` is deprecated. Use {func}`jax.tree.unflatten`
+    instead.
+  * Implemented host callback handlers for CPU and GPU devices using XLA's FFI
+    and removed existing CPU/GPU handlers using XLA's custom call.
+  * All APIs in `jax.lib.xla_extension` are now deprecated.
+  * Several previously-deprecated APIs have been removed, including:
+    * From `jax.lib.xla_client`: `FftType`, `PaddingType`, `dtype_to_etype`,
+      and `shape_from_pyval`.
+    * From `jax.lib.xla_extension`: `ArrayImpl`, `XlaRuntimeError`.
+    * From `jax`: `jax.treedef_is_leaf`, `jax.tree_flatten`, `jax.tree_map`,
+      `jax.tree_leaves`, `jax.tree_structure`, `jax.tree_transpose`, and
+      `jax.tree_unflatten`. Replacements can be found in {mod}`jax.tree` or
+      {mod}`jax.tree_util`.
+    * From `jax.core`: `AxisSize`, `ClosedJaxpr`, `EvalTrace`, `InDBIdx`, `InputType`,
+      `Jaxpr`, `JaxprEqn`, `Literal`, `MapPrimitive`, `OpaqueTraceState`, `OutDBIdx`,
+      `Primitive`, `Token`, `TRACER_LEAK_DEBUGGER_WARNING`, `Var`, `concrete_aval`,
+      `dedup_referents`, `escaped_tracer_error`, `extend_axis_env_nd`, `get_referent`,
+      `join_effects`, `leaked_tracer_error`, `maybe_find_leaked_tracers`, `raise_to_shaped`,
+      `raise_to_shaped_mappings`, `reset_trace_state`, `str_eqn_compact`,
+      `substitute_vars_in_output_ty`, `typecompat`, and `used_axis_names_jaxpr`. Most
+      have no public replacement, though a few are available at {mod}`jax.extend.core`.
+
+## jax 0.5.3 (Mar 19, 2025)
+
+* New Features
+
+  * Added a `allow_negative_indices` option to {func}`jax.lax.dynamic_slice`,
+    {func}`jax.lax.dynamic_update_slice` and related functions. The default is
+    true, matching the current behavior. If set to false, JAX does not need to
+    emit code clamping negative indices, which improves code size.
+  * Added a `replace` option to {func}`jax.random.categorical` to enable sampling
+    without replacement.
+
+## jax 0.5.2 (Mar 4, 2025)
+
+Patch release of 0.5.1
+
+* Bug fixes
+  * Fixes TPU metric logging and `tpu-info`, which was broken in 0.5.1
+
+## jax 0.5.1 (Feb 24, 2025)
+
 * New Features
   * Added an experimental {func}`jax.experimental.custom_dce.custom_dce`
     decorator to support customizing the behavior of opaque functions under
@@ -26,6 +75,7 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     {func}`jax.lax.reduce_and`, {func}`jax.lax.reduce_or`, and {func}`jax.lax.reduce_xor`.
   * {func}`jax.lax.linalg.qr`, and {func}`jax.scipy.linalg.qr`, now support
     column-pivoting on CPU and GPU. See {jax-issue}`#20282` and
+  * Added {func}`jax.random.multinomial`.
     {jax-issue}`#25955` for more details.
 
 * Changes
@@ -45,8 +95,15 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     A downstream effect of this several other internal functions need debug
     info. This change does not affect public APIs.
     See https://github.com/jax-ml/jax/issues/26480 for more detail.
+  * In {func}`jax.numpy.ndim`, {func}`jax.numpy.shape`, and {func}`jax.numpy.size`,
+    non-arraylike inputs (such as lists, tuples, etc.) are now deprecated.
 
 * Bug fixes
+  * TPU runtime startup and shutdown time should be significantly improved on
+    TPU v5e and newer (from around 17s to around 8s). If not already set, you may
+    need to enable transparent hugepages in your VM image
+    (`sudo sh -c 'echo always > /sys/kernel/mm/transparent_hugepage/enabled'`).
+    We hope to improve this further in future releases.
   * Persistent compilation cache no longer writes access time file if
     JAX_COMPILATION_CACHE_MAX_SIZE is unset or set to -1, i.e. if the LRU
     eviction policy isn't enabled. This should improve performance when using
@@ -154,8 +211,6 @@ to signify this.
 ## jax 0.4.37 (Dec 9, 2024)
 
 This is a patch release of jax 0.4.36. Only "jax" was released at this version.
-
-## jax 0.4.37
 
 * Bug fixes
   * Fixed a bug where `jit` would error if an argument was named `f` (#25329).

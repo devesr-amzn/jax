@@ -17,6 +17,11 @@ on:
         required: true
         default: 'gs://jax-nightly-release-transient/nightly/latest'
         type: string
+      download-jax-only-from-gcs:
+        description: "Whether to download only the jax wheel from GCS (e.g for testing a jax only release)"
+        required: true
+        default: '0'
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -31,15 +36,17 @@ jobs:
           # Runner OS and Python values need to match the matrix stategy of our internal CI jobs
           # that build the wheels.
           runner: ["linux-x86-n2-64", "linux-arm64-t2a-48", "windows-x86-n2-64"]
-          python: ["3.10","3.11", "3.12", "3.13"]
+          python: ["3.10","3.11", "3.12", "3.13", "3.13-nogil"]
           enable-x64: [0]
+          exclude:
+            - runner: "windows-x86-n2-64"
+              python: "3.13-nogil"
+    name: "Pytest CPU (JAX artifacts version = ${{ startsWith(github.ref_name, 'release/') && 'latest release' || 'nightly' }})"
     with:
       runner: ${{ matrix.runner }}
       python: ${{ matrix.python }}
       enable-x64:  ${{ matrix.enable-x64 }}
-      # Don't install "jax" at head. Instead install the nightly/release "jax" wheels found in the
-      # GCS bucket.
-      install-jax-current-commit: 0
+      download-jax-only-from-gcs: ${{inputs.download-jax-only-from-gcs}}
       gcs_download_uri: ${{inputs.gcs_download_uri}}
 
   run-pytest-cuda:
@@ -50,15 +57,53 @@ jobs:
           # Runner OS and Python values need to match the matrix stategy of our internal CI jobs
           # that build the wheels.
           runner: ["linux-x86-g2-48-l4-4gpu"]
-          python: ["3.10","3.11", "3.12", "3.13"]
-          cuda: ["12.3", "12.1"]
+          python: ["3.10","3.11", "3.12", "3.13", "3.13-nogil"]
+          cuda: ["12.1", "12.8"]
           enable-x64: [0]
+    name: "Pytest CUDA (JAX artifacts version = ${{ startsWith(github.ref_name, 'release/') && 'latest release' || 'nightly' }})"
     with:
       runner: ${{ matrix.runner }}
       python: ${{ matrix.python }}
       cuda:  ${{ matrix.cuda }}
       enable-x64:  ${{ matrix.enable-x64 }}
-      # Don't install "jax" at head. Instead install the nightly/release "jax" wheels found in the
-      # GCS bucket.
-      install-jax-current-commit: 0
+      download-jax-only-from-gcs: ${{inputs.download-jax-only-from-gcs}}
+      gcs_download_uri: ${{inputs.gcs_download_uri}}
+
+  run-pytest-tpu:
+    uses: ./.github/workflows/pytest_tpu.yml
+    strategy:
+        fail-fast: false # don't cancel all jobs on failure
+        matrix:
+          # Skip Python 3.13 as it fails due to missing TensorFlow wheels (used for
+          # profiler_test.py, build/collect-profile-requirements.txt) for that version (b/402590302)
+          python: ["3.10", "3.11", "3.12"]
+          tpu-specs: [
+            # {type: "v3-8", cores: "4"}, # Enable when we have the v3 type available
+            {type: "v4-8", cores: "4", runner: "linux-x86-ct4p-240-4tpu"},
+            {type: "v5e-8", cores: "8", runner: "linux-x86-ct5lp-224-8tpu"}
+          ]
+          libtpu-version-type: ["pypi_latest", "nightly", "oldest_supported_libtpu"]
+          exclude:
+            - libtpu-version-type: ${{ startsWith(github.ref_name, 'release/') && 'nightly' }}
+            - libtpu-version-type: ${{ !startsWith(github.ref_name, 'release/') && 'pypi_latest' }}
+            # Run a single Python version for v4-8.
+            - tpu-specs:
+                type: "v4-8"
+              python: "3.10"
+            - tpu-specs:
+                type: "v4-8"
+              python: "3.11"
+            # Run min and max Python versions for v5e-8
+            - tpu-specs:
+                type: "v5e-8"
+              python: "3.11"
+    name: "Pytest TPU (JAX artifacts version = ${{ startsWith(github.ref_name, 'release/') && 'latest release' || 'nightly' }})"
+    with:
+      runner: ${{ matrix.tpu-specs.runner }}
+      cores: ${{ matrix.tpu-specs.cores }}
+      tpu-type: ${{ matrix.tpu-specs.type }}
+      python: ${{ matrix.python }}
+      run-full-tpu-test-suite: "1"
+      libtpu-version-type: ${{ matrix.libtpu-version-type }}
+      download-jax-only-from-gcs: ${{inputs.download-jax-only-from-gcs}}
       gcs_download_uri: ${{inputs.gcs_download_uri}}

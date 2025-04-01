@@ -19,11 +19,11 @@ from setuptools import setup, find_packages
 
 project_name = 'jax'
 
-_current_jaxlib_version = '0.5.0'
+_current_jaxlib_version = '0.5.3'
 # The following should be updated after each new jaxlib release.
-_latest_jaxlib_version_on_pypi = '0.5.0'
+_latest_jaxlib_version_on_pypi = '0.5.3'
 
-_libtpu_version = '0.0.8'
+_libtpu_version = '0.0.11.*'
 
 def load_version_module(pkg_path):
   spec = importlib.util.spec_from_file_location(
@@ -50,12 +50,12 @@ setup(
     long_description_content_type='text/markdown',
     author='JAX team',
     author_email='jax-dev@google.com',
-    packages=find_packages(exclude=["examples", "jax/src/internal_test_util"]),
+    packages=find_packages(exclude=["*examples*", "*internal_test_util*"]),
     package_data={'jax': ['py.typed', "*.pyi", "**/*.pyi"]},
     python_requires='>=3.10',
     install_requires=[
         f'jaxlib >={_minimum_jaxlib_version}, <={_jax_version}',
-        'ml_dtypes>=0.4.0',
+        'ml_dtypes>=0.5.0',
         'numpy>=1.25',
         "numpy>=1.26.0; python_version>='3.12'",
         'opt_einsum',
@@ -73,7 +73,7 @@ setup(
         'ci': [f'jaxlib=={_latest_jaxlib_version_on_pypi}'],
 
         # Cloud TPU VM jaxlib can be installed via:
-        # $ pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+        # $ pip install "jax[tpu]"
         'tpu': [
           f'jaxlib>={_current_jaxlib_version},<={_jax_version}',
           f'libtpu=={_libtpu_version}',

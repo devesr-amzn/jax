@@ -26,14 +26,17 @@ from jax._src import dtypes
 from jax._src.lax import lax
 from jax._src.lib import xla_client as xc
 from jax._src.sharding_impls import SingleDeviceSharding
-from jax._src.util import safe_zip, safe_map
-from jax._src.typing import Array, ArrayLike, DimSize, DType, DTypeLike, Shape
+from jax._src.util import safe_zip, safe_map, set_module
+from jax._src.typing import (Array, ArrayLike, DimSize, DType, DTypeLike,
+                             Shape, SupportsNdim, SupportsShape, SupportsSize)
 from jax.sharding import Sharding
 
 import numpy as np
 
 zip, unsafe_zip = safe_zip, zip
 map, unsafe_map = safe_map, map
+
+export = set_module('jax.numpy')
 
 _dtype = partial(dtypes.dtype, canonicalize=True)
 
@@ -250,8 +253,7 @@ def _broadcast_arrays(*args: ArrayLike) -> list[Array]:
   if not shapes or all(core.definitely_equal_shape(shapes[0], s) for s in shapes):
     return [lax.asarray(arg) for arg in args]
   result_shape = lax.broadcast_shapes(*shapes)
-  result_sharding = (lax.broadcast_shardings(*avals)
-                     if config.sharding_in_types.value else None)
+  result_sharding = lax.broadcast_shardings(*avals)
   return [_broadcast_to(arg, result_shape, result_sharding) for arg in args]
 
 
@@ -309,3 +311,141 @@ def normalize_device_to_sharding(device: xc.Device | Sharding | None) -> Shardin
     return SingleDeviceSharding(device)
   else:
     return device
+
+
+@export
+def ndim(a: ArrayLike | SupportsNdim) -> int:
+  """Return the number of dimensions of an array.
+
+  JAX implementation of :func:`numpy.ndim`. Unlike ``np.ndim``, this function
+  raises a :class:`TypeError` if the input is a collection such as a list or
+  tuple.
+
+  Args:
+    a: array-like object, or any object with an ``ndim`` attribute.
+
+  Returns:
+    An integer specifying the number of dimensions of ``a``.
+
+  Examples:
+    Number of dimensions for arrays:
+
+    >>> x = jnp.arange(10)
+    >>> jnp.ndim(x)
+    1
+    >>> y = jnp.ones((2, 3))
+    >>> jnp.ndim(y)
+    2
+
+    This also works for scalars:
+
+    >>> jnp.ndim(3.14)
+    0
+
+    For arrays, this can also be accessed via the :attr:`jax.Array.ndim` property:
+
+    >>> x.ndim
+    1
+  """
+  if hasattr(a, "ndim"):
+    return a.ndim
+  # Deprecation warning added 2025-2-20.
+  check_arraylike("ndim", a, emit_warning=True)
+  if hasattr(a, "__jax_array__"):
+    a = a.__jax_array__()
+  # NumPy dispatches to a.ndim if available.
+  return np.ndim(a)  # type: ignore[arg-type]
+
+
+@export
+def shape(a: ArrayLike | SupportsShape) -> tuple[int, ...]:
+  """Return the shape an array.
+
+  JAX implementation of :func:`numpy.shape`. Unlike ``np.shape``, this function
+  raises a :class:`TypeError` if the input is a collection such as a list or
+  tuple.
+
+  Args:
+    a: array-like object, or any object with a ``shape`` attribute.
+
+  Returns:
+    An tuple of integers representing the shape of ``a``.
+
+  Examples:
+    Shape for arrays:
+
+    >>> x = jnp.arange(10)
+    >>> jnp.shape(x)
+    (10,)
+    >>> y = jnp.ones((2, 3))
+    >>> jnp.shape(y)
+    (2, 3)
+
+    This also works for scalars:
+
+    >>> jnp.shape(3.14)
+    ()
+
+    For arrays, this can also be accessed via the :attr:`jax.Array.shape` property:
+
+    >>> x.shape
+    (10,)
+  """
+  if hasattr(a, "shape"):
+    return a.shape
+  # Deprecation warning added 2025-2-20.
+  check_arraylike("shape", a, emit_warning=True)
+  if hasattr(a, "__jax_array__"):
+    a = a.__jax_array__()
+  # NumPy dispatches to a.shape if available.
+  return np.shape(a)  # type: ignore[arg-type]
+
+
+@export
+def size(a: ArrayLike | SupportsSize | SupportsShape, axis: int | None = None) -> int:
+  """Return number of elements along a given axis.
+
+  JAX implementation of :func:`numpy.size`. Unlike ``np.size``, this function
+  raises a :class:`TypeError` if the input is a collection such as a list or
+  tuple.
+
+  Args:
+    a: array-like object, or any object with a ``size`` attribute when ``axis`` is not
+      specified, or with a ``shape`` attribute when ``axis`` is specified.
+    axis: optional integer along which to count elements. By default, return
+      the total number of elements.
+
+  Returns:
+    An integer specifying the number of elements in ``a``.
+
+  Examples:
+    Size for arrays:
+
+    >>> x = jnp.arange(10)
+    >>> jnp.size(x)
+    10
+    >>> y = jnp.ones((2, 3))
+    >>> jnp.size(y)
+    6
+    >>> jnp.size(y, axis=1)
+    3
+
+    This also works for scalars:
+
+    >>> jnp.size(3.14)
+    1
+
+    For arrays, this can also be accessed via the :attr:`jax.Array.size` property:
+
+    >>> y.size
+    6
+  """
+  if (axis is None and hasattr(a, "size")) or (axis is not None and hasattr(a, "shape")):
+    # NumPy dispatches to a.size/a.shape if available.
+    return np.size(a, axis=axis)  # type: ignore[arg-type]
+  # Deprecation warning added 2025-2-20.
+  check_arraylike("size", a, emit_warning=True)
+  if hasattr(a, "__jax_array__"):
+    a = a.__jax_array__()
+  # NumPy dispatches to a.size/a.shape if available.
+  return np.size(a, axis=axis)  # type: ignore[arg-type]

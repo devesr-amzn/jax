@@ -41,7 +41,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "third_party/absl/status/statusor.h"
+#include "absl/status/statusor.h"
 #include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/literal.h"
@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
   xla::XlaComputation xla_computation(test_module_proto);
   xla::CompileOptions compile_options;
   std::unique_ptr<xla::PjRtLoadedExecutable> executable =
-      client->Compile(xla_computation, compile_options).value();
+      client->CompileAndLoad(xla_computation, compile_options).value();
 
   // Prepare inputs.
   xla::Literal literal_x =
