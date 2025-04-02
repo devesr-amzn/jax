@@ -1061,17 +1061,10 @@ class TestPromotionTables(jtu.JaxTestCase):
         self.skipTest('XLA support for int4 is incomplete.')
       if dtypes.iinfo(dtype).bits == 2:
         self.skipTest('XLA support for int2 is incomplete.')
-<<<<<<< HEAD
     if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu', 'neuron']):
       self.skipTest('TPU and neuron do not support float8_e8m0fnu.')
-    if dtype in fp8_dtypes and dtype not in (dtypes.float8_e4m3, dtypes.float8_e4m3fn) and jtu.test_device_matches(['neuron']):
-      self.skipTest(f'{dtype} is not supported on neuron')
-=======
-    if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu']):
-      self.skipTest('TPU does not support float8_e8m0fnu.')
-    if dtype == dtypes.float4_e2m1fn and jtu.test_device_matches(['tpu']):
-      self.skipTest('TPU does not support float4_e2m1fn.')
->>>>>>> main
+    if dtype == dtypes.float4_e2m1fn and jtu.test_device_matches(['tpu', 'neuron']):
+      self.skipTest('TPU and neuron do not support float4_e2m1fn.')
     val = lax_internal._convert_element_type(0, dtype, weak_type=weak_type)
     rep = repr(val)
     self.assertStartsWith(rep, 'Array(')
