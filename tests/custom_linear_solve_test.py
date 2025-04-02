@@ -91,6 +91,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
       {"testcase_name": "nonsymmetric", "symmetric": False},
       {"testcase_name": "symmetric", "symmetric": True},
   )
+  @jtu.skip_on_devices("neuron")
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve(self, symmetric):
 
@@ -121,6 +122,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
     actual = jax.vmap(linear_solve, (None, 1), 1)(a, c)
     self.assertAllClose(expected, actual)
 
+  @jtu.skip_on_devices("neuron")
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve_aux(self):
     def explicit_jacobian_solve_aux(matvec, b):
@@ -186,6 +188,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
     jtu.check_grads(lambda x: linear_solve(a, x), (b,), order=2,
                     rtol={np.float32: 5e-3})
 
+  @jtu.skip_on_devices("neuron")
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve_iterative(self):
 
@@ -225,6 +228,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
         order=2,
         rtol={jnp.float32: 6e-2, jnp.float64: 2e-3})
 
+  @jtu.skip_on_devices("neuron")
   def test_custom_linear_solve_cholesky(self):
 
     def positive_definite_solve(a, b):
@@ -253,6 +257,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
         lambda x, y: positive_definite_solve(posify(x), y),
         (a, b), order=2, rtol=0.3)
 
+  @jtu.skip_on_devices("neuron")
   def test_custom_linear_solve_complex(self):
 
     def solve(a, b):
@@ -268,6 +273,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
     b = 0.5 * rng.randn(2) + 0.5j * rng.randn(2)
     jtu.check_grads(solve, (a, b), order=2, rtol=1e-2)
 
+  @jtu.skip_on_devices("neuron")
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve_lu(self):
 
@@ -295,6 +301,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
     jtu.check_grads(jax.jit(linear_solve), (a, b), order=2,
                     rtol={np.float32: 2e-3})
 
+  @jtu.skip_on_devices("neuron")
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve_without_transpose_solve(self):
 
@@ -439,6 +446,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(ValueError, re.escape("matvec() output shapes")):
       jax.jvp(bad_matvec_usage, (1.0,), (1.0,))
 
+  @jtu.skip_on_devices("neuron")
   def test_custom_linear_solve_new_remat(self):
 
     def explicit_jacobian_solve(matvec, b):

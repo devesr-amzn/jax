@@ -994,8 +994,8 @@ class TestPromotionTables(jtu.JaxTestCase):
   @jax.numpy_dtype_promotion('standard')
   def testFloat4PromotionError(self):
     for dtype in fp4_dtypes:
-      if dtype == dtypes.float4_e2m1fn and jtu.test_device_matches(['tpu']):
-        # TPU does not support float4_e2m1fn.
+      if dtype == dtypes.float4_e2m1fn and jtu.test_device_matches(['tpu', 'neuron']):
+        # TPU and neuron do not support float4_e2m1fn.
         continue
       x = jnp.array(1, dtype=dtype)
       y = jnp.array(1, dtype='float32')
@@ -1025,6 +1025,8 @@ class TestPromotionTables(jtu.JaxTestCase):
     promotion=['standard', 'strict'],
   )
   def testBinaryNonPromotion(self, dtype, weak_type, promotion):
+    if dtype in complex_dtypes and jtu.test_device_matches(['neuron']):
+      self.skipTest("neuron does not support complex dtypes")
     if dtype in fp8_dtypes:
       self.skipTest("XLA support for float8 is incomplete.")
     if dtype in fp4_dtypes:
@@ -1061,6 +1063,14 @@ class TestPromotionTables(jtu.JaxTestCase):
         self.skipTest('XLA support for int4 is incomplete.')
       if dtypes.iinfo(dtype).bits == 2:
         self.skipTest('XLA support for int2 is incomplete.')
+    if dtype == dtypes.float8_e3m4 and jtu.test_device_matches(['neuron']):
+      self.skipTest('neuron does not support float8_e3m4.')
+    if dtype == dtypes.float8_e4m3b11fnuz and jtu.test_device_matches(['neuron']):
+      self.skipTest('neuron does not support float8_e4m3b11fnuz.')
+    if dtype == dtypes.float8_e5m2fnuz and jtu.test_device_matches(['neuron']):
+      self.skipTest('neuron does not support float8_e5m2fnuz.')
+    if dtype == dtypes.float8_e4m3fnuz and jtu.test_device_matches(['neuron']):
+      self.skipTest('neuron does not support float8_e4m3fnuz.')
     if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu', 'neuron']):
       self.skipTest('TPU and neuron do not support float8_e8m0fnu.')
     if dtype == dtypes.float4_e2m1fn and jtu.test_device_matches(['tpu', 'neuron']):

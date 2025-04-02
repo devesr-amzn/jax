@@ -40,6 +40,7 @@ class DebugNaNsTest(jtu.JaxTestCase):
     ans = jnp.tanh(A)
     ans.block_until_ready()
 
+  @jtu.skip_on_devices("neuron")
   def testMultipleResultPrimitiveNoNaN(self):
     A = jnp.array([[1., 2.], [2., 3.]])
     ans, _ = jnp.linalg.eigh(A)
@@ -236,6 +237,7 @@ class DebugInfsTest(jtu.JaxTestCase):
     ans = jnp.tanh(A)
     ans.block_until_ready()
 
+  @jtu.skip_on_devices("neuron")
   def testMultipleResultPrimitiveNoInf(self):
     A = jnp.array([[1., 2.], [2., 3.]])
     ans, _ = jnp.linalg.eigh(A)

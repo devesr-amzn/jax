@@ -86,6 +86,9 @@ class CustomRootTest(jtu.JaxTestCase):
   )
   def test_custom_root_scalar(self, solve_method):
 
+    if jtu.test_device_matches(["neuron"]) and solve_method == newton_raphson:
+      self.skipTest("custom_root with newton_raphson is not supported on neuron")
+
     def scalar_solve(f, y):
       return y / f(1.0)
 
@@ -114,6 +117,7 @@ class CustomRootTest(jtu.JaxTestCase):
     self.assertAllClose(
         results, 5.0**1.5, check_dtypes=False, rtol={np.float64: 1e-7})
 
+  @jtu.skip_on_devices("neuron")
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_root_vector_with_solve_closure(self):
 
@@ -137,6 +141,7 @@ class CustomRootTest(jtu.JaxTestCase):
     expected = jnp.linalg.solve(a, b)
     self.assertAllClose(expected, actual)
 
+  @jtu.skip_on_devices("neuron")
   def test_custom_root_vector_nonlinear(self):
 
     def nonlinear_func(x, y):
@@ -161,6 +166,7 @@ class CustomRootTest(jtu.JaxTestCase):
     actual = jax.jit(nonlinear_solve)(y)
     self.assertAllClose(y, actual, rtol=1e-5, atol=1e-5)
 
+  @jtu.skip_on_devices("neuron")
   def test_custom_root_with_custom_linear_solve(self):
 
     def linear_solve(a, b):
