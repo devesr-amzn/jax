@@ -29,13 +29,16 @@ from jax._src import core as jax_core
 from jax._src import dtypes
 from jax._src import effects
 from jax._src import tree_util
+from jax._src import pretty_printer as pp
 from jax._src.lib.mlir.dialects import arith as arith_dialect
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas import primitives as pallas_primitives
+import jax._src.pallas.utils as pallas_utils
 from jax._src.state import discharge as state_discharge
 from jax._src.state import indexing
 from jax._src.state import types as state_types
 import jax.experimental.mosaic.gpu as mgpu
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 
@@ -88,7 +91,7 @@ class GPUCompilerParams(pallas_core.CompilerParams):
   delay_release: int = 0
   profile_space: int = 0
   profile_dir: str = ""
-  thread_semantics: mgpu.core.ThreadSemantics = mgpu.core.ThreadSemantics.Lane
+  lowering_semantics: mgpu.core.LoweringSemantics = mgpu.core.LoweringSemantics.Lane
 
   def __post_init__(self):
     if bool(self.profile_space) ^ bool(self.profile_dir):
@@ -137,6 +140,22 @@ class SemaphoreType(enum.Enum):
 
   def get_ref_aval(self) -> pallas_core.TransformedRef | AbstractMemoryRef:
     return self(()).get_ref_aval()
+
+
+class PrimitiveSemantics(enum.Enum):
+  """Thread semantics for a primitives at the Pallas user-level."""
+
+  Warp = enum.auto()
+  Warpgroup = enum.auto()
+
+
+# Convenience constants for (lowering, primitive) thread semantics pairs.
+LANExWG_SEMANTICS = (
+    mgpu.LoweringSemantics.Lane, PrimitiveSemantics.Warpgroup)
+LANExWARP_SEMANTICS = (
+    mgpu.LoweringSemantics.Lane, PrimitiveSemantics.Warp)
+WGxWG_SEMANTICS = (
+    mgpu.LoweringSemantics.Warpgroup, PrimitiveSemantics.Warpgroup)
 
 
 def kernel(
@@ -263,9 +282,33 @@ class UntileRef(state_types.Transform):
   def transform_dtype(self, dtype):
     return dtype
 
+  def untransform_transpose(
+      self, perm: tuple[int, ...]
+  ) -> tuple[tuple[int, ...], state_types.Transform]:
+    # The transpose in question is applied to the utiled ref so we
+    # need to translate it by duplicating and offseting the last part.
+    off = len(perm)
+    new_suffix = [i + off for i in perm[-len(self.tiling) :]]
+    if set(new_suffix) != set(range(off, off + len(self.tiling))):
+      raise ValueError(
+          "Transpose cannot be moved before a tiling transform when it changes"
+          f" the set of tiled dimensions. (permutation: {perm}, tiling:"
+          f" {self.tiling})"
+      )
+
+    new_tiling = tuple(self.tiling[i - off] for i in new_suffix)
+    return (*perm, *new_suffix), dataclasses.replace(self, tiling=new_tiling)
+
+  def untransform_reshape(
+      self, dtype: jnp.dtype, shape: tuple[int, ...]
+  ) -> tuple[tuple[int, ...], state_types.Transform]:
+    del dtype
+    raise NotImplementedError("Reshapes don't commute with transposes.")
+
   def untransform_index(
-      self, idxs: tuple[Index, ...]
+      self, dtype: jnp.dtype | ir.Type, idxs: tuple[Index, ...]
   ) -> tuple[tuple[Index, ...], state_types.Transform]:
+    del dtype
     untiled_idxs = idxs[: -len(self.tiling)]
     tiled_idxs = idxs[-len(self.tiling) :]
     idxs_after_tiling: list[Index] = []
@@ -303,6 +346,9 @@ class UntileRef(state_types.Transform):
 
   def undo_to_gpu_transform(self) -> mgpu.MemRefTransform:
     return mgpu.TileTransform(self.tiling)
+
+  def pretty_print(self, context: jax_core.JaxprPpContext) -> pp.Doc:
+    return pp.text(f"{{untile({list(self.tiling)})}}")
 
 
 def _perm_inverse(permutation: tuple[int, ...]) -> tuple[int, ...]:
@@ -352,9 +398,23 @@ class TransposeRef(state_types.Transform):
   def transform_dtype(self, dtype):
     return dtype
 
+  def untransform_transpose(
+      self, perm
+  ) -> tuple[tuple[int, ...], state_types.Transform]:
+    raise NotImplementedError(
+        "Commuting of transpose over transpose is not supported."
+    )
+
+  def untransform_reshape(
+      self, dtype: jnp.dtype | ir.Type, shape: tuple[int, ...]
+  ) -> tuple[tuple[int, ...], state_types.Transform]:
+    del shape, dtype
+    raise NotImplementedError("Can't reshape a transposed memref.")
+
   def untransform_index(
-      self, idxs: tuple[Index, ...]
+      self, dtype: jnp.dtype | ir.Type, idxs: tuple[Index, ...]
   ) -> tuple[tuple[Index, ...], state_types.Transform]:
+    del dtype
     removed_dims = [
         i for i, idx in enumerate(idxs) if not isinstance(idx, (slice, mgpu.ds))
     ]
@@ -368,6 +428,9 @@ class TransposeRef(state_types.Transform):
 
   def undo_to_gpu_transform(self) -> mgpu.MemRefTransform:
     return mgpu.TransposeTransform(_perm_inverse(self.permutation))
+
+  def pretty_print(self, context: jax_core.JaxprPpContext) -> pp.Doc:
+    return pp.text(f"{{transpose({list(self.permutation)})}}")
 
 
 def transform_ref(
@@ -422,7 +485,7 @@ class SwizzleTransform(MemoryRefTransform):
     raise NotImplementedError
 
   def __call__(self, aval: jax_core.ShapedArray) -> jax_core.ShapedArray:
-    swizzle_elems = self.swizzle // aval.dtype.itemsize
+    swizzle_elems = (self.swizzle * 8) // pallas_utils.dtype_bitwidth(aval.dtype)
     if swizzle_elems != aval.shape[-1]:
       raise ValueError(
           f"Swizzle {self.swizzle} requires the trailing dimension to be of"
@@ -436,9 +499,31 @@ class SwizzleTransform(MemoryRefTransform):
 class UnswizzleRef(state_types.Transform):
   swizzle: int = dataclasses.field(metadata=dict(static=True))
 
+  def swizzle_elems(self, dtype: jnp.dtype | ir.Type) -> int:
+    if not isinstance(dtype, ir.Type):
+      dtype = mgpu_utils.dtype_to_ir_type(dtype)
+    return (self.swizzle * 8) // mgpu.bitwidth(dtype)
+
+  def untransform_transpose(self, perm) -> tuple[tuple[int, ...], state_types.Transform]:
+    if perm[-1] != len(perm) - 1:
+      raise ValueError("Can't transpose the swizzled dimension.")
+
+    return perm, self
+
+  def untransform_reshape(
+      self, dtype: jnp.dtype | ir.Type, shape: tuple[int, ...]
+  ) -> tuple[tuple[int, ...], state_types.Transform]:
+    if shape[-1] != self.swizzle_elems(dtype):
+      raise ValueError(
+          f"Reshape shape {shape} is not divisible by swizzle elements"
+          f" {self.swizzle_elems(dtype)}"
+      )
+    return shape, self
+
   def untransform_index(
-      self, idxs: tuple[Index, ...]
+      self, dtype: jnp.dtype | ir.Type, idxs: tuple[Index, ...]
   ) -> tuple[tuple[Index, ...], state_types.Transform]:
+    swizzle_elems = self.swizzle_elems(dtype)
     if not idxs:
       return idxs, self
     if not all(isinstance(idx, (slice, mgpu.ds)) for idx in idxs[-2:]):
@@ -447,17 +532,20 @@ class UnswizzleRef(state_types.Transform):
       )
     last_idx = idxs[-1]
     if isinstance(last_idx, mgpu.DynamicSlice):
-      if last_idx.base != 0 or last_idx.length != self.swizzle:
+      if last_idx.base != 0 or last_idx.length != swizzle_elems:
         raise ValueError("Swizzled dims cannot be sliced")
     else:
       assert isinstance(last_idx, slice)
       if (
           (last_idx.step is not None and last_idx.step != 1)
           or (last_idx.start is not None and last_idx.start != 0)
-          or (last_idx.stop is not None and last_idx.stop != self.swizzle)
+          or (last_idx.stop is not None and last_idx.stop != swizzle_elems)
       ):
         raise ValueError("Swizzled dims cannot be sliced")
     return idxs, self
+
+  def pretty_print(self, context: jax_core.JaxprPpContext) -> pp.Doc:
+    return pp.text(f"{{unswizzle({self.swizzle})}}")
 
 
 @dataclasses.dataclass
@@ -662,6 +750,27 @@ class GPUMesh:
   def discharges_effect(self, effect: jax_core.Effect):
     return effect is _wgmma_pipeline_effect or effect is _memory_effect
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class WarpMesh:
+  """Represents a mesh over individual warps within a warpgroup.
+
+  When used in conjunction with `core_map`, the warp ID will be visible
+  within the body of the wrapped scope by querying `lax.axis_index` with
+  the specified axis name.
+  """
+
+  _NUM_WARPS_PER_WARPGROUP: ClassVar[int] = 4
+  axis_name: str
+
+  @property
+  def shape(self):
+    return collections.OrderedDict([
+        (self.axis_name, self._NUM_WARPS_PER_WARPGROUP),
+    ])
+
+  def discharges_effect(self, effect: jax_core.Effect):
+    del effect
+    return False
 
 def _gpu_mesh_discharge_rule(
     in_avals,

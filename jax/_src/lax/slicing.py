@@ -173,6 +173,8 @@ def dynamic_slice(
   else:
     dynamic_sizes = []
     static_sizes = core.canonicalize_shape(slice_sizes)  # type: ignore
+  operand, *start_indices = core.standard_insert_pbroadcast(
+      operand, *start_indices)
   return dynamic_slice_p.bind(operand, *start_indices, *dynamic_sizes,
                               slice_sizes=tuple(static_sizes))
 
@@ -234,7 +236,8 @@ def dynamic_update_slice(
   """
   start_indices = _dynamic_slice_indices(
       operand, start_indices, allow_negative_indices)
-  operand, update = core.standard_insert_pbroadcast(operand, update)
+  operand, update, *start_indices = core.standard_insert_pbroadcast(
+      operand, update, *start_indices)
   return dynamic_update_slice_p.bind(operand, update, *start_indices)
 
 
@@ -783,6 +786,8 @@ def scatter_apply(
     pass
   jaxpr, consts = lax._reduction_jaxpr(_apply, core.get_aval(lax._zero(operand)))
   # TODO: implement this via its own primitive so we can define appropriate autodiff rules.
+  operand, scatter_indices, unused = core.standard_insert_pbroadcast(
+      operand, scatter_indices, unused)
   return scatter_p.bind(
       operand, scatter_indices, unused, update_jaxpr=jaxpr,
       update_consts=consts, dimension_numbers=dimension_numbers,
@@ -1487,12 +1492,12 @@ def _dynamic_slice_jvp(primals, tangents, *, slice_sizes):
 def _dynamic_slice_transpose_rule(t, operand, *start_indices, slice_sizes):
   assert ad.is_undefined_primal(operand)
   assert all(not ad.is_undefined_primal(s) for s in start_indices)
-  operand_shape, operand_dtype = operand.aval.shape, operand.aval.dtype
   if type(t) is ad_util.Zero:
     return [ad_util.Zero(operand.aval)] + [None] * len(start_indices)
   else:
-    zeros = lax.full(operand_shape, 0, operand_dtype,
+    zeros = lax.full(operand.aval.shape, 0, operand.aval.dtype,
                      sharding=operand.aval.sharding)
+    zeros = core.pvary(zeros, tuple(operand.aval.vma))
     return ([dynamic_update_slice_p.bind(zeros, t, *start_indices)] +
             [None] * len(start_indices))
 

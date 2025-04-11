@@ -93,7 +93,7 @@ package_group(
     includes = [":internal"],
     packages = [
         # Intentionally avoid jax dependencies on jax.extend.
-        # See https://jax.readthedocs.io/en/latest/jep/15856-jex.html
+        # See https://docs.jax.dev/en/latest/jep/15856-jex.html
         "//tests/...",
     ] + jax_extend_internal_users,
 )
@@ -142,6 +142,7 @@ py_library(
     # these are available in jax.test_util via the standard :jax target.
     name = "test_util",
     srcs = [
+        "_src/test_loader.py",
         "_src/test_util.py",
         "_src/test_warning_util.py",
     ],
@@ -400,6 +401,7 @@ pytype_strict_library(
     deps = [
         ":partition_spec",
         ":sharding",
+        ":util",
         "//jax/_src/lib",
     ] + py_deps("numpy"),
 )
@@ -1072,6 +1074,7 @@ pytype_strict_library(
     srcs = ["_src/tpu_custom_call.py"],
     visibility = [":internal"],
     deps = [
+        ":cloud_tpu_init",
         ":config",
         ":core",
         ":jax",

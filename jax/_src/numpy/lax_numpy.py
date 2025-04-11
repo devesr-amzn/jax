@@ -552,7 +552,7 @@ def result_type(*args: Any) -> DType:
 
     For details on 64-bit values, refer to `Sharp bits - double precision`_:
 
-    .. _Sharp bits - double precision: https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#double-64bit-precision
+    .. _Sharp bits - double precision: https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#double-64bit-precision
   """
   return dtypes.result_type(*args)
 
@@ -911,11 +911,11 @@ def histogram(a: ArrayLike, bins: ArrayLike = 10,
     Array(True, dtype=bool)
   """
   if weights is None:
-    util.check_arraylike("histogram", a, bins)
+    a, _ = util.ensure_arraylike("histogram", a, bins)
     a, = util.promote_dtypes_inexact(a)
     weights = ones_like(a)
   else:
-    util.check_arraylike("histogram", a, bins, weights)
+    a, _, weights = util.ensure_arraylike("histogram", a, bins, weights)
     if np.shape(a) != np.shape(weights):
       raise ValueError("weights should have the same shape as a.")
     a, weights = util.promote_dtypes_inexact(a, weights)
@@ -1005,7 +1005,7 @@ def histogram2d(x: ArrayLike, y: ArrayLike, bins: ArrayLike | list[ArrayLike] = 
     >>> jnp.allclose(normed_sum, 1.0)
     Array(True, dtype=bool)
   """
-  util.check_arraylike("histogram2d", x, y)
+  x, y = util.ensure_arraylike("histogram2d", x, y)
   try:
     N = len(bins)  # type: ignore[arg-type]
   except TypeError:
@@ -1077,10 +1077,10 @@ def histogramdd(sample: ArrayLike, bins: ArrayLike | list[ArrayLike] = 10,
     Array(True, dtype=bool)
   """
   if weights is None:
-    util.check_arraylike("histogramdd", sample)
+    sample = util.ensure_arraylike("histogramdd", sample)
     sample, = util.promote_dtypes_inexact(sample)
   else:
-    util.check_arraylike("histogramdd", sample, weights)
+    sample, weights = util.ensure_arraylike("histogramdd", sample, weights)
     if np.shape(weights) != np.shape(sample)[:1]:
       raise ValueError("should have one weight for each sample.")
     sample, weights = util.promote_dtypes_inexact(sample, weights)
@@ -2424,7 +2424,7 @@ def expand_dims(a: ArrayLike, axis: int | Sequence[int]) -> Array:
              [2],
              [3]]]], dtype=int32)
   """
-  util.check_arraylike("expand_dims", a)
+  a = util.ensure_arraylike("expand_dims", a)
   axis = _ensure_index_tuple(axis)
   return lax.expand_dims(a, axis)
 
@@ -2814,7 +2814,7 @@ def where(condition, x=None, y=None, /, *, size=None, fill_value=None):
     (reverse-mode differentiation), a NaN in either ``x`` or ``y`` will propagate into the
     gradient, regardless of the value of ``condition``.  More information on this behavior
     and workarounds is available in the `JAX FAQ
-    <https://jax.readthedocs.io/en/latest/faq.html#gradients-contain-nan-where-using-where>`_.
+    <https://docs.jax.dev/en/latest/faq.html#gradients-contain-nan-where-using-where>`_.
 
   Examples:
     When ``x`` and ``y`` are not provided, ``where`` behaves equivalently to
@@ -2984,7 +2984,7 @@ def bincount(x: ArrayLike, weights: ArrayLike | None = None,
     >>> jnp.bincount(x, length=5)
     Array([2, 1, 0, 1, 0], dtype=int32)
   """
-  util.check_arraylike("bincount", x)
+  x = util.ensure_arraylike("bincount", x)
   if _dtype(x) == bool:
     x = lax.convert_element_type(x, 'int32')
   if not issubdtype(_dtype(x), np.integer):
@@ -4371,7 +4371,7 @@ def pad(array: ArrayLike, pad_width: PadValueLike[int | Array | np.ndarray],
     Array([-10, -10,   2,   3,   4,  10,  10], dtype=int32)
   """
 
-  util.check_arraylike("pad", array)
+  array = util.ensure_arraylike("pad", array)
   pad_width = _broadcast_to_pairs(pad_width, np.ndim(array), "pad_width")
   if pad_width and not all(core.is_dim(p[0]) and core.is_dim(p[1])
                            for p in pad_width):
@@ -4466,7 +4466,7 @@ def stack(arrays: np.ndarray | Array | Sequence[ArrayLike],
     axis = _canonicalize_axis(axis, arrays.ndim)
     return concatenate(expand_dims(arrays, axis + 1), axis=axis, dtype=dtype)
   else:
-    util.check_arraylike("stack", *arrays)
+    arrays = util.ensure_arraylike_tuple("stack", arrays)
     shape0 = np.shape(arrays[0])
     axis = _canonicalize_axis(axis, len(shape0) + 1)
     new_arrays = []
@@ -4555,7 +4555,7 @@ def tile(A: ArrayLike, reps: DimSize | Sequence[DimSize]) -> Array:
            [1, 2],
            [3, 4]], dtype=int32)
   """
-  util.check_arraylike("tile", A)
+  A = util.ensure_arraylike("tile", A)
   try:
     iter(reps)  # type: ignore[arg-type]
   except TypeError:
@@ -4628,7 +4628,7 @@ def concatenate(arrays: np.ndarray | Array | Sequence[ArrayLike],
   """
   if isinstance(arrays, (np.ndarray, Array)):
     return _concatenate_array(arrays, axis, dtype=dtype)
-  util.check_arraylike("concatenate", *arrays)
+  arrays = util.ensure_arraylike_tuple("concatenate", arrays)
   if not len(arrays):
     raise ValueError("Need at least one array to concatenate.")
   if axis is None:
@@ -4870,6 +4870,7 @@ def dstack(tup: np.ndarray | Array | Sequence[ArrayLike],
   else:
     # TODO(jakevdp): Non-array input deprecated 2023-09-22; change to error.
     util.check_arraylike("dstack", *tup, emit_warning=True)
+    tup = util.ensure_arraylike_tuple("dstack", tup)
     arrs = [atleast_3d(m) for m in tup]
   return concatenate(arrs, axis=2, dtype=dtype)
 
@@ -5017,7 +5018,7 @@ def choose(a: ArrayLike, choices: Array | np.ndarray | Sequence[ArrayLike],
   """
   if out is not None:
     raise NotImplementedError("The 'out' argument to jnp.choose is not supported.")
-  util.check_arraylike('choose', a, *choices)
+  a, *choices = util.ensure_arraylike_tuple('choose', (a, *choices))
   if not issubdtype(_dtype(a), np.integer):
     raise ValueError("`a` array must be integer typed")
   N = len(choices)
@@ -5501,14 +5502,7 @@ def array(object: Any, dtype: DTypeLike | None = None, copy: bool = True,
 
   leaves, treedef = tree_flatten(object, is_leaf=lambda x: x is None)
   if any(leaf is None for leaf in leaves):
-    # Added Nov 16 2023
-    if deprecations.is_accelerated("jax-numpy-array-none"):
-      raise TypeError("None is not a valid value for jnp.array")
-    warnings.warn(
-      "None encountered in jnp.array(); this is currently treated as NaN. "
-      "In the future this will result in an error.",
-      FutureWarning, stacklevel=2)
-    leaves, treedef = tree_flatten(object)
+    raise ValueError("None is not a valid value for jnp.array")
   leaves = [
       leaf
       if (leaf_jax_array := getattr(leaf, "__jax_array__", None)) is None
@@ -5909,14 +5903,14 @@ def fromfile(*args, **kwargs):
   ``jnp.asarray(np.fromfile(...))`` instead, although care should be taken if ``np.fromfile``
   is used within jax transformations because of its potential side-effect of consuming the
   file object; for more information see `Common Gotchas: Pure Functions
-  <https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions>`_.
+  <https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions>`_.
   """
   raise NotImplementedError(
     "jnp.fromfile() is not implemented because it may be non-pure and thus unsafe for use "
     "with JIT and other JAX transformations. Consider using jnp.asarray(np.fromfile(...)) "
     "instead, although care should be taken if np.fromfile is used within a jax transformations "
     "because of its potential side-effect of consuming the file object; for more information see "
-    "https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions")
+    "https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions")
 
 
 @export
@@ -5928,14 +5922,14 @@ def fromiter(*args, **kwargs):
   ``jnp.asarray(np.fromiter(...))`` instead, although care should be taken if ``np.fromiter``
   is used within jax transformations because of its potential side-effect of consuming the
   iterable object; for more information see `Common Gotchas: Pure Functions
-  <https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions>`_.
+  <https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions>`_.
   """
   raise NotImplementedError(
     "jnp.fromiter() is not implemented because it may be non-pure and thus unsafe for use "
     "with JIT and other JAX transformations. Consider using jnp.asarray(np.fromiter(...)) "
     "instead, although care should be taken if np.fromiter is used within a jax transformations "
     "because of its potential side-effect of consuming the iterable object; for more information see "
-    "https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions")
+    "https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions")
 
 
 @export
@@ -6994,8 +6988,11 @@ def repeat(a: ArrayLike, repeats: ArrayLike, axis: int | None = None, *,
     Array([[1, 1, 2, 2, 2, 2, 2],
            [3, 3, 4, 4, 4, 4, 4]], dtype=int32)
   """
-  arr = util.ensure_arraylike("repeat", a)
-  core.is_dim(repeats) or util.check_arraylike("repeat", repeats)
+  if core.is_dim(repeats):
+    util.check_arraylike("repeat", a)
+  else:
+    util.check_arraylike("repeat", a, repeats)
+  arr = asarray(a)
 
   if axis is None:
     arr = arr.ravel()
@@ -7834,7 +7831,7 @@ def diag_indices_from(arr: ArrayLike) -> tuple[Array, ...]:
     Array([0, 1], dtype=int32),
     Array([0, 1], dtype=int32))
   """
-  util.check_arraylike("diag_indices_from", arr)
+  arr = util.ensure_arraylike("diag_indices_from", arr)
   nd = np.ndim(arr)
   if not np.ndim(arr) >= 2:
     raise ValueError("input array must be at least 2-d")
@@ -8250,6 +8247,9 @@ def delete(
   # Case 3: obj is an array
   # NB: pass both arrays to check for appropriate error message.
   util.check_arraylike("delete", a, obj)
+  # Can't use ensure_arraylike here because obj may be static.
+  if hasattr(obj, "__jax_array__"):
+    obj = obj.__jax_array__()
 
   # Case 3a: unique integer indices; delete in a JIT-compatible way
   if issubdtype(_dtype(obj), np.integer) and assume_unique_indices:
@@ -8780,6 +8780,7 @@ def argwhere(
     >>> jnp.argwhere(0)
     Array([], shape=(0, 0), dtype=int32)
   """
+  a = util.ensure_arraylike("argwhere", a)
   result = transpose(vstack(nonzero(atleast_1d(a), size=size, fill_value=fill_value)))
   if np.ndim(a) == 0:
     return result[:0].reshape(result.shape[0], 0)

@@ -186,9 +186,7 @@ def _python_pjit_helper(fun: Callable, jit_info: PjitInfo, *args, **kwargs):
     args_flat = [*init_states, *args_flat]
 
   try:
-    if (core.trace_state_clean() and
-        not config.debug_key_reuse.value and
-        not config.data_dependent_tracing_fallback.value):
+    if core.trace_state_clean() and not config.debug_key_reuse.value:
       args_flat = map(core.full_lower, args_flat)
       core.check_eval_args(args_flat)
       out_flat, compiled, profiler = _pjit_call_impl_python(*args_flat, **p.params)
@@ -683,7 +681,7 @@ class InferParamsCacheEntry:
 
 # We use an outer cache that is keyed on the signature of the arguments, but
 # when populating a cache entry using _infer_params_impl, we need to provide
-# actual arguments. In principle we could refactor _infer_params_impl to look
+# actual arguments. In principle, we could refactor _infer_params_impl to look
 # only at an argument signature instead of args/kwargs in those cases that we
 # cache, but this was a more minimal change.
 @util.weakref_lru_cache
@@ -730,7 +728,7 @@ def _infer_params_internal(
   if entry.pjit_params is None:
     p, args_flat = _infer_params_impl(
         fun, ji, ctx_mesh, dbg, args, kwargs, in_avals=avals)
-    if p.attrs_tracked:  # if attrs, don't popoulate the cache
+    if p.attrs_tracked:  # if attrs, don't populate the cache
       return p, p.consts + args_flat
     entry.pjit_params = p
   return entry.pjit_params, entry.pjit_params.consts + dynargs
@@ -955,7 +953,7 @@ def pjit(
       be donated.
 
       For more details on buffer donation see the
-      `FAQ <https://jax.readthedocs.io/en/latest/faq.html#buffer-donation>`_.
+      `FAQ <https://docs.jax.dev/en/latest/faq.html#buffer-donation>`_.
     donate_argnames: An optional string or collection of strings specifying
       which named arguments are donated to the computation. See the
       comment on ``donate_argnums`` for details. If not
@@ -1271,7 +1269,7 @@ def explain_tracing_cache_miss(
     if add_weak_type_hint:
       p('where weak_type=True often means a Python builtin numeric value, and ')
       p('weak_type=False means a jax.Array.')
-      p('See https://jax.readthedocs.io/en/latest/type_promotion.html#weak-types')
+      p('See https://docs.jax.dev/en/latest/type_promotion.html#weak-types')
     return done()
 
   # we think this is unreachable...
@@ -2076,14 +2074,47 @@ def _pjit_linearization(nzs, *primals_in, jaxpr,
                         donated_invars, ctx_mesh, name, keep_unused, inline,
                         compiler_options_kvs):
   primal_jaxpr, num_residuals, nzs_out, tangent_jaxpr = ad.linearize_jaxpr(jaxpr, nzs)
-  # constvars will become residuals. Move them to the end of the ordinary args.
   res_shardings = (UNSPECIFIED,) * num_residuals
   res_layouts = (None,) * num_residuals
   res_donated = (False,) * num_residuals
+  primal_out_shardings = res_shardings + tuple(out_shardings)
+  primal_out_layouts = res_layouts + tuple(out_layouts)
+
+  def keep_where(l, should_keep):
+    return tuple(x for x, keep in zip(l, should_keep) if keep)
+
+  # Input-to-output forwarding.
+  in_fwd = pe._jaxpr_forwarding(primal_jaxpr.jaxpr)
+  in_fwd_res, in_fwd_primal = split_list(in_fwd, [num_residuals])
+  in_fwd = in_fwd_res + [
+      fwd if isinstance(os, UnspecifiedValue) and ol is None else None
+      for os, ol, fwd in zip(out_shardings, out_layouts, in_fwd_primal)
+  ]
+  del in_fwd_res, in_fwd_primal
+  keep = [f is None for f in in_fwd]
+  primal_jaxpr = pe.prune_closed_jaxpr_outputs(primal_jaxpr, keep)
+  primal_out_shardings = keep_where(primal_out_shardings, keep)
+  primal_out_layouts = keep_where(primal_out_layouts, keep)
+  kept_res, _ = split_list(keep, [num_residuals])
+  num_kept_residuals = sum(kept_res)
+  del keep, kept_res
+
+  # Output-to-output forwarding.
+  num_out_primals = len(primal_jaxpr.jaxpr.outvars) - num_kept_residuals
+  res_vars, out_vars = split_list(primal_jaxpr.jaxpr.outvars, [num_kept_residuals])
+  idx_map = {id(v): i for i, v in enumerate(out_vars)}
+  offset = sum(id(v) not in idx_map for v in res_vars)
+  idx_map = {k: v + offset for k, v in idx_map.items()}
+  out_fwd = [idx_map.get(id(v)) for v in res_vars] + [None] * num_out_primals
+  keep = [f is None for f in out_fwd]
+  primal_jaxpr = pe.prune_closed_jaxpr_outputs(primal_jaxpr, keep)
+  primal_out_shardings = keep_where(primal_out_shardings, keep)
+  primal_out_layouts = keep_where(primal_out_layouts, keep)
+  del keep
+
   def tangent_fun(consts_, *tangents):
     tangents_nz = _filter_zeros(nzs, tangents)
-    assert len(consts_) == num_residuals
-    nz_tangents_out = pjit_p.bind(*(*tangents_nz, *consts_),
+    nz_tangents_out = pjit_p.bind(*tangents_nz, *consts_,
         jaxpr=tangent_jaxpr,
         in_shardings=_filter_zeros(nzs, in_shardings) + res_shardings,
         out_shardings=_filter_zeros(nzs_out, out_shardings),
@@ -2106,15 +2137,17 @@ def _pjit_linearization(nzs, *primals_in, jaxpr,
 
   ans = pjit_p.bind(*primals_in, jaxpr=primal_jaxpr,
                     in_shardings=in_shardings,
-                    out_shardings=(*res_shardings, *out_shardings),
+                    out_shardings=primal_out_shardings,
                     in_layouts=in_layouts,
-                    out_layouts=(*res_layouts, *out_layouts),
+                    out_layouts=primal_out_layouts,
                     donated_invars=donated_invars,
                     ctx_mesh=ctx_mesh,
                     name=name,
                     keep_unused=keep_unused,
                     inline=inline,
                     compiler_options_kvs=compiler_options_kvs)
+  ans = subs_list(out_fwd, ans, ans)
+  ans = subs_list(in_fwd, primals_in, ans)
   residuals_ans, primal_ans = split_list(ans, [num_residuals])
 
   return primal_ans, nzs_out, residuals_ans, tangent_fun
@@ -2531,7 +2564,7 @@ def with_sharding_constraint(x, shardings):
   Returns:
     x_with_shardings: PyTree of jax.Arrays with specified sharding constraints.
 
-  .. _Distributed arrays and automatic parallelization: https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html
+  .. _Distributed arrays and automatic parallelization: https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html
   """
   x_flat, tree = tree_flatten(x)
 
@@ -2935,6 +2968,50 @@ def use_explicit_axes(*axes):
                            'use_explicit_axes')
   with mesh_lib.use_abstract_mesh(new_mesh):
     yield
+
+# -------------------- with_dll_constraint --------------------
+
+def with_dll_constraint(x, layouts):
+  x_flat, tree = tree_flatten(x)
+  layouts_flat = tuple(flatten_axes("with_dll_constraint layouts", tree,
+                                    layouts))
+  if any(not isinstance(l, DeviceLocalLayout) for l in layouts_flat):
+    raise ValueError(
+        'layouts passed to `with_dll_constraint` must be of type'
+        f' `DeviceLocalLayout`. Got {[type(l) for l in layouts_flat]}')
+  check_aval_layout_compatibility(
+      layouts_flat, x_flat, ("",) * len(layouts_flat),
+      "with_dll_constraint arguments")
+  outs = [dll_constraint_p.bind(xf, layout=l)
+          for xf, l in zip(x_flat, layouts_flat)]
+  return tree_unflatten(tree, outs)
+
+dll_constraint_p = core.Primitive('dll_constraint')
+dll_constraint_p.def_abstract_eval(lambda x, **_: x)
+ad.deflinear2(dll_constraint_p,
+              lambda ct, _, **params: (dll_constraint_p.bind(ct, **params),))
+
+def _dll_constraint_impl(x, *, layout):
+  if not isinstance(x, xc.ArrayImpl):
+    raise ValueError(
+        'with_dll_constraint in eager mode can only be applied to'
+        f' jax.Arrays. Got {type(x)}')
+  if x.layout.device_local_layout == layout:  # type: ignore
+    return x
+  return api.jit(_identity_fn, out_shardings=Layout(layout, x.sharding))(x)
+dll_constraint_p.def_impl(_dll_constraint_impl)
+
+def _dll_constraint_hlo_lowering(ctx, x_node, *, layout):
+  aval, = ctx.avals_in
+  out_aval, = ctx.avals_out
+  return [mlir.wrap_with_layout_op(ctx, x_node, out_aval, layout, aval)]
+mlir.register_lowering(dll_constraint_p,
+                       _dll_constraint_hlo_lowering)
+
+def _dll_constraint_batcher(axis_data, vals_in, dims_in, layout):
+  raise NotImplementedError
+batching.fancy_primitive_batchers[dll_constraint_p] = _dll_constraint_batcher
+batching.skippable_batchers[dll_constraint_p] = lambda _: ()
 
 # -------------------- helpers --------------------
 

@@ -70,13 +70,13 @@ def _rank_promotion_warning_or_error(fun_name: str, shapes: Sequence[Shape]):
     msg = ("Following NumPy automatic rank promotion for {} on shapes {}. "
            "Set the jax_numpy_rank_promotion config option to 'allow' to "
            "disable this warning; for more information, see "
-           "https://jax.readthedocs.io/en/latest/rank_promotion_warning.html.")
+           "https://docs.jax.dev/en/latest/rank_promotion_warning.html.")
     warnings.warn(msg.format(fun_name, ' '.join(map(str, shapes))))
   elif config.numpy_rank_promotion.value == "raise":
     msg = ("Operands could not be broadcast together for {} on shapes {} "
            "and with the config option jax_numpy_rank_promotion='raise'. "
            "For more information, see "
-           "https://jax.readthedocs.io/en/latest/rank_promotion_warning.html.")
+           "https://docs.jax.dev/en/latest/rank_promotion_warning.html.")
     raise ValueError(msg.format(fun_name, ' '.join(map(str, shapes))))
 
 
@@ -159,7 +159,7 @@ def ensure_arraylike(fun_name: str, /, *args: Any) -> Array | tuple[Array, ...]:
   return tuple(_arraylike_asarray(arg) for arg in args)  # pytype: disable=bad-return-type
 
 
-def ensure_arraylike_tuple(fun_name: str, tup: tuple[Any, ...]) -> tuple[Array, ...]:
+def ensure_arraylike_tuple(fun_name: str, tup: Sequence[Any]) -> tuple[Array, ...]:
   """Check that argument elements are arraylike and convert to a tuple of arrays.
 
   This is useful because ensure_arraylike with a single argument returns a single array.
@@ -259,7 +259,7 @@ def _broadcast_arrays(*args: ArrayLike) -> list[Array]:
 
 def _broadcast_to(arr: ArrayLike, shape: DimSize | Shape, sharding=None
                   ) -> Array:
-  check_arraylike("broadcast_to", arr)
+  arr = ensure_arraylike("broadcast_to", arr)
   arr = arr if isinstance(arr, Array) else lax.asarray(arr)
   if not isinstance(shape, tuple) and np.ndim(shape) == 0:
     shape = (shape,)

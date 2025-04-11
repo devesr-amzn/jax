@@ -159,7 +159,7 @@ class TransposeTransform(MemRefTransform):
 
   def __post_init__(self):
     if len(self.permutation) != len(set(self.permutation)):
-      raise ValueError("Permutation must be a permutation")
+      raise ValueError("All elements of `permutation` must be unique")
 
   def apply(self, ref: ir.Value) -> ir.Value:
     return utils.memref_transpose(ref, self.permutation)
@@ -229,6 +229,7 @@ class CollapseLeadingIndicesTransform(MemRefTransform):
 
 OnDeviceProfiler = profiler.OnDeviceProfiler
 
+ReductionOp = Literal["add", "min", "max", "inc", "dec", "and", "or", "xor"]
 
 @dataclasses.dataclass()
 class LaunchContext:
@@ -324,6 +325,14 @@ class LaunchContext:
           ref = t.apply(ref)
         ref_ty = ir.MemRefType(ref.type)
         # TODO(apaszke): Use utils.memref_ptr to compute base_ptr
+        strides, _ = ref_ty.get_strides_and_offset()
+        if strides[-1] != 1:
+          raise ValueError(
+              "TMA requires the stride of the last dimension after"
+              " transforming the GMEM reference to be 1, but it is"
+              f" {strides[-1]}."
+          )
+
         _, offset, *sizes_and_strides = memref.extract_strided_metadata(ref)
         aligned_ptr_idx = memref.extract_aligned_pointer_as_index(ref)
         as_i64 = lambda i: arith.index_cast(i64, i)
@@ -406,10 +415,10 @@ class LaunchContext:
       uniform: bool = True,
       collective: Sequence[gpu.Dimension] | gpu.Dimension | None = None,
       partitioned: int | None = None,
-      predicate: ir.Value | None = None,  # Should select 0 or 1 threads from the WG.
-      reduction_op: Literal[
-        "add","min","max","inc","dec","and","or","xor"
-      ] | None = None,
+      predicate: (
+          ir.Value | None
+      ) = None,  # Should select 0 or 1 threads from the WG.
+      reduction_op: ReductionOp | None = None,
   ):
     """Initiates an async copy between GMEM and SMEM.
 
@@ -648,7 +657,8 @@ class LaunchContext:
     ]
 
     uniform_ctx = (
-        functools.partial(utils.single_thread, per_block=False)
+        functools.partial(
+            utils.single_thread, scope=utils.ThreadSubset.WARPGROUP)
         if uniform and predicate is None
         else contextlib.nullcontext
     )
@@ -660,8 +670,8 @@ class LaunchContext:
       )
     if (zeroth_bw := slice_shape[-1] * element_bitwidth) % 128 != 0:
       raise ValueError(
-          "Async copies require the number of bytes copied along the last"
-          f" dimension to be divisible by 16, but got {zeroth_bw}"
+          "Async copies require the number of bits copied along the last"
+          f" dimension to be divisible by 128, but got {zeroth_bw}"
       )
     if (
         swizzle is not None

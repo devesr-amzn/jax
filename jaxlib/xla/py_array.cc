@@ -237,12 +237,33 @@ tsl::RCReference<ifrt::Array> CreateIfRtArrayFromSingleDeviceShardedPyArrays(
   return *std::move(ifrt_array);
 }
 
+struct PyBaseArrayObject {
+  PyObject_HEAD;
+#if PY_VERSION_HEX < 0x030C0000
+  PyObject* weakrefs;
+#endif  // PY_VERSION_HEX < 0x030C0000
+};
+
+extern "C" void PyBaseArray_tp_dealloc(PyBaseArrayObject* self) {
+  PyObject_GC_UnTrack(self);
+  PyObject_ClearWeakRefs((PyObject*)self);
+  PyTypeObject* tp = Py_TYPE(self);
+  tp->tp_free((PyObject*)self);
+  Py_DECREF(tp);
+}
+
+extern "C" int PyBaseArray_tp_traverse(PyObject* self, visitproc visit,
+                                       void* arg) {
+  Py_VISIT(Py_TYPE(self));
+  return 0;
+}
+
 struct PyArrayObject {
   PyObject_HEAD;
 #if PY_VERSION_HEX < 0x030C0000
   PyObject* weakrefs;
   PyObject* dict;
-#endif  // PY_VERSION_HEX < 0x030B0000
+#endif  // PY_VERSION_HEX < 0x030C0000
   bool initialized;
   alignas(PyArray::Storage) char array_storage[sizeof(PyArray::Storage)];
 };
@@ -793,6 +814,7 @@ absl::Status PyArray::BlockUntilResultStatusIsReady() {
   if (!result_status.IsReady()) {
     // Only release the gil if we need to Await().
     nb::gil_scoped_release release_gil;
+    BlockUntilReadyWithCancel(result_status);
     return result_status.Await();
   }
   return result_status.Await();
@@ -1458,6 +1480,31 @@ absl::Status PyArray::BatchedBlockUntilReady(std::vector<nb::object> objs) {
   return AwaitBuffersReady(absl::MakeConstSpan(ifrt_arrays));
 }
 
+absl::Status PyArray::ReplaceWithAlias(PyArray o) {
+  auto& storage = GetStorage();
+  auto& o_storage = o.GetStorage();
+  if (storage.py_client.get() != o_storage.py_client.get()) {
+    return absl::InvalidArgumentError(
+        "Unable to replace a PyArray with a PyArray from a different client.");
+  }
+  storage.aval = o_storage.aval;
+  storage.weak_type = o_storage.weak_type;
+  storage.dtype = o_storage.dtype;
+  storage.shape = o_storage.shape;
+  storage.sharding = o_storage.sharding;
+  storage.npy_value = o_storage.npy_value;
+  storage.committed = o_storage.committed;
+  storage.traceback = o_storage.traceback;
+  storage.ifrt_array = o_storage.ifrt_array;
+  storage.fully_replicated_array = o_storage.fully_replicated_array;
+  storage.py_arrays = o_storage.py_arrays;
+  storage.host_value.Clear();
+  storage.dynamic_shape = o_storage.dynamic_shape;
+  storage.result_status = o_storage.result_status;
+
+  return absl::OkStatus();
+}
+
 std::vector<PyArray> PyClient::LiveArrays() const {
   std::vector<PyArray> result;
   for (auto& shard : arrays_) {
@@ -1715,7 +1762,9 @@ absl::StatusOr<std::pair<nb::object, bool>> PyHostValue::AsNumPyArray(
         nb::gil_scoped_release gil;
         TF_ASSIGN_OR_RETURN(hold_ptr->external_reference_hold,
                             pjrt_buffer->AcquireExternalReference());
-        TF_RETURN_IF_ERROR(ifrt_array->GetReadyFuture().Await());
+        auto fut = ifrt_array->GetReadyFuture();
+        BlockUntilReadyWithCancel(fut);
+        TF_RETURN_IF_ERROR(fut.Await());
       }
       void* data =
           hold_ptr->external_reference_hold->OpaqueDeviceMemoryDataPointer();
@@ -1729,6 +1778,7 @@ absl::StatusOr<std::pair<nb::object, bool>> PyHostValue::AsNumPyArray(
   TF_RETURN_IF_ERROR(CopyToHostAsync(dynamic_shape_holder, ifrt_array));
   if (!ready_.IsReady()) {
     nb::gil_scoped_release gil;
+    BlockUntilReadyWithCancel(ready_);
     TF_RETURN_IF_ERROR(ready_.Await());
   } else {
     TF_RETURN_IF_ERROR(ready_.Await());
@@ -1878,7 +1928,30 @@ absl::Status PyHostValue::CopyToHostAsync(
   return absl::OkStatus();
 }
 
+void PyHostValue::Clear() {
+  ready_ = {};
+  value_ = {};
+  string_array_contents_ = {};
+}
+
 namespace {
+PyMemberDef PyBaseArray_members[] = {
+#if PY_VERSION_HEX < 0x030C0000
+    {"__weaklistoffset__", T_PYSSIZET,
+     static_cast<Py_ssize_t>(offsetof(PyBaseArrayObject, weakrefs)), READONLY,
+     nullptr},
+#endif  // PY_VERSION_HEX < 0x030C0000
+    {nullptr, 0, 0, 0, nullptr},
+};
+
+PyType_Slot PyBaseArray_slots[] = {
+    {Py_tp_dealloc, reinterpret_cast<void*>(PyBaseArray_tp_dealloc)},
+    {Py_tp_members, reinterpret_cast<void*>(PyBaseArray_members)},
+    {Py_tp_traverse, reinterpret_cast<void*>(PyBaseArray_tp_traverse)},
+    {Py_tp_hash, reinterpret_cast<void*>(PyObject_HashNotImplemented)},
+    {0, nullptr},
+};
+
 PyGetSetDef PyArray_tp_getset[] = {
     {"__dict__", PyObject_GenericGetDict, PyObject_GenericSetDict, nullptr,
      nullptr},
@@ -1911,6 +1984,34 @@ PyType_Slot PyArray_slots[] = {
 }  // namespace
 
 absl::Status PyArray::RegisterTypes(nb::module_& m) {
+  // We are not using nanobind to avoid having a non-standard metaclass, which
+  // would make Array incompatible with abc.ABCMeta.
+  std::string base_name =
+      absl::StrCat(nb::cast<std::string>(m.attr("__name__")), ".Array");
+  PyType_Spec PyBaseArray_spec = {
+#if PY_VERSION_HEX < 0x030B0000
+      // Work around for https://github.com/python/cpython/issues/89478
+      // CPython 3.10 and earlier assume that the .name value remains alive
+      // forever.
+      /*.name=*/strdup(base_name.c_str()),
+#else
+      /*.name=*/base_name.c_str(),
+#endif  // PY_VERSION_HEX < 0x030B0000
+      /*.basicsize=*/static_cast<int>(sizeof(PyBaseArrayObject)),
+      /*.itemsize=*/0,
+#if PY_VERSION_HEX < 0x030C0000
+      /*.flags=*/Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
+#else   // PY_VERSION_HEX >= 0x030C0000
+      /*.flags=*/Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC |
+          Py_TPFLAGS_MANAGED_WEAKREF,
+#endif  // PY_VERSION_HEX >= 0x030C0000
+      /*.slots=*/PyBaseArray_slots};
+  auto* base_type = PyType_FromSpec(&PyBaseArray_spec);
+  if (!base_type) {
+    throw nb::python_error();
+  }
+  m.attr("Array") = nb::borrow<nb::object>(base_type);
+
   std::string name =
       absl::StrCat(nb::cast<std::string>(m.attr("__name__")), ".ArrayImpl");
 
@@ -1934,7 +2035,7 @@ absl::Status PyArray::RegisterTypes(nb::module_& m) {
       /*.slots=*/PyArray_slots,
   };
 
-  type_ = PyType_FromSpec(&PyArray_spec);
+  type_ = PyType_FromSpecWithBases(&PyArray_spec, base_type);
   if (!type_) {
     throw nb::python_error();
   }
@@ -1991,6 +2092,11 @@ absl::Status PyArray::RegisterTypes(nb::module_& m) {
   type.attr("_copy_single_device_array_to_host_async") = nb::cpp_function(
       [](PyArray& self) {
         xla::ThrowIfError(self.CopySingleDeviceArrayToHostAsync());
+      },
+      nb::is_method());
+  type.attr("_replace_with") = nb::cpp_function(
+      [](PyArray& self, PyArray& o) {
+        xla::ThrowIfError(self.ReplaceWithAlias(o));
       },
       nb::is_method());
   type.attr("block_until_ready") = nb::cpp_function(

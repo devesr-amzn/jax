@@ -389,6 +389,11 @@ async def main():
   arch = platform.machine()
   os_name = platform.system().lower()
 
+  custom_wheel_version_suffix = ""
+  wheel_build_date = ""
+  wheel_git_hash = ""
+  wheel_type = "snapshot"
+
   args = parser.parse_args()
 
   logger.info("%s", BANNER)
@@ -496,6 +501,7 @@ async def main():
   if args.use_clang:
     clang_path = args.clang_path or utils.get_clang_path_or_exit()
     clang_major_version = utils.get_clang_major_version(clang_path)
+    clangpp_path = utils.get_clangpp_path(clang_path)
     logging.debug(
         "Using Clang as the compiler, clang path: %s, clang version: %s",
         clang_path,
@@ -505,6 +511,7 @@ async def main():
     # Use double quotes around clang path to avoid path issues on Windows.
     wheel_build_command_base.append(f"--action_env=CLANG_COMPILER_PATH=\"{clang_path}\"")
     wheel_build_command_base.append(f"--repo_env=CC=\"{clang_path}\"")
+    wheel_build_command_base.append(f"--repo_env=CXX=\"{clangpp_path}\"")
     wheel_build_command_base.append(f"--repo_env=BAZEL_COMPILER=\"{clang_path}\"")
 
     if clang_major_version >= 16:
@@ -619,6 +626,17 @@ async def main():
     )
     for option in args.bazel_options:
       wheel_build_command_base.append(option)
+
+      # Parse the build options for the wheel version suffix.
+      if "ML_WHEEL_TYPE" in option:
+        wheel_type = option.split("=")[-1]
+      if "ML_WHEEL_VERSION_SUFFIX" in option:
+        custom_wheel_version_suffix = option.split("=")[-1].replace("-", "")
+      if "ML_WHEEL_BUILD_DATE" in option:
+        wheel_build_date = option.split("=")[-1].replace("-", "")
+      if "ML_WHEEL_GIT_HASH" in option:
+        wheel_git_hash = option.split("=")[-1][:9]
+
     if "cuda" in args.wheels:
       wheel_build_command_base.append("--config=cuda_libraries_from_stubs")
 
@@ -727,10 +745,29 @@ async def main():
         dst_dir = os.path.join(output_path, wheel_dir)
         utils.copy_dir_recursively(src_dir, dst_dir)
       else:
-        utils.copy_individual_files(bazel_dir, output_path, f"{wheel_dir}*.whl")
+        wheel_version_suffix = "dev0+selfbuilt"
+        if wheel_type == "release":
+          wheel_version_suffix = custom_wheel_version_suffix
+        elif wheel_type in ["nightly", "custom"]:
+          wheel_version_suffix = f".dev{wheel_build_date}"
+          if wheel_type == "custom":
+            wheel_version_suffix += (
+                f"+{wheel_git_hash}{custom_wheel_version_suffix}"
+            )
+        if wheel in ["jax", "jax-cuda-pjrt"]:
+          python_tag = "py"
+        else:
+          python_tag = "cp"
+        utils.copy_individual_files(
+            bazel_dir,
+            output_path,
+            f"{wheel_dir}*{wheel_version_suffix}-{python_tag}*.whl",
+        )
         if wheel == "jax":
           utils.copy_individual_files(
-              bazel_dir, output_path, f"{wheel_dir}*.tar.gz"
+              bazel_dir,
+              output_path,
+              f"{wheel_dir}*{wheel_version_suffix}.tar.gz",
           )
 
   # Exit with success if all wheels in the list were built successfully.

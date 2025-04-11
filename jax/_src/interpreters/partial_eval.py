@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections import namedtuple
 from collections.abc import Callable, Sequence, Hashable
-from contextlib import contextmanager
+import contextlib
 from functools import partial
 import itertools as it
 import operator as op
@@ -402,8 +402,7 @@ class JaxprTrace(Trace['JaxprTracer']):
         vals = [t.pval[1] for t in tracers]
         return prim.bind(fun, jvp, *vals, symbolic_zeros=symbolic_zeros)
     # We assume non-trivial partial evaluation is only performed to build linear
-    # functions, and hence we don't need to keep the custom JVP rule around
-    # anymore.
+    # functions, and hence we don't need to keep the custom JVP rule around.
     del jvp, symbolic_zeros
     with core.set_current_trace(self):
       return fun.call_wrapped(*tracers)
@@ -499,6 +498,24 @@ def partial_eval_wrapper_nounits(
   jaxpr, (*maybe_fwds, out_pvals, res, env) = f(in_pvals)
   out_knowns, out_avals, out_consts = partition_pvals(out_pvals)
   store.store((*maybe_fwds, out_knowns, out_avals, jaxpr, env))
+  return (*out_consts, *res)
+
+@lu.transformation_with_aux2
+def partial_eval_wrapper_nounits2(
+    f: Callable,
+    store: lu.Store,
+    in_knowns: Sequence[bool],
+    in_avals: Sequence[AbstractValue],
+    *in_consts: Any):
+  in_avals_, in_consts_ = iter(in_avals), iter(in_consts)
+  in_pvals = [PartialVal.known(next(in_consts_)) if known else
+              PartialVal.unknown(next(in_avals_)) for known in in_knowns]
+  sentinel = object()
+  assert next(in_avals_, sentinel) is next(in_consts_, sentinel) is sentinel
+  jaxpr, (*maybe_fwds, out_pvals, res, env) = f(in_pvals)
+  out_knowns, _, out_consts = partition_pvals(out_pvals)
+  res_avals = [core.typeof(r) for r in res]
+  store.store((*maybe_fwds, out_knowns, res_avals, jaxpr, env))
   return (*out_consts, *res)
 
 custom_partial_eval_rules: dict[Primitive, Callable] = {}
@@ -1236,14 +1253,12 @@ def _default_res_aval_updater(
     params: dict[str, Any], aval: AbstractValue) -> AbstractValue:
   return aval
 
-@contextmanager
-def trivial_ctx(_): yield
 
 def call_partial_eval_custom_rule(
     jaxpr_param_name: str, params_updater: ParamsUpdater,
     saveable: Callable[..., RematCases_], unks_in: list[bool], inst_in: list[bool],
     eqn: JaxprEqn, *, res_aval: ResAvalUpdater = _default_res_aval_updater,
-    ctx = trivial_ctx,
+    ctx = contextlib.nullcontext,
   ) -> tuple[JaxprEqn, JaxprEqn, Sequence[bool], Sequence[bool], list[Var]]:
   jaxpr = eqn.params[jaxpr_param_name]
   with ctx(eqn.params):
@@ -1878,6 +1893,7 @@ class DynamicJaxprTrace(core.Trace):
     # avoid cyclic refs
     self.frame.tracers = []
     self.frame.constid_to_tracer = {}
+    self.frame.constvar_to_val = {}
 
   def to_jaxpr_tracer(self, x):
     as_local_var = self.frame.tracer_to_var.get(id(x))

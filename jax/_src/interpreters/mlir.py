@@ -663,7 +663,7 @@ class ShapePolyLoweringState:
 @dataclasses.dataclass(frozen=True)
 class LoweringParameters:
   # A mapping between primitives and user-defined LoweringRules.
-  # When lowering a primitive, give priorioty to the rule in this map over
+  # When lowering a primitive, give priority to the rule in this map over
   # existing Jax rules.
   override_lowering_rules: tuple[tuple[core.Primitive, LoweringRule]] | None = None
 
@@ -677,7 +677,7 @@ class LoweringParameters:
   # Signals that we are lowering for exporting.
 
   for_export: bool = False
-  # See usage in https://jax.readthedocs.io/en/latest/export/export.html#ensuring-forward-and-backward-compatibility
+  # See usage in https://docs.jax.dev/en/latest/export/export.html#ensuring-forward-and-backward-compatibility
   # We have this here to ensure it is reflected in the cache keys
   export_ignore_forward_compatibility: bool = False
 
@@ -1179,7 +1179,7 @@ def lower_jaxpr_to_module(
           donated_args[input_id] = False
   if any(donated_args):
     unused_donations = [str(a) for a, d in zip(in_avals, donated_args) if d]
-    msg = "See an explanation at https://jax.readthedocs.io/en/latest/faq.html#buffer-donation."
+    msg = "See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation."
     if not platforms_with_donation:
       msg = f"Donation is not implemented for {platforms}.\n{msg}"
     if unused_donations:
@@ -2757,11 +2757,6 @@ def cache_lowering(f):
   return cached_lowering
 
 
-def xla_computation_to_mlir_module(xla_computation: xc.XlaComputation
-                                  ) -> ir.Module:
-  module_str = xc._xla.mlir.xla_computation_to_mlir_module(xla_computation)
-  return ir.Module.parse(module_str)
-
 def merge_mlir_modules(dst_module: ir.Module,
                        sym_name: str,
                        src_module: ir.Module,
@@ -3052,3 +3047,7 @@ def refine_polymorphic_shapes(module: ir.Module) -> ir.Module:
   context = make_ir_context()
   with context:
     return ir.Module.parse(refined_module_str)
+
+########################### pvary ##################################
+
+register_lowering(core.pvary_p, lambda ctx, *x, axes, axis_index_groups: x)

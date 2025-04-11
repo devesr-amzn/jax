@@ -45,7 +45,7 @@ from jax._src.errors import (
     ConcretizationTypeError, TracerArrayConversionError, TracerBoolConversionError,
     TracerIntegerConversionError, UnexpectedTracerError)
 from jax._src import linear_util as lu
-
+from jax._src.tree_util import tree_flatten, tree_unflatten
 from jax._src import source_info_util
 from jax._src.util import (safe_zip, safe_map, curry, tuple_insert,
                            tuple_delete, cache,
@@ -320,7 +320,7 @@ class JaxprEqnContextManager:
   def __exit__(self, exc_type, exc_value, traceback):
     config.compute_on_context_manager.set_local(self.prev_compute_type)
     config.threefry_partitionable.set_local(self.prev_threefry_partitionable)
-    if self.context.xla_metadata is not None:
+    if self.context.xla_metadata:
       config.xla_metadata_context_manager.set_local(self.prev_xla_metadata)
     config.abstract_mesh_context_manager.set_local(self.prev_abstract_mesh)
 
@@ -412,7 +412,6 @@ def new_jaxpr_eqn(invars, outvars, primitive, params, effects, source_info=None,
 
 _var_counter = it.count()
 
-@total_ordering
 class Var:
   __slots__ = ["count", "suffix", "aval"]
 
@@ -424,11 +423,6 @@ class Var:
     self.count = next(_var_counter)
     self.suffix = suffix
     self.aval = aval
-
-  # TODO(phawkins, mattjj): remove ordering of variables. JAX itself does not
-  # care about variable ordering, but the downstream package kfac_jax does.
-  def __lt__(self, other):
-    return self.count < other.count
 
   def __repr__(self):
     return f'Var(id={id(self)}){self.suffix}:{self.aval.str_short()}'
@@ -503,9 +497,7 @@ class Primitive:
 
   def _true_bind(self, *args, **params):
     for arg in args:
-      if (isinstance(arg, Tracer)
-          and not arg._trace.is_valid()
-          and not config.data_dependent_tracing_fallback.value):
+      if isinstance(arg, Tracer) and not arg._trace.is_valid():
         raise escaped_tracer_error(arg)
     # TODO: figure out how to handle function arguments
     # assert (not config.enable_checks.value or
@@ -1021,10 +1013,6 @@ class EvalTrace(Trace):
     else:
       # TODO(dougalm): delete. this shouldn't be necessary
       args = map(full_lower, args)
-      if config.data_dependent_tracing_fallback.value:
-        for arg in args:
-          if isinstance(arg, Tracer):
-            return primitive.bind_with_trace(arg._trace, args, params)
       check_eval_args(args)
       return primitive.impl(*args, **params)
 
@@ -1502,11 +1490,6 @@ def _jaxpr_type_to_callable_annotation(jaxpr: Jaxpr) -> InputType:
          for v in jaxpr.invars]
   return tuple(out)
 
-# TODO(dougalm): Deprecate. This is here for backwards compat.
-def lattice_join(x, y):
-  assert typematch(x, y)
-  return x
-
 # For use in typing annotations to denote either a Tracer or a `valid_jaxtype`.
 Value = Any
 
@@ -1899,6 +1882,7 @@ def get_sharding(sharding, shape):
     raise ValueError("Mesh of an aval must be an AbstractMesh. "
                      f"Got {out_s.mesh} of type {type(out_s.mesh)}")
   _check_divisibility(out_s, shape)
+  assert out_s.memory_kind is None
   return out_s
 
 def str_short_aval(shape, dtype, mesh, spec, vma,
@@ -1911,6 +1895,8 @@ def str_short_aval(shape, dtype, mesh, spec, vma,
   return f'{dt_str}[{shapestr}]{vma}{mesh_axes}'
 
 def get_vma(vma, mesh):
+  if mesh.empty:
+    return vma
   for i in vma:
     if mesh._name_to_type[i] != AxisType.Manual:
       raise ValueError(
@@ -2007,20 +1993,57 @@ def primal_dtype_to_tangent_dtype(primal_dtype):
     return primal_dtype
 
 
+def pvary(x, axis_name):
+  axes = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
+  if not axis_name:
+    return x
+  xs, treedef = tree_flatten(x)
+  ys = pvary_p.bind(*xs, axes=axes, axis_index_groups=None)
+  return tree_unflatten(treedef, ys)
+
+pvary_p = Primitive('pvary')
+pvary_p.multiple_results = True
+pvary_p.def_impl(lambda *args, axes, axis_index_groups: args)
+
+def _pvary_abstract_eval(*args, axes, axis_index_groups):
+  if not config.varying_axes_in_types.value:
+    return args
+  if not config._check_rep.value:
+    return args
+  assert isinstance(axes, tuple)
+  arg_vma = [a.vma for a in args]
+  # If there is intersection between arg_vma and axes, error
+  if any(set(axes) & a for a in arg_vma):
+    raise ValueError(
+        "Collective pvary must be applied to a "
+        f"non-device-varying type, but got {arg_vma} for collective acting "
+        f"over axis name {axes}. Please open an issue at "
+        "https://github.com/jax-ml/jax/issues, and as a temporary "
+        "workaround pass the check_rep=False argument to shard_map")
+  sharding = NamedSharding(mesh_lib.get_abstract_mesh(), P())
+  return [a.update(sharding=sharding, vma=a.vma.union(frozenset(axes)))
+          for a in args]
+pvary_p.def_abstract_eval(_pvary_abstract_eval)
+
+
 def standard_insert_pbroadcast(*args):
   if not config.varying_axes_in_types.value:
     return args
+  if not config._check_rep.value:
+    return args
   if not args:
     return args
-  # TODO(yashkatariya): Move pbroadcast out of shard_map
-  from jax.experimental.shard_map import pbroadcast  # type: ignore
   in_vma = [frozenset() if (aval := get_aval(a)) is abstract_token
             else aval.vma for a in args]
   out_vma = frozenset.union(*in_vma)
-  return [pbroadcast(arg, tuple(n for n in out_vma if n not in src))
+  return [pvary(arg, tuple(n for n in out_vma if n not in src))
           if out_vma - src else arg for arg, src in zip(args, in_vma)]
 
 def standard_vma_rule(prim_name, *avals, **kwargs) -> frozenset[AxisName]:
+  if not config.varying_axes_in_types.value:
+    return frozenset()
+  if not config._check_rep.value:
+    return frozenset()
   avals = tuple(a for a in avals if a is not abstract_token)
   if not avals:
     return frozenset()
@@ -2245,16 +2268,10 @@ class Token:
 pytype_aval_mappings[Token] = lambda _: abstract_token
 
 
-# TODO(dougalm): Deprecate these. They're just here for backwards compat.
-def raise_to_shaped(aval):
-  return aval
-raise_to_shaped_mappings: dict[type, Callable] = {}
-
 ### Operations on shapes and dimension sizes.
 
 class InconclusiveDimensionOperation(Exception):
   """Raised when we cannot conclusively compute with symbolic dimensions."""
-  pass
 
 def is_symbolic_dim(v: Any) -> bool:
   """Checks if a value is a symbolic dimension used for shape polymorphism.
@@ -2589,9 +2606,9 @@ def unmapped_aval(size: AxisSize, axis: int | None,
 
 def _map_shaped_array(
     size: int, axis: int | None, aval: ShapedArray) -> ShapedArray:
-  assert axis is None or aval.shape[axis] == size
-  # TODO: Extend the named shape
-  if axis is None: return aval
+  # assert axis is None or aval.shape[axis] == size
+  if axis is None:
+    return aval
   sharding = aval.sharding.with_spec(tuple_delete(aval.sharding.spec, axis))
   return ShapedArray(tuple_delete(aval.shape, axis), aval.dtype,
                      weak_type=aval.weak_type, sharding=sharding, vma=aval.vma)

@@ -57,6 +57,7 @@ from jax._src.interpreters import batching
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import mlir
 from jax._src.interpreters import xla
+from jax._src.lib import jaxlib_extension_version
 from jax._src.layout import DeviceLocalLayout, AutoLayout, Layout
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
@@ -338,8 +339,8 @@ def xla_pmap_impl_lazy(
     donated_invars: Sequence[bool],
     is_explicit_global_axis_size: bool,
 ) -> Callable:
-  if (config.disable_jit.value and config.eager_pmap.value and
-      not is_explicit_global_axis_size and not any(d for d in donated_invars)):
+  if (config.disable_jit.value and
+      not is_explicit_global_axis_size and not any(donated_invars)):
     def _emap_apply_fn(*args):
       return _emap_impl(fun, *args, backend=backend, axis_name=axis_name,
                         axis_size=axis_size, global_axis_size=global_axis_size,
@@ -1314,7 +1315,10 @@ class ExecuteReplicated:
       out_ = []
       for i, o in zip(self.mut.out_mut, out):
         if i is not None:
-          args[i]._buf = o
+          if jaxlib_extension_version < 330:
+            args[i]._buf = o
+          else:
+            args[i]._buf._replace_with(o)
         else:
           out_.append(o)
       return out_

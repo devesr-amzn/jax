@@ -88,13 +88,13 @@ def _align_to(x: int, alignment: int):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ResourceEstimatorContext:
   axis_names: _AxisNames
-  thread_semantics: mgpu.ThreadSemantics
+  lowering_semantics: mgpu.LoweringSemantics
 
   @property
   def arrival_multiplier(self) -> int:
     return (
         WARPGROUP_SIZE
-        if self.thread_semantics == mgpu.ThreadSemantics.Lane
+        if self.lowering_semantics == mgpu.LoweringSemantics.Lane
         else 1
     )
 
@@ -299,6 +299,7 @@ class ModuleContext:
   program_ids: Sequence[ir.Value] | None
   approx_math: bool
   single_wg_lane_predicate: ir.Value | None
+  single_warp_lane_predicate: ir.Value | None
   smem_requested_bytes: int
   smem_used_bytes: int
   tmem_requested_cols: int
@@ -308,8 +309,25 @@ class ModuleContext:
   name_stack: source_info_util.NameStack
   traceback_caches: mlir.TracebackCaches
   squashed_dims: tuple[int, ...]
-  thread_semantics: mgpu.ThreadSemantics
+  lowering_semantics: mgpu.LoweringSemantics
+  primitive_semantics: gpu_core.PrimitiveSemantics
+  warp_axis_name: str | None = None
 
+  @property
+  def single_lane_predicate(self) -> ir.Value:
+    """Returns a predicate that is True for a single lane within the current
+    thread semantics.
+    """
+    assert self.lowering_semantics == mgpu.LoweringSemantics.Lane
+    match self.primitive_semantics:
+      case gpu_core.PrimitiveSemantics.Warpgroup:
+        return self.single_wg_lane_predicate
+      case gpu_core.PrimitiveSemantics.Warp:
+        return self.single_warp_lane_predicate
+      case _:
+        raise ValueError(f"Unknown semantics: {self.primitive_semantics}")
+
+  @contextlib.contextmanager
   def reserve_barrier(self, barrier: mgpu.Barrier) -> mgpu.BarrierRef:
     """Reserves a barrier.
 
@@ -319,7 +337,9 @@ class ModuleContext:
     available = self.runtime_barriers.get(barrier, [])
     if not available:
       raise RuntimeError(f"Barrier {barrier} is already reserved")
-    return available.pop()
+    barrier = available.pop()
+    yield barrier
+    available.append(barrier)
 
   @contextlib.contextmanager
   def alloc_tmem(
@@ -367,7 +387,7 @@ class ModuleContext:
     smem = ir.Attribute.parse("#gpu.address_space<workgroup>")
     i8 = ir.IntegerType.get_signless(8)
     i32 = ir.IntegerType.get_signless(32)
-    if self.thread_semantics == mgpu.ThreadSemantics.Lane:
+    if self.lowering_semantics == mgpu.LoweringSemantics.Lane:
       smem_base = gpu_dialect.dynamic_shared_memory(
           ir.MemRefType.get((mgpu_utils.DYNAMIC,), i8, memory_space=smem)
       )
@@ -383,7 +403,7 @@ class ModuleContext:
       # The below code emission relies on the assumption that the first scratch
       # operand provided by Mosaic GPU always begins at the beginning of
       # dynamic SMEM. Mosaic GPU is expected to uphold that invariant.
-      if self.thread_semantics == mgpu.ThreadSemantics.Lane:
+      if self.lowering_semantics == mgpu.LoweringSemantics.Lane:
         view = memref_dialect.view(
             scratch_ty, smem_base, _as_index(off), []
         )
@@ -416,7 +436,7 @@ class LoweringRuleContext:
   def estimator_ctx(self) -> ResourceEstimatorContext:
     return ResourceEstimatorContext(
         axis_names=self.module_ctx.axis_names,
-        thread_semantics=self.module_ctx.thread_semantics,
+        lowering_semantics=self.module_ctx.lowering_semantics,
     )
 
 
@@ -472,7 +492,7 @@ def _check_block_mappings(
         f" and index_map {bm.index_map_jaxpr.jaxpr} in"
         f" memory space {bm.transformed_block_aval.memory_space}."
         " See details at"
-        " https://jax.readthedocs.io/en/latest/pallas/grid_blockspec.html#pallas-blockspec."
+        " https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec."
     )
 
   for bm in block_mappings:
@@ -629,13 +649,9 @@ def lower_pipelined_jaxpr_to_module(
     scratch_refs = [
         next(sem_refs_it) if r is sem_placeholder else r for r in scratch_refs
     ]
-    def body_fn(*refs):
-      grid_env = pallas_core.current_grid_env()
-      assert grid_env is not None  # Set by ``emit_pipeline``.
+    def body_fn(indices, *refs):
       program_ids_template = util.merge_lists(
-          which_parallel,
-          [grid_axis.index for grid_axis in grid_env],
-          [None] * sum(which_parallel),
+          which_parallel, indices, [None] * sum(which_parallel)
       )
       assert len(refs) + len(scratch_refs) == len(jaxpr.invars)
       return gpu_primitives.jaxpr_call(
@@ -707,8 +723,8 @@ def lower_jaxpr_to_module(
   debug_info = jaxpr.debug_info
   params = compiler_params.get("mosaic_gpu", {})
   approx_math = params.get("approx_math", False)
-  thread_semantics = params.get(
-      "thread_semantics", mgpu_core.ThreadSemantics.Lane
+  lowering_semantics = params.get(
+      "lowering_semantics", mgpu_core.LoweringSemantics.Lane
   )
 
   if len(cluster) < 3:
@@ -736,17 +752,22 @@ def lower_jaxpr_to_module(
     else:
       tmem_cols = 0
 
-    if thread_semantics == mgpu.ThreadSemantics.Lane:
-      single_lane_predicate = mgpu.single_thread_predicate(per_block=False)
+    if lowering_semantics == mgpu.LoweringSemantics.Lane:
+      single_wg_lane_predicate = mgpu.single_thread_predicate(
+          scope=mgpu.ThreadSubset.WARPGROUP)
+      single_warp_lane_predicate = mgpu.single_thread_predicate(
+          scope=mgpu.ThreadSubset.WARP)
     else:  # Warpgroup semantics do not have a single lane predicate.
-      single_lane_predicate = None
+      single_wg_lane_predicate = None
+      single_warp_lane_predicate = None
 
     module_ctx = ModuleContext(
         mlir.sanitize_name(debug_info.func_name),
         axis_names,
         [_program_id(axis, squashed_dims) for axis in range(len(grid))],
         approx_math,
-        single_lane_predicate,
+        single_wg_lane_predicate,
+        single_warp_lane_predicate,
         smem_requested_bytes=math.prod(ir.MemRefType(runtime_smem.type).shape),
         smem_used_bytes=0,
         tmem_requested_cols=tmem_cols,
@@ -756,7 +777,8 @@ def lower_jaxpr_to_module(
         name_stack=source_info_util.NameStack(),
         traceback_caches=mlir.TracebackCaches(),
         squashed_dims=squashed_dims,
-        thread_semantics=thread_semantics,
+        lowering_semantics=lowering_semantics,
+        primitive_semantics=gpu_core.PrimitiveSemantics.Warpgroup,
     )
     del runtime_smem, grouped_barriers, runtime_barriers
 
@@ -766,7 +788,7 @@ def lower_jaxpr_to_module(
 
   rs = _estimate_resources(
       ResourceEstimatorContext(
-          axis_names=axis_names, thread_semantics=thread_semantics
+          axis_names=axis_names, lowering_semantics=lowering_semantics
       ),
       jaxpr,
   )
@@ -805,7 +827,7 @@ def lower_jaxpr_to_module(
       )
   )
 
-  if thread_semantics == mgpu.ThreadSemantics.Warpgroup:
+  if lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
     # Run Python lowering passes. The remaining passes will be run in C++ in
     # jax/jaxlib/mosaic/gpu/custom_call.cc
     mgpu.infer_layout(module)  # pytype: disable=attribute-error
@@ -824,17 +846,22 @@ def lower_jaxpr_to_module(
 
 mosaic_lowering_rules = {
     # Lowering rules when using Mosaic GPU lane semantics.
-    mgpu.ThreadSemantics.Lane: {} ,
+    (mgpu.LoweringSemantics.Lane, gpu_core.PrimitiveSemantics.Warpgroup): {} ,
+    gpu_core.LANExWARP_SEMANTICS: {} ,
     # Lowering rules when using Mosaic GPU warpgroup semantics.
-    mgpu.ThreadSemantics.Warpgroup: {},
+    (mgpu.LoweringSemantics.Warpgroup,
+     gpu_core.PrimitiveSemantics.Warpgroup): {},
 }
 
 
 def register_lowering_rule(
-    primitive: jax_core.Primitive, thread_semantics: mgpu.ThreadSemantics
+    primitive: jax_core.Primitive,
+    lowering_semantics: mgpu.LoweringSemantics,
+    primitive_semantics: gpu_core.PrimitiveSemantics = gpu_core.PrimitiveSemantics.Warpgroup,
 ):
   def deco(fn):
-    mosaic_lowering_rules[thread_semantics][primitive] = fn
+    mosaic_lowering_rules[
+        (lowering_semantics, primitive_semantics)][primitive] = fn
     return fn
 
   return deco
@@ -870,7 +897,7 @@ def lower_jaxpr_to_mosaic_gpu(
     # TODO(apaszke): Handle other avals (refs, etc.).
     if isinstance(aval := var.aval, jax_core.ShapedArray):
       # TODO(apaszke): Clarify the type invariants for lane semantics?
-      if module_ctx.thread_semantics == mgpu.ThreadSemantics.Warpgroup:
+      if module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
         # Shaped arrays must be vectors if and only if their shape is non-empty.
         # Those with empty shapes should be represented by their scalar type.
         mlir_dtype = mgpu_utils.dtype_to_ir_type(aval.dtype)
@@ -895,8 +922,11 @@ def lower_jaxpr_to_mosaic_gpu(
           if val.type != mlir_dtype:
             raise AssertionError(f"Scalar type must match ShapedArray dtype, got: {val.type} != {mlir_dtype}")
 
-  foreach(write_env, jaxpr.constvars, consts)
-  foreach(lambda v, a: write_env(v, a, require_value=False), jaxpr.invars, args)
+  foreach(
+      functools.partial(write_env, require_value=False), jaxpr.constvars, consts
+  )
+  foreach(functools.partial(write_env, require_value=False), jaxpr.invars, args)
+
   # TODO(justinfu): Handle transform scopes.
   last_local_name_stack: list[str] = []
   named_regions = []
@@ -907,10 +937,13 @@ def lower_jaxpr_to_mosaic_gpu(
     )
     loc = mlir._source_info_to_location(module_ctx, eqn.primitive, source_info)
     with source_info_util.user_context(eqn.source_info.traceback), loc:
-      if eqn.primitive not in mosaic_lowering_rules[module_ctx.thread_semantics]:
+      if eqn.primitive not in mosaic_lowering_rules[
+          (module_ctx.lowering_semantics, module_ctx.primitive_semantics)]:
         raise NotImplementedError(
             "Unimplemented primitive in Pallas Mosaic GPU lowering: "
-            f"{eqn.primitive.name}. "
+            f"{eqn.primitive.name} for lowering semantics "
+            f"{module_ctx.lowering_semantics} and user thread semantics "
+            f"{module_ctx.primitive_semantics}. "
             "Please file an issue on https://github.com/jax-ml/jax/issues."
         )
       new_local_name_stack = [scope.name for scope in eqn.source_info.name_stack.stack]
@@ -922,7 +955,9 @@ def lower_jaxpr_to_mosaic_gpu(
         wrapper_stack = contextlib.ExitStack()
         wrapper_stack.enter_context(launch_ctx.named_region(name))
         named_regions.append(wrapper_stack)
-      rule = mosaic_lowering_rules[module_ctx.thread_semantics][eqn.primitive]
+      rule = mosaic_lowering_rules[
+          (module_ctx.lowering_semantics, module_ctx.primitive_semantics)
+          ][eqn.primitive]
       rule_ctx = LoweringRuleContext(
           module_ctx,
           launch_ctx,
@@ -951,8 +986,9 @@ def lower_jaxpr_to_mosaic_gpu(
   return map(read_env, jaxpr.outvars)
 
 
-@register_lowering_rule(primitives.program_id_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(primitives.program_id_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(primitives.program_id_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(
+    primitives.program_id_p, mgpu.LoweringSemantics.Warpgroup)
 def _program_id_lowering_rule(ctx: LoweringRuleContext, axis):
   if ctx.module_ctx.program_ids is None:
     raise NotImplementedError("pl.program_id() is not supported in this context")
@@ -1019,8 +1055,9 @@ def _lower_fun(
   return lowering_rule
 
 
-@register_lowering_rule(primitives.num_programs_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(primitives.num_programs_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(primitives.num_programs_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(
+    primitives.num_programs_p, mgpu.LoweringSemantics.Warpgroup)
 def _num_programs_lowering_rule(ctx: LoweringRuleContext, axis):
   del ctx  # Unused.
   return arith_dialect.index_cast(
@@ -1028,61 +1065,50 @@ def _num_programs_lowering_rule(ctx: LoweringRuleContext, axis):
       gpu_dialect.block_dim(gpu_dialect.Dimension(axis)),
   )
 
-
-def _handle_reshaping(
-    ref: ir.Value, transforms: Sequence[gpu_core.Transform]
+def _handle_transforms(
+    ref: ir.Value,
+    transforms: Sequence[gpu_core.Transform],
+    *,
+    handle_transposes=True,
+    handle_reshapes=True,
 ) -> tuple[ir.Value, Sequence[gpu_core.Transform]]:
-  is_trivial_indexer = lambda t: isinstance(
-      t, indexing.NDIndexer
-  ) and gpu_core.is_trivial_index(t.indices, t.shape)
-
-  last_reshaper_idx = next(
-      reversed([i for i, t in enumerate(transforms) if isinstance(t, RefReshaper)]),
-      None,
-  )
-  if last_reshaper_idx is None:
-    return ref, transforms
-  # Check that before the reshape are only trivial indexes and or
-  # other reshapes.
-  # TODO(cperivol): Reshapes should bubble up  rather than being
-  # expected to effectively be the first ref transform.
-  if not all(isinstance(t, RefReshaper) or is_trivial_indexer(t) for t in transforms[:last_reshaper_idx]):
-    raise NotImplementedError(
-        "Reshapes do not compose with other transforms and indexers must be"
-        f" trivial (transforms: {transforms})"
-    )
-  reshaper = cast(RefReshaper, transforms[last_reshaper_idx])
-  # Skip all the reshapes and trivial indexes.
-  return mgpu.memref_reshape(ref, reshaper.shape), transforms[last_reshaper_idx + 1:]
-
-
-def _handle_indexing(
-    ref: ir.Value, transforms: Sequence[gpu_core.Transform]
-) -> tuple[ir.Value, Sequence[gpu_core.Transform]]:
-  if not transforms:
-    pass
-  indexer_idxs = [
-      i for i, t in enumerate(transforms) if isinstance(t, indexing.NDIndexer)
-  ]
-  if not indexer_idxs:
-    return ref, transforms
-  sliced_ref = ref
+  transformed_ref = ref
+  mlir_dtype = ir.MemRefType(ref.type).element_type
   new_transforms = []
-  for t in transforms:
-    if not isinstance(t, indexing.NDIndexer):
-      new_transforms.append(t)
-      continue
-    indexer = cast(indexing.NDIndexer, t)
-    if indexer.int_indexer_shape:
-      raise NotImplementedError("int_indexer_shape non-empty")
-    indices = _ndindexer_indices(indexer)
+  def _bubble_up(untransform_fn, data):
+    nonlocal new_transforms
     new_transforms_rev = []
     for t in reversed(new_transforms):
-      indices, new_t = t.untransform_index(indices)
+      data, new_t = untransform_fn(t, data)
       new_transforms_rev.append(new_t)
-    sliced_ref = mgpu.memref_slice(sliced_ref, indices)
+
     new_transforms = list(reversed(new_transforms_rev))
-  return sliced_ref, new_transforms
+    return data
+
+  for t in transforms:
+    match t:
+      case indexing.NDIndexer():
+        indexer = cast(indexing.NDIndexer, t)
+        if indexer.int_indexer_shape:
+          raise NotImplementedError("int_indexer_shape non-empty")
+        indices = _ndindexer_indices(indexer)
+        indices = _bubble_up(
+            lambda t, idxs: t.untransform_index(mlir_dtype, idxs), indices
+        )
+        transformed_ref = mgpu.memref_slice(transformed_ref, indices)
+      case gpu_core.TransposeRef(perm) if handle_transposes:
+        perm = _bubble_up(lambda t, p: t.untransform_transpose(p),
+                                          perm)
+        transformed_ref = mgpu.memref_transpose(transformed_ref, perm)
+      case RefReshaper(dtype=dtype, shape=shape) if handle_reshapes:
+        shape = _bubble_up(
+            lambda t, p: t.untransform_reshape(dtype, p),  # pylint: disable=cell-var-from-loop
+            shape)
+        transformed_ref = mgpu.memref_reshape(transformed_ref, shape)
+      case _:
+        new_transforms.append(t)
+
+  return transformed_ref, new_transforms
 
 
 def _ndindexer_indices(indexer: indexing.NDIndexer) -> tuple[gpu_core.Index, ...]:
@@ -1104,7 +1130,7 @@ def _ndindexer_indices(indexer: indexing.NDIndexer) -> tuple[gpu_core.Index, ...
   return tuple(indices)
 
 
-@register_lowering_rule(sp.get_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(sp.get_p, mgpu.LoweringSemantics.Lane)
 def _get_lowering_rule(ctx: LoweringRuleContext, x_ref, *leaves, tree):
   if isinstance(x_ref, tcgen05.TMEMRef):
     transforms = jax.tree.unflatten(tree, leaves)
@@ -1124,12 +1150,11 @@ def _get_lowering_rule(ctx: LoweringRuleContext, x_ref, *leaves, tree):
   x_aval = ctx.avals_in[0]
 
   transforms = jax.tree.unflatten(tree, leaves)
-  x_smem, transforms = _handle_reshaping(x_ref, transforms)
-  x_smem, transforms = _handle_indexing(x_smem, transforms)
+  x_smem, transforms = _handle_transforms(x_ref, transforms)
 
   match transforms:
     case (gpu_core.UnswizzleRef(swizzle), gpu_core.UntileRef(tiling)):
-      if tiling != (8, swizzle // x_aval.dtype.itemsize):
+      if tiling != (8, (swizzle * 8) // pallas_utils.dtype_bitwidth(x_aval.dtype)):
         raise NotImplementedError("Tiling does not fit swizzle")
       return mgpu.FragmentedArray.load_tiled(
           x_smem, is_signed=mgpu_utils.is_signed(x_aval.dtype), swizzle=swizzle
@@ -1148,7 +1173,7 @@ def _get_lowering_rule(ctx: LoweringRuleContext, x_ref, *leaves, tree):
       raise NotImplementedError(f"Unsupported transforms: {transforms}")
 
 
-@register_lowering_rule(sp.get_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(sp.get_p, mgpu.LoweringSemantics.Warpgroup)
 def _get_lowering_rule_wg(ctx: LoweringRuleContext, x_smem, *leaves, tree):
   if not isinstance(x_smem, ir.Value) and ir.MemRefType.isinstance(x_smem):
     raise TypeError(f"Can only load from references (got {x_smem}).")
@@ -1156,8 +1181,7 @@ def _get_lowering_rule_wg(ctx: LoweringRuleContext, x_smem, *leaves, tree):
   x_aval = ctx.avals_in[0]
 
   transforms = jax.tree.unflatten(tree, leaves)
-  x_smem, transforms = _handle_reshaping(x_smem, transforms)
-  x_smem, transforms = _handle_indexing(x_smem, transforms)
+  x_smem, transforms = _handle_transforms(x_smem, transforms)
 
   if transforms:
     raise NotImplementedError(
@@ -1174,7 +1198,7 @@ def _get_lowering_rule_wg(ctx: LoweringRuleContext, x_smem, *leaves, tree):
     return memref_dialect.load(x_smem, [])
 
 
-@register_lowering_rule(sp.swap_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(sp.swap_p, mgpu.LoweringSemantics.Lane)
 def _swap_lowering_rule(
     ctx: LoweringRuleContext, x_smem, value, *leaves, tree
 ):
@@ -1184,30 +1208,50 @@ def _swap_lowering_rule(
     raise TypeError(f"Can only store to references (got {x_smem}).")
   x_aval = ctx.avals_in[0]
   transforms = jax.tree.unflatten(tree, leaves)
-  x_smem, transforms = _handle_reshaping(x_smem, transforms)
-  x_smem, transforms = _handle_indexing(x_smem, transforms)
+  transposed_value = value.layout == mgpu.WGMMA_TRANSPOSED_LAYOUT
+  x_smem, transforms = _handle_transforms(
+      x_smem, transforms, handle_transposes=not transposed_value
+  )
   match transforms:
-    case (gpu_core.UnswizzleRef(swizzle), gpu_core.UntileRef(tiling)):
+    case (
+        gpu_core.UnswizzleRef(swizzle),
+        gpu_core.UntileRef(tiling),
+        *maybe_transpose,
+    ):
       if tiling != (8, swizzle // x_aval.dtype.itemsize):
         raise NotImplementedError("Tiling does not fit swizzle")
+
+      if transposed_value != bool(maybe_transpose):
+        raise ValueError(
+            "Either both the ref and the value are transposed or neither is."
+        )
+
+      if maybe_transpose:
+        if maybe_transpose != [gpu_core.TransposeRef((1, 0))]:
+          raise NotImplementedError(
+              f"Unsupported transforms: {transforms} ({maybe_transpose})"
+          )
+
+        x_smem = mgpu.memref_transpose(x_smem, (1, 0, 3, 2))
+
       old_value = mgpu.FragmentedArray.load_tiled(
-          x_smem, is_signed=mgpu_utils.is_signed(x_aval.dtype), swizzle=swizzle
+          x_smem,
+          is_signed=mgpu_utils.is_signed(x_aval.dtype),
+          swizzle=swizzle,
+          layout=value.layout,
       )
       value.store_tiled(x_smem, swizzle=swizzle)
       return old_value
     case ():
       match value.layout:
-        case mgpu.WGMMARowFragLayout():
-          old_value = mgpu.FragmentedArray.load_wgmma_row(
-              x_smem, is_signed=mgpu_utils.is_signed(x_aval.dtype)
+        case mgpu.TiledLayout():
+          old_value = mgpu.FragmentedArray.load_untiled(
+              x_smem,
+              layout=value.layout,
+              is_signed=mgpu_utils.is_signed(x_aval.dtype),
+              optimized=False,
           )
-          value.store_untiled(x_smem)
-          return old_value
-        case mgpu.WGMMAColFragLayout():
-          old_value = mgpu.FragmentedArray.load_wgmma_col(
-              x_smem, is_signed=mgpu_utils.is_signed(x_aval.dtype)
-          )
-          value.store_untiled(x_smem)
+          value.store_untiled(x_smem, optimized=False)
           return old_value
         case _:
           old_value = mgpu.FragmentedArray.load_strided(
@@ -1219,7 +1263,7 @@ def _swap_lowering_rule(
       raise NotImplementedError(f"Unsupported transforms: {transforms}")
 
 
-@register_lowering_rule(sp.swap_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(sp.swap_p, mgpu.LoweringSemantics.Warpgroup)
 def _swap_lowering_rule_wg(
     ctx: LoweringRuleContext, x_smem, value, *leaves, tree
 ):
@@ -1231,9 +1275,7 @@ def _swap_lowering_rule_wg(
   x_aval = ctx.avals_in[0]
 
   transforms = jax.tree.unflatten(tree, leaves)
-  x_smem, transforms = _handle_reshaping(x_smem, transforms)
-  x_smem, transforms = _handle_indexing(x_smem, transforms)
-
+  x_smem, transforms = _handle_transforms(x_smem, transforms)
   if transforms:
     raise NotImplementedError(
         "Transforms are not yet implemented for warpgroup semantics"
@@ -1252,8 +1294,8 @@ def _swap_lowering_rule_wg(
   return old_value
 
 
-@register_lowering_rule(pjit.pjit_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(pjit.pjit_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(pjit.pjit_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(pjit.pjit_p, mgpu.LoweringSemantics.Warpgroup)
 def _pjit_lowering_rule(ctx: LoweringRuleContext, *args, jaxpr, **kwargs):
   if jaxpr.consts:
     raise NotImplementedError
@@ -1262,7 +1304,7 @@ def _pjit_lowering_rule(ctx: LoweringRuleContext, *args, jaxpr, **kwargs):
   )
 
 
-@register_lowering_rule(lax.slice_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(lax.slice_p, mgpu.LoweringSemantics.Lane)
 def _slice_lowering_rule(
     ctx: LoweringRuleContext, x, limit_indices, start_indices, strides
 ):
@@ -1272,8 +1314,8 @@ def _slice_lowering_rule(
   return x[tuple(slice(b, e) for b, e in zip(start_indices, limit_indices))]
 
 
-@register_lowering_rule(lax.select_n_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.select_n_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.select_n_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.select_n_p, mgpu.LoweringSemantics.Warpgroup)
 def _select_n_lowering_rule(ctx: LoweringRuleContext, pred, *cases):
   if len(cases) != 2:
     raise NotImplementedError(
@@ -1282,7 +1324,7 @@ def _select_n_lowering_rule(ctx: LoweringRuleContext, pred, *cases):
     )
   pred_aval, *cases_avals = ctx.avals_in
   [out_aval] = ctx.avals_out
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     pred = _ensure_fa(pred, pred_aval.dtype)
     cases = _bcast(*cases, *cases_avals, out_aval)
     # ``select`` expects the first case to be the true branch, but ``select_n``
@@ -1300,7 +1342,7 @@ def _select_n_lowering_rule(ctx: LoweringRuleContext, pred, *cases):
     return arith_dialect.select(pred, *reversed(cases))
 
 
-@register_lowering_rule(lax.broadcast_in_dim_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(lax.broadcast_in_dim_p, mgpu.LoweringSemantics.Lane)
 def _broadcast_in_dim_lowering_rule(
     ctx: LoweringRuleContext,
     x: mgpu.FragmentedArray,
@@ -1330,7 +1372,8 @@ def _broadcast_in_dim_lowering_rule(
   return x.broadcast(shape)
 
 
-@register_lowering_rule(lax.broadcast_in_dim_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(
+    lax.broadcast_in_dim_p, mgpu.LoweringSemantics.Warpgroup)
 def _broadcast_in_dim_lowering_rule_wg(
     ctx: LoweringRuleContext,
     x: ir.Value,
@@ -1350,18 +1393,25 @@ def _broadcast_in_dim_lowering_rule_wg(
   )
 
 
-@register_lowering_rule(lax.convert_element_type_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(lax.convert_element_type_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.convert_element_type_p,
+  mgpu.LoweringSemantics.Lane, gpu_core.PrimitiveSemantics.Warp)
 def _convert_element_type_lowering_rule(
     ctx: LoweringRuleContext, x, *, new_dtype, weak_type, sharding
 ):
   del weak_type, sharding
   [x_aval] = ctx.avals_in
+  if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+    if x_aval.shape != ():
+      raise NotImplementedError(
+          "Non-scalar arithmetic is not supported in warp-level lowering.")
   return _ensure_fa(x, x_aval.dtype).astype(
       mgpu_utils.dtype_to_ir_type(new_dtype), is_signed=mgpu_utils.is_signed(new_dtype)
   )
 
 
-@register_lowering_rule(lax.convert_element_type_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(
+    lax.convert_element_type_p, mgpu.LoweringSemantics.Warpgroup)
 def _convert_element_type_lowering_rule_wg(
     ctx: LoweringRuleContext, x, *, new_dtype, weak_type, sharding
 ):
@@ -1453,12 +1503,12 @@ def _convert_element_type_lowering_rule_wg(
   return convert(ty, x)
 
 
-mosaic_lowering_rules[mgpu.ThreadSemantics.Lane].update({
+mosaic_lowering_rules[gpu_core.LANExWG_SEMANTICS].update({
     lax.neg_p: lambda ctx, x: -x,
     lax.not_p: lambda ctx, x: ~x,
 })
 
-mosaic_lowering_rules[mgpu.ThreadSemantics.Warpgroup].update({
+mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS].update({
     lax.neg_p: _lower_fun(lambda x: jnp.subtract(0, x), multiple_results=False),
     lax.not_p: _lower_fun(
         lambda x: jnp.astype(jnp.bitwise_xor(jnp.astype(x, int), -1), jnp.dtype(x)), multiple_results=False,
@@ -1467,11 +1517,15 @@ mosaic_lowering_rules[mgpu.ThreadSemantics.Warpgroup].update({
 
 
 def _binary_op_lowering_rule(ctx: LoweringRuleContext, x, y, *, impl):
+  if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+    if not all(aval_in.shape == () for aval_in in ctx.avals_in):
+      raise NotImplementedError(
+          "Non-scalar arithmetic is not supported in warp-level lowering.")
   x, y = _bcast(x, y, *ctx.avals_in, *ctx.avals_out)
   return impl(x, y)
 
-
-mosaic_lowering_rules[mgpu.ThreadSemantics.Lane].update({
+for semantics in [gpu_core.LANExWG_SEMANTICS, gpu_core.LANExWARP_SEMANTICS]:
+  mosaic_lowering_rules[semantics].update({
     lax.add_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x + y),
     lax.sub_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x - y),
     lax.mul_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x * y),
@@ -1487,8 +1541,7 @@ mosaic_lowering_rules[mgpu.ThreadSemantics.Lane].update({
     lax.ne_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x != y),
     lax.max_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x.max(y)),
     lax.min_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x.min(y)),
-})
-
+  })
 
 def _binary_op_lowering_rule_wg(
     ctx: LoweringRuleContext, x, y, *, ui_impl, si_impl, f_impl=None
@@ -1532,7 +1585,7 @@ for op, si_impl, ui_impl, f_impl in [
         arith_dialect.minimumf,
     ),
 ]:
-  mosaic_lowering_rules[mgpu.ThreadSemantics.Warpgroup][op] = partial(
+  mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS][op] = partial(
       _binary_op_lowering_rule_wg,
       si_impl=si_impl,
       ui_impl=ui_impl,
@@ -1551,7 +1604,7 @@ for op, impl in [
     (lax.or_p, arith_dialect.ori),
     (lax.xor_p, arith_dialect.xori),
 ]:
-  mosaic_lowering_rules[mgpu.ThreadSemantics.Warpgroup][op] = partial(
+  mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS][op] = partial(
       _binary_boolean_op_lowering_rule_wg,
       impl=impl,
   )
@@ -1584,7 +1637,7 @@ for op, si_pred, ui_pred, f_pred in [
     (lax.gt_p, CmpIPred.sgt, CmpIPred.ugt, CmpFPred.OGT),
     (lax.ge_p, CmpIPred.sge, CmpIPred.uge, CmpFPred.OGE),
 ]:
-  mosaic_lowering_rules[mgpu.ThreadSemantics.Warpgroup][op] = partial(
+  mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS][op] = partial(
       _comparison_lowering_rule_wg,
       si_pred=si_pred,
       ui_pred=ui_pred,
@@ -1592,7 +1645,7 @@ for op, si_pred, ui_pred, f_pred in [
   )
 
 
-@register_lowering_rule(lax.div_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(lax.div_p, mgpu.LoweringSemantics.Lane)
 def _div_lowering_rule(ctx: LoweringRuleContext, x, y):
   x, y = _bcast(x, y, *ctx.avals_in, *ctx.avals_out)
   if ir.FloatType.isinstance(x.mlir_dtype):
@@ -1600,19 +1653,19 @@ def _div_lowering_rule(ctx: LoweringRuleContext, x, y):
   return x // y
 
 
-@register_lowering_rule(lax.integer_pow_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.integer_pow_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.integer_pow_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.integer_pow_p, mgpu.LoweringSemantics.Warpgroup)
 def _integer_pow_lowering_rule(ctx: LoweringRuleContext, x, y):
   if y != 2:
     raise NotImplementedError
   return _square_lowering_rule(ctx, x)
 
 
-@register_lowering_rule(lax.square_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.square_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.square_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.square_p, mgpu.LoweringSemantics.Warpgroup)
 def _square_lowering_rule(ctx: LoweringRuleContext, x):
   [x_aval] = ctx.avals_in
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     x = _ensure_fa(x, x_aval.dtype)
     return x * x
   if jnp.issubdtype(x_aval.dtype, jnp.integer):
@@ -1622,13 +1675,13 @@ def _square_lowering_rule(ctx: LoweringRuleContext, x):
   raise NotImplementedError(f"Unsupported dtype {x_aval.dtype}")
 
 
-@register_lowering_rule(lax.rsqrt_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.rsqrt_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.rsqrt_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.rsqrt_p, mgpu.LoweringSemantics.Warpgroup)
 def _rsqrt_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   if accuracy is not None:
     raise NotImplementedError("Not implemented: accuracy")
   [x_aval] = ctx.avals_in
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     return _ensure_fa(x, x_aval.dtype).rsqrt(approx=ctx.module_ctx.approx_math)
   fastmath = (
       arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
@@ -1638,13 +1691,13 @@ def _rsqrt_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   )
 
 
-@register_lowering_rule(lax.tanh_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.tanh_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.tanh_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.tanh_p, mgpu.LoweringSemantics.Warpgroup)
 def _tanh_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   if accuracy is not None:
     raise NotImplementedError("Not implemented: accuracy")
   [x_aval] = ctx.avals_in
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     return _ensure_fa(x, x_aval.dtype).tanh(approx=ctx.module_ctx.approx_math)
   fastmath = (
       arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
@@ -1658,21 +1711,21 @@ def _logistic(x, accuracy):
   return 1.0 / (1 + lax.exp(-x))
 
 
-mosaic_lowering_rules[mgpu.ThreadSemantics.Lane][lax.logistic_p] = _lower_fun(
+mosaic_lowering_rules[gpu_core.LANExWG_SEMANTICS][lax.logistic_p] = _lower_fun(
     _logistic, multiple_results=False
 )
-mosaic_lowering_rules[mgpu.ThreadSemantics.Warpgroup][lax.logistic_p] = (
+mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS][lax.logistic_p] = (
     _lower_fun(_logistic, multiple_results=False)
 )
 
 
-@register_lowering_rule(lax.exp_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.exp_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.exp_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.exp_p, mgpu.LoweringSemantics.Warpgroup)
 def _exp_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   if accuracy is not None:
     raise NotImplementedError("Not implemented: accuracy")
   [x_aval] = ctx.avals_in
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     return _ensure_fa(x, x_aval.dtype).exp(approx=ctx.module_ctx.approx_math)
   fastmath = (
       arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
@@ -1680,13 +1733,13 @@ def _exp_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   return math_dialect.exp(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
 
 
-@register_lowering_rule(lax.exp2_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.exp2_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.exp2_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.exp2_p, mgpu.LoweringSemantics.Warpgroup)
 def _exp2_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   if accuracy is not None:
     raise NotImplementedError("Not implemented: accuracy")
   [x_aval] = ctx.avals_in
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     return _ensure_fa(x, x_aval.dtype).exp2(approx=ctx.module_ctx.approx_math)
   fastmath = (
       arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
@@ -1694,13 +1747,13 @@ def _exp2_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   return math_dialect.exp2(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
 
 
-@register_lowering_rule(lax.log_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.log_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.log_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.log_p, mgpu.LoweringSemantics.Warpgroup)
 def _log_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   if accuracy is not None:
     raise NotImplementedError("Not implemented: accuracy")
   [x_aval] = ctx.avals_in
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     return _ensure_fa(x, x_aval.dtype).log(approx=ctx.module_ctx.approx_math)
   fastmath = (
       arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
@@ -1708,7 +1761,7 @@ def _log_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   return math_dialect.log(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
 
 
-@register_lowering_rule(lax.reduce_sum_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(lax.reduce_sum_p, mgpu.LoweringSemantics.Lane)
 def _reduce_sum_lowering_rule(ctx: LoweringRuleContext, x, *, axes):
   [x_aval] = ctx.avals_in
   match x.layout:
@@ -1728,7 +1781,7 @@ def _reduce_sum_lowering_rule(ctx: LoweringRuleContext, x, *, axes):
       raise NotImplementedError(f"Unsupported layout {x.layout}")
 
 
-@register_lowering_rule(lax.reduce_max_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(lax.reduce_max_p, mgpu.LoweringSemantics.Lane)
 def _reduce_max_lowering_rule(ctx: LoweringRuleContext, x, *, axes):
   [x_aval] = ctx.avals_in
   match x.layout:
@@ -1769,7 +1822,7 @@ def _reduce_lowering_rule_wg(
   return vector_dialect.MultiDimReductionOp(kind, x, acc, axes)
 
 
-@register_lowering_rule(lax.reduce_sum_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.reduce_sum_p, mgpu.LoweringSemantics.Warpgroup)
 def _reduce_sum_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
   op = _reduce_lowering_rule_wg(
       vector_dialect.CombiningKind.ADD, 0, ctx, x, axes=axes
@@ -1780,7 +1833,7 @@ def _reduce_sum_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
   return op.result
 
 
-@register_lowering_rule(lax.reduce_max_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.reduce_max_p, mgpu.LoweringSemantics.Warpgroup)
 def _reduce_max_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
   [x_aval] = ctx.avals_in
   if jnp.issubdtype(x_aval.dtype, jnp.floating):
@@ -1821,8 +1874,8 @@ def _resolve_cluster_axis(axis_names: _AxisNames | None, axis_name: str):
   return gpu_dialect.Dimension(axis_names.cluster.index(axis_name))
 
 
-@register_lowering_rule(lax.axis_index_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.axis_index_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.axis_index_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.axis_index_p, mgpu.LoweringSemantics.Warpgroup)
 def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
   axis_names = ctx.module_ctx.axis_names
   if not axis_names:
@@ -1881,8 +1934,17 @@ def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
         _block_id(ctx, gpu_dialect.Dimension(idx)),
     )
 
+@register_lowering_rule(lax.axis_index_p,
+  mgpu.LoweringSemantics.Lane, gpu_core.PrimitiveSemantics.Warp)
+def _axis_index_warp_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
+  if axis_name == ctx.module_ctx.warp_axis_name:
+    return mgpu.warp_idx(sync=True)
+  raise ValueError(
+      "Named axes can only refer to the warp axis name inside of core_map."
+  )
 
-@register_lowering_rule(primitives.debug_print_p, mgpu.ThreadSemantics.Lane)
+
+@register_lowering_rule(primitives.debug_print_p, mgpu.LoweringSemantics.Lane)
 def _debug_print_lowering_rule(
     ctx: LoweringRuleContext,
     *args,
@@ -1910,7 +1972,7 @@ def _debug_print_lowering_rule(
 
   return ()
 
-@register_lowering_rule(primitives.debug_print_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(primitives.debug_print_p, mgpu.LoweringSemantics.Warpgroup)
 def _debug_print_lowering_rule_wg(
     ctx: LoweringRuleContext,
     *args,
@@ -1924,8 +1986,8 @@ def _debug_print_lowering_rule_wg(
   return ()
 
 
-@register_lowering_rule(primitives.run_scoped_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(primitives.run_scoped_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(primitives.run_scoped_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(primitives.run_scoped_p, mgpu.LoweringSemantics.Warpgroup)
 def _run_scoped_lowering_rule(
     ctx: LoweringRuleContext, *consts, jaxpr: jax_core.Jaxpr
 ):
@@ -1936,7 +1998,7 @@ def _run_scoped_lowering_rule(
       aval = v.aval
       if isinstance(aval, gpu_core.WGMMAAbstractAccumulatorRef):
         dtype = mlir.dtype_to_ir_type(aval.dtype)
-        if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+        if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
           input_refs.append(mgpu.WGMMAAccumulator.zero(*aval.shape, dtype))
         else:
           zero = arith_dialect.constant(dtype, ir.FloatAttr.get(dtype, 0.0))
@@ -1946,7 +2008,7 @@ def _run_scoped_lowering_rule(
           input_refs.append(acc)
         should_discharge.append(True)
       elif isinstance(aval.dtype, gpu_core.BarrierType):
-        input_refs.append(
+        barrier_ref = alloc_stack.enter_context(
             ctx.module_ctx.reserve_barrier(
                 mgpu.Barrier(
                     aval.dtype.num_arrivals
@@ -1955,17 +2017,19 @@ def _run_scoped_lowering_rule(
                 )
             )
         )
+        input_refs.append(barrier_ref)
         should_discharge.append(False)
       elif isinstance(aval.dtype, gpu_core.ClusterBarrierType):
         collective_dims = jax.tree.map(
             lambda axis: _resolve_cluster_axis(ctx.module_ctx.axis_names, axis),
             aval.dtype.collective_axes,
         )
-        input_refs.append(
+        barrier_ref = alloc_stack.enter_context(
             ctx.module_ctx.reserve_barrier(
                 mgpu.ClusterBarrier(collective_dims, *aval.shape)
             )
         )
+        input_refs.append(barrier_ref)
         should_discharge.append(False)
       elif aval.memory_space == gpu_core.SMEM:
         [input_ref] = alloc_stack.enter_context(
@@ -2017,7 +2081,8 @@ def _run_scoped_lowering_rule(
   return outs
 
 
-@register_lowering_rule(discharge.run_state_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(discharge.run_state_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(discharge.run_state_p, mgpu.LoweringSemantics.Warpgroup)
 def _run_state_lowering_rule(
     ctx: LoweringRuleContext,
     *args,
@@ -2035,7 +2100,12 @@ def _run_state_lowering_rule(
   for arg, v, out_aval in zip(args, jaxpr.invars, ctx.avals_out):
     aval = v.aval
     if isinstance(aval, gpu_core.WGMMAAbstractAccumulatorRef):
-      new_input_vals.append(mgpu.WGMMAAccumulator.from_registers(arg))
+      if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
+        arg = mgpu.dialect.optimization_barrier([arg])
+        nvvm_dialect.wgmma_fence_aligned()
+        new_input_vals.append(arg)
+      else:
+        new_input_vals.append(mgpu.WGMMAAccumulator.from_registers(arg))
       should_discharge.append(True)
       assert isinstance(out_aval, jax_core.ShapedArray)
     else:
@@ -2089,7 +2159,7 @@ def _lower_jaxpr_to_for_loop(
 
     _ensure = (
         _ensure_fa
-        if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane
+        if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane
         else _ensure_ir_value
     )
     return [v if a else _ensure(v, av) for a, v, av in zip(is_acc, vals, avals)]
@@ -2109,8 +2179,8 @@ def _lower_jaxpr_to_for_loop(
   return loop.results
 
 
-@register_lowering_rule(lax.scan_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.scan_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.scan_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.scan_p, mgpu.LoweringSemantics.Warpgroup)
 def _scan_lowering_rule(
     ctx: LoweringRuleContext,
     *args,
@@ -2198,8 +2268,8 @@ def _lower_while_via_fori(
   return ub, ub, *for_out
 
 
-@register_lowering_rule(lax.while_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.while_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.while_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.while_p, mgpu.LoweringSemantics.Warpgroup)
 def _while_lowering_rule(
     ctx: LoweringRuleContext,
     *args,
@@ -2223,7 +2293,7 @@ def _while_lowering_rule(
 
   _is_acc = lambda x: isinstance(x, mgpu.WGMMAAccumulator)
   _ensure = _ensure_ir_value
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Lane:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     _ensure = lambda v, aval: v if _is_acc(v) else _ensure_fa(v, aval.dtype)
 
   # If we fail conversion to fori, fallback to an ordinary while loop.
@@ -2257,26 +2327,29 @@ def _while_lowering_rule(
         ctx.module_ctx, ctx.launch_ctx, body_jaxpr.jaxpr, body_args
     )
     loop_out = [*map(_ensure, loop_out, carry_avals)]
-    for idx, (carry_fa, out_fa) in enumerate(zip(carry, loop_out)):
-      if _is_acc(carry_fa) != _is_acc(out_fa):
-        raise ValueError(
-            f"The loop body output has unexpected accumulator type: output[{idx}]"
-            f" is {out_fa}, when it should be {carry_fa}."
-        )
+    if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+      for idx, (carry_fa, out_fa) in enumerate(zip(carry, loop_out)):
+        if _is_acc(carry_fa) != _is_acc(out_fa):
+          raise ValueError(
+              f"The loop body output has unexpected accumulator type:"
+              f" output[{idx}] is {out_fa}, when it should be {carry_fa}."
+          )
 
-      if not _is_acc(out_fa) and carry_fa.layout != out_fa.layout:
-        raise ValueError(
-            f"The loop body output has unexpected layout: output[{idx}] has"
-            f" layout {out_fa.layout}, when it should be {carry_fa.layout}."
-        )
+        if not _is_acc(out_fa) and carry_fa.layout != out_fa.layout:
+          raise ValueError(
+              f"The loop body output has unexpected layout: output[{idx}] has"
+              f" layout {out_fa.layout}, when it should be {carry_fa.layout}."
+          )
     scf_dialect.yield_(
         carry_treedef.flatten_up_to(loop_out) if loop_out else []
     )
   return carry_treedef.unflatten(list(while_op.results))
 
 
-@register_lowering_rule(lax.cond_p, mgpu.ThreadSemantics.Lane)
-@register_lowering_rule(lax.cond_p, mgpu.ThreadSemantics.Warpgroup)
+@register_lowering_rule(lax.cond_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.cond_p,
+  mgpu.LoweringSemantics.Lane, gpu_core.PrimitiveSemantics.Warp)
+@register_lowering_rule(lax.cond_p, mgpu.LoweringSemantics.Warpgroup)
 def _cond_lowering_rule(ctx: LoweringRuleContext, index, *args, branches):
   index_aval, *_arg_avals = ctx.avals_in
 
@@ -2333,9 +2406,9 @@ def _cond_lowering_rule(ctx: LoweringRuleContext, index, *args, branches):
   return treedef.unflatten(list(switch_op.results))
 
 
-@register_lowering_rule(lax.bitcast_convert_type_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(lax.bitcast_convert_type_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(
-    lax.bitcast_convert_type_p, mgpu.ThreadSemantics.Warpgroup
+    lax.bitcast_convert_type_p, mgpu.LoweringSemantics.Warpgroup
 )
 def _bitcast_convert_type_lowering_rule(
     ctx: LoweringRuleContext, x, *, new_dtype
@@ -2351,7 +2424,7 @@ def _bitcast_convert_type_lowering_rule(
         " have different widths"
     )
 
-  if ctx.module_ctx.thread_semantics == mgpu.ThreadSemantics.Warpgroup:
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
     x = _ensure_ir_value(x, x_aval.dtype)
     return arith_dialect.bitcast(
         ir.VectorType.get(x_aval.shape, dst_elem_type), x
@@ -2367,7 +2440,7 @@ def _bitcast_convert_type_lowering_rule(
   )
 
 
-@register_lowering_rule(lax.optimization_barrier_p, mgpu.ThreadSemantics.Lane)
+@register_lowering_rule(lax.optimization_barrier_p, mgpu.LoweringSemantics.Lane)
 def _optimization_barrier_lowering(ctx: LoweringRuleContext, *args):
   result = mgpu.optimization_barrier(
       *(_ensure_fa(arg, aval.dtype) for arg, aval in zip(args, ctx.avals_in))
@@ -2376,13 +2449,52 @@ def _optimization_barrier_lowering(ctx: LoweringRuleContext, *args):
 
 
 @register_lowering_rule(
-    lax.optimization_barrier_p, mgpu.ThreadSemantics.Warpgroup
+    lax.optimization_barrier_p, mgpu.LoweringSemantics.Warpgroup
 )
 def _optimization_barrier_lowering_wg(ctx: LoweringRuleContext, *args):
   result = mgpu.dialect.optimization_barrier([
       _ensure_ir_value(arg, aval.dtype) for arg, aval in zip(args, ctx.avals_in)
   ])
   return (result,) if len(ctx.avals_in) == 1 else result
+
+
+@register_lowering_rule(pallas_core.core_map_p, mgpu.LoweringSemantics.Lane)
+def _core_map_lowering_rule(
+    ctx: LoweringRuleContext,
+    *args,
+    jaxpr,
+    mesh,
+    **_,
+):
+  if isinstance(mesh, gpu_core.WarpMesh):
+    # A core_map over a WarpMesh represents a fork/join over individual
+    # warps in a warpgroup.
+    if (ctx.module_ctx.warp_axis_name or
+        ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp):
+      raise LoweringError(
+          "Cannot nest core_maps. Already under core_map with warp_axis_name "
+          f"{ctx.module_ctx.warp_axis_name}.")
+    module_ctx = dataclasses.replace(
+        ctx.module_ctx,
+        warp_axis_name=mesh.axis_name,
+        primitive_semantics=gpu_core.PrimitiveSemantics.Warp,
+    )
+    for aval_in in ctx.avals_in:
+      if isinstance(aval_in, jax_core.ShapedArray) and aval_in.shape:
+        raise LoweringError(
+          "Can only close over scalars and Refs when using core_map with "
+          f"WarpMesh. Found array of shape {aval_in}."
+        )
+    _ = lower_jaxpr_to_mosaic_gpu(
+        module_ctx,
+        ctx.launch_ctx,
+        jaxpr,
+        args=(),
+        consts=args,
+    )
+    mgpu.warpgroup_barrier()
+    return []
+  raise ValueError(f"Unsupported mesh: {mesh}")
 
 
 def _bcast(

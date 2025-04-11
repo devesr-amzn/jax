@@ -76,28 +76,33 @@ _CPU_PYPI_WHEEL_DEPS = [
     "@pypi_jaxlib//:pkg",
 ]
 
-# TODO(vam): remove this once zstandard builds against Python 3.13
+# TODO(vam): remove this once zstandard builds against Python >3.13
 def get_zstandard():
-    if HERMETIC_PYTHON_VERSION == "3.13" or HERMETIC_PYTHON_VERSION == "3.13-ft":
+    if HERMETIC_PYTHON_VERSION in ("3.13", "3.13-ft", "3.14", "3.14-ft"):
         return []
     return ["@pypi_zstandard//:pkg"]
+
+def get_optional_dep(package, excluded_py_versions = ["3.14", "3.14-ft"]):
+    if HERMETIC_PYTHON_VERSION in excluded_py_versions:
+        return []
+    return [package]
 
 _py_deps = {
     "absl/logging": ["@pypi_absl_py//:pkg"],
     "absl/testing": ["@pypi_absl_py//:pkg"],
     "absl/flags": ["@pypi_absl_py//:pkg"],
-    "cloudpickle": ["@pypi_cloudpickle//:pkg"],
-    "colorama": ["@pypi_colorama//:pkg"],
-    "epath": ["@pypi_etils//:pkg"],  # etils.epath
-    "filelock": ["@pypi_filelock//:pkg"],
+    "cloudpickle": get_optional_dep("@pypi_cloudpickle//:pkg"),
+    "colorama": get_optional_dep("@pypi_colorama//:pkg"),
+    "epath": get_optional_dep("@pypi_etils//:pkg"),  # etils.epath
+    "filelock": get_optional_dep("@pypi_filelock//:pkg"),
     "flatbuffers": ["@pypi_flatbuffers//:pkg"],
     "hypothesis": ["@pypi_hypothesis//:pkg"],
     "magma": [],
-    "matplotlib": ["@pypi_matplotlib//:pkg"],
+    "matplotlib": get_optional_dep("@pypi_matplotlib//:pkg"),
     "mpmath": [],
     "opt_einsum": ["@pypi_opt_einsum//:pkg"],
-    "pil": ["@pypi_pillow//:pkg"],
-    "portpicker": ["@pypi_portpicker//:pkg"],
+    "pil": get_optional_dep("@pypi_pillow//:pkg"),
+    "portpicker": get_optional_dep("@pypi_portpicker//:pkg"),
     "ml_dtypes": ["@pypi_ml_dtypes//:pkg"],
     "numpy": ["@pypi_numpy//:pkg"],
     "scipy": ["@pypi_scipy//:pkg"],
@@ -154,82 +159,6 @@ def py_library_providing_imports_info(*, name, lib_rule = native.py_library, pyt
 
 def py_extension(name, srcs, copts, deps, linkopts = []):
     nanobind_extension(name, srcs = srcs, copts = copts, linkopts = linkopts, deps = deps, module_name = name)
-
-def windows_cc_shared_mlir_library(name, out, deps = [], srcs = [], exported_symbol_prefixes = []):
-    """Workaround DLL building issue.
-
-    1. cc_binary with linkshared enabled cannot produce DLL with symbol
-       correctly exported.
-    2. Even if the DLL is correctly built, the resulting target cannot be
-       correctly consumed by other targets.
-
-    Args:
-      name: the name of the output target
-      out: the name of the output DLL filename
-      deps: deps
-      srcs: srcs
-    """
-
-    # create a dummy library to get the *.def file
-    dummy_library_name = name + ".dummy.dll"
-    native.cc_binary(
-        name = dummy_library_name,
-        linkshared = 1,
-        linkstatic = 1,
-        deps = deps,
-        target_compatible_with = ["@platforms//os:windows"],
-    )
-
-    # .def file with all symbols, not usable
-    full_def_name = name + ".full.def"
-    native.filegroup(
-        name = full_def_name,
-        srcs = [dummy_library_name],
-        output_group = "def_file",
-        target_compatible_with = ["@platforms//os:windows"],
-    )
-
-    # say filtered_symbol_prefixes == ["mlir", "chlo"], then construct the regex
-    # pattern as "^\\s*(mlir|clho)" to use grep
-    pattern = "^\\s*(" + "|".join(exported_symbol_prefixes) + ")"
-
-    # filtered def_file, only the needed symbols are included
-    filtered_def_name = name + ".filtered.def"
-    filtered_def_file = out + ".def"
-    native.genrule(
-        name = filtered_def_name,
-        srcs = [full_def_name],
-        outs = [filtered_def_file],
-        cmd = """echo 'LIBRARY {}\nEXPORTS ' > $@ && grep -E '{}' $(location :{}) >> $@""".format(out, pattern, full_def_name),
-        target_compatible_with = ["@platforms//os:windows"],
-    )
-
-    # create the desired library
-    native.cc_binary(
-        name = out,  # this name must be correct, it will be the filename
-        linkshared = 1,
-        deps = deps,
-        win_def_file = filtered_def_file,
-        target_compatible_with = ["@platforms//os:windows"],
-    )
-
-    # however, the created cc_library (a shared library) cannot be correctly
-    # consumed by other cc_*...
-    interface_library_file = out + ".if.lib"
-    native.filegroup(
-        name = interface_library_file,
-        srcs = [out],
-        output_group = "interface_library",
-        target_compatible_with = ["@platforms//os:windows"],
-    )
-
-    # but this one can be correctly consumed, this is our final product
-    native.cc_import(
-        name = name,
-        interface_library = interface_library_file,
-        shared_library = out,
-        target_compatible_with = ["@platforms//os:windows"],
-    )
 
 ALL_BACKENDS = ["cpu", "gpu", "tpu"]
 

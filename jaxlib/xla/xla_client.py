@@ -50,7 +50,7 @@ profiler = _xla.profiler
 
 # Just an internal arbitrary increasing number to help with backward-compatible
 # changes. In JAX, reference this via jax._src.lib.jaxlib_extension_version.
-_version = 324
+_version = 330
 
 # An internal increasing version number for protecting jaxlib code against
 # ifrt changes.
@@ -237,40 +237,28 @@ def CurrentSourceInfoMetadata(op_type=None, op_name=None, skip_frames=1):
 
 PrimitiveType = _xla.PrimitiveType
 
-bfloat16 = ml_dtypes.bfloat16
-float4_e2m1fn = ml_dtypes.float4_e2m1fn
-float8_e3m4 = ml_dtypes.float8_e3m4
-float8_e4m3 = ml_dtypes.float8_e4m3
-float8_e8m0fnu = ml_dtypes.float8_e8m0fnu
-float8_e4m3fn = ml_dtypes.float8_e4m3fn
-float8_e4m3b11fnuz = ml_dtypes.float8_e4m3b11fnuz
-float8_e4m3fnuz = ml_dtypes.float8_e4m3fnuz
-float8_e5m2 = ml_dtypes.float8_e5m2
-float8_e5m2fnuz = ml_dtypes.float8_e5m2fnuz
-
 XLA_ELEMENT_TYPE_TO_DTYPE = {
     PrimitiveType.PRED: np.dtype('bool'),
-    PrimitiveType.S4: np.dtype('int4'),
+    PrimitiveType.S4: np.dtype(ml_dtypes.int4),
     PrimitiveType.S8: np.dtype('int8'),
     PrimitiveType.S16: np.dtype('int16'),
     PrimitiveType.S32: np.dtype('int32'),
     PrimitiveType.S64: np.dtype('int64'),
-    PrimitiveType.U4: np.dtype('uint4'),
+    PrimitiveType.U4: np.dtype(ml_dtypes.uint4),
     PrimitiveType.U8: np.dtype('uint8'),
     PrimitiveType.U16: np.dtype('uint16'),
     PrimitiveType.U32: np.dtype('uint32'),
     PrimitiveType.U64: np.dtype('uint64'),
-    # TODO(reedwm): Uncomment once the minimum ml_dtypes in JAX is >= 0.5.0.
-    # PrimitiveType.F4E2M1FN: np.dtype(float4_e2m1fn),
-    # PrimitiveType.F8E3M4: np.dtype(float8_e3m4),
-    # PrimitiveType.F8E4M3: np.dtype(float8_e4m3),
-    # PrimitiveType.F8E8M0FNU: np.dtype(float8_e8m0fnu),
-    PrimitiveType.F8E4M3FN: np.dtype(float8_e4m3fn),
-    PrimitiveType.F8E4M3B11FNUZ: np.dtype(float8_e4m3b11fnuz),
-    PrimitiveType.F8E5M2: np.dtype(float8_e5m2),
-    PrimitiveType.F8E4M3FNUZ: np.dtype(float8_e4m3fnuz),
-    PrimitiveType.F8E5M2FNUZ: np.dtype(float8_e5m2fnuz),
-    PrimitiveType.BF16: np.dtype(bfloat16),
+    PrimitiveType.F4E2M1FN: np.dtype(ml_dtypes.float4_e2m1fn),
+    PrimitiveType.F8E3M4: np.dtype(ml_dtypes.float8_e3m4),
+    PrimitiveType.F8E4M3: np.dtype(ml_dtypes.float8_e4m3),
+    PrimitiveType.F8E4M3FN: np.dtype(ml_dtypes.float8_e4m3fn),
+    PrimitiveType.F8E4M3B11FNUZ: np.dtype(ml_dtypes.float8_e4m3b11fnuz),
+    PrimitiveType.F8E4M3FNUZ: np.dtype(ml_dtypes.float8_e4m3fnuz),
+    PrimitiveType.F8E5M2: np.dtype(ml_dtypes.float8_e5m2),
+    PrimitiveType.F8E5M2FNUZ: np.dtype(ml_dtypes.float8_e5m2fnuz),
+    PrimitiveType.F8E8M0FNU: np.dtype(ml_dtypes.float8_e8m0fnu),
+    PrimitiveType.BF16: np.dtype(ml_dtypes.bfloat16),
     PrimitiveType.F16: np.dtype('float16'),
     PrimitiveType.F32: np.dtype('float32'),
     PrimitiveType.F64: np.dtype('float64'),
@@ -486,6 +474,7 @@ XlaOp = _xla.XlaOp
 FftType = _xla.FftType
 Client = _xla.Client
 Memory = _xla.Memory
+Array = _xla.Array
 ArrayImpl = _xla.ArrayImpl
 LoadedExecutable = _xla.LoadedExecutable
 DeviceList = _xla.DeviceList
@@ -984,7 +973,6 @@ XlaRuntimeError = _xla.XlaRuntimeError
 # mostly to keep ASAN happy.
 atexit.register(_xla.collect_garbage)
 
-weakref_lru_cache = _xla.weakref_lru_cache
 array_result_handler = _xla.array_result_handler
 batched_copy_array_to_devices_with_sharding = (
     _xla.batched_copy_array_to_devices_with_sharding

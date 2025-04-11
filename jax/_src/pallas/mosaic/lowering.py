@@ -45,6 +45,7 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.lax import lax as lax_internal
 from jax._src.lax.control_flow import for_loop
+from jax._src.lib import version as jaxlib_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import func
@@ -517,17 +518,11 @@ class MosaicGridMapping:
     nonlocal_axis_names = set()
     def _get_nonlocal_axis_names(jaxpr: jax_core.Jaxpr):
       return {
-            e.name
-            for e in jaxpr.effects
-            if isinstance(e, jax_core.NamedAxisEffect)
-            and (
-                not self.grid_names
-                or all(
-                    name not in self.grid_names
-                    for name in tree_util.tree_leaves(e.name)
-                )
-            )
-        }
+          e.name
+          for e in jaxpr.effects
+          if isinstance(e, jax_core.NamedAxisEffect)
+          and (not self.grid_names or e.name not in self.grid_names)
+      }
     nonlocal_axis_names.update(_get_nonlocal_axis_names(self.jaxpr))
     for bm in self.block_mappings:
       if bm is not None:
@@ -581,7 +576,7 @@ def _check_block_mappings(
               # TODO(necula): add index_map source location info
               f"and index_map {bm.index_map_jaxpr.jaxpr}, in "
               f"memory space {bm.block_aval.memory_space}."
-              "\nSee details at https://jax.readthedocs.io/en/latest/pallas/grid_blockspec.html#pallas-blockspec")
+              "\nSee details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec")
     if rank < 1:
       raise ValueError(
           "The Pallas TPU lowering currently supports only blocks of "
@@ -743,6 +738,15 @@ def lower_jaxpr_to_module(
       block_shape = [
           1 if b is pallas_core.mapped else b for b in bm.block_shape
       ]
+
+      # Force single-buffering pipelining for trivial windowing in VMEM.
+      pipeline_mode = bm.pipeline_mode
+      if (
+          tpu_memory_space == tpu_core.TPUMemorySpace.VMEM
+          and bm.has_trivial_window()
+      ):
+        pipeline_mode = pallas_core.Buffered(1)
+
       # If we have an extended dtype, we need to add the block shape for the
       # remaining physical dtype.
       block_shape += list(_get_aval_physical_dtype_shape(bm.block_aval.inner_aval))
@@ -760,20 +764,20 @@ def lower_jaxpr_to_module(
         block_params["window_kind"] = ir.Attribute.parse(
             f"#tpu.element_window<{pad_low},{pad_high}>"
         )
-      if bm.pipeline_mode is not None:
-        if not isinstance(bm.pipeline_mode, pallas_core.Buffered):
+      if pipeline_mode is not None:
+        if not isinstance(pipeline_mode, pallas_core.Buffered):
           raise LoweringException(
-              f"Unsupported pipeline mode: {bm.pipeline_mode}."
+              f"Unsupported pipeline mode: {pipeline_mode}."
           )
-        buffer_count = bm.pipeline_mode.buffer_count
+        buffer_count = pipeline_mode.buffer_count
         if buffer_count < 1 or buffer_count > 2:
           raise LoweringException(
               "Only single (1) and double (2) buffering are supported. Got"
               f" {buffer_count}."
           )
-        pipeline_mode = "synchronous" if buffer_count == 1 else "double_buffered"
+        pipeline_mode_str = "synchronous" if buffer_count == 1 else "double_buffered"
         block_params["pipeline_mode"] = ir.Attribute.parse(
-            f"#tpu.pipeline_mode<{pipeline_mode}>"
+            f"#tpu.pipeline_mode<{pipeline_mode_str}>"
         )
       window_params.append(ir.DictAttr.get(block_params))
       m.body.append(mlir_func)
@@ -1500,10 +1504,13 @@ def _load_lowering_rule(ctx: LoweringRuleContext, *args_flat, args_tree, **_):
         starts,
     )
   if load_aval != aval_out:
-    vec_type = ir.VectorType.get(aval_out.shape,
-                                _dtype_to_ir_type(aval_out.dtype,
-                                                  is_kernel_boundary=True))
-    load_val = vector.shape_cast(vec_type, load_val)
+    if aval_out.shape:
+      vec_type = ir.VectorType.get(aval_out.shape,
+                                  _dtype_to_ir_type(aval_out.dtype,
+                                                    is_kernel_boundary=True))
+      load_val = vector.shape_cast(vec_type, load_val)
+    else:
+      load_val = vector.extract(load_val, [], [0] * len(load_aval.shape))
   return _maybe_cast_load_to_bool(ctx, aval_out, load_val)
 
 def _prng_key_load_lowering_rule(ctx: LoweringRuleContext, *args_flat, args_tree) -> KeyScalarBundle:
@@ -1688,6 +1695,8 @@ def _masked_swap_lowering_rule(
     result = vector.load(mem_aval_vec_type, ref, starts)
   val = _maybe_cast_store_to_memref_type(ctx, val_aval, val)
   if mem_aval != aval_out:
+    if not aval_out.shape:
+      raise ValueError("Cannot swap scalars to VMEM.")
     # We are slicing a scalar so provided dummy 1 indices
     result_vec_type = ir.VectorType.get(aval_out.shape,
       _dtype_to_ir_type(aval_out.dtype, is_kernel_boundary=True))
@@ -2170,6 +2179,8 @@ def _reshape_lowering_rule(ctx: LoweringRuleContext, x, new_sizes, dimensions,
         ),
         x,
     )
+  if not ctx.avals_out[0].shape:
+    return vector.extract(x, [], [0] * len(ctx.avals_in[0].shape))
   return vector.shape_cast(
       aval_to_ir_type(
           ctx.lowering_context.dynamic_shape_replacement_fn, ctx.avals_out[0]
@@ -3531,8 +3542,14 @@ def _semaphore_wait_lowering_rule(ctx: LoweringRuleContext, *args, args_tree):
   return []
 lowering_rules[primitives.semaphore_wait_p] = _semaphore_wait_lowering_rule
 
-def _dma_start_lowering_rule(ctx: LoweringRuleContext, *args, tree,
-                             device_id_type: primitives.DeviceIdType):
+
+def _dma_start_lowering_rule(
+    ctx: LoweringRuleContext,
+    *args,
+    tree,
+    device_id_type: primitives.DeviceIdType,
+    priority: int,
+):
   (
       src_ref,
       src_transforms,
@@ -3564,10 +3581,20 @@ def _dma_start_lowering_rule(ctx: LoweringRuleContext, *args, tree,
   sem, _ = _transform_ref(sem, sem_aval.dtype, sem_aval.shape, sem_transforms)
   if device_id is not None:
     device_id = _device_id_to_logical(ctx, device_id, device_id_type)
-  tpu.enqueue_dma(src_ref, dst_ref, sem, source_semaphore=src_sem,
-                  device_id=device_id)
-
+  priority_kwarg = {"priority": priority}
+  if jaxlib_version < (0, 5, 4):
+    priority_kwarg = {}
+  tpu.enqueue_dma(
+      src_ref,
+      dst_ref,
+      sem,
+      source_semaphore=src_sem,
+      device_id=device_id,
+      **priority_kwarg,
+  )
   return []
+
+
 lowering_rules[tpu_primitives.dma_start_p] = _dma_start_lowering_rule
 
 
@@ -3601,10 +3628,6 @@ def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
   return []
 
 lowering_rules[tpu_primitives.dma_wait_p] = _dma_wait_lowering_rule
-
-def _device_id_lowering_rule(ctx: LoweringRuleContext):
-  return tpu.device_id()
-lowering_rules[primitives.device_id_p] = _device_id_lowering_rule
 
 def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
   grid_names = ctx.lowering_context.grid_names

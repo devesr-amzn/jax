@@ -125,6 +125,10 @@ class RefBitcaster:
       return sharding
     raise NotImplementedError
 
+  def pretty_print(self, context: core.JaxprPpContext) -> pp.Doc:
+    del context  # Unused.
+    return pp.text(f"{{bitcast({self.dtype}{list(self.shape)}])}}")
+
 
 @tree_util.register_pytree_node_class
 @dataclasses.dataclass(frozen=True)
@@ -178,6 +182,10 @@ class RefReshaper:
       return sharding
     raise NotImplementedError
 
+  def pretty_print(self, context: core.JaxprPpContext) -> pp.Doc:
+    del context  # Unused.
+    return pp.text(f"{{reshape({self.dtype}{list(self.shape)})}}")
+
 
 class Transform(Protocol):
 
@@ -204,6 +212,9 @@ class Transform(Protocol):
   def transform_sharding(self, sharding):
     if all(p is None for p in sharding.spec): return sharding # no explicit axes
     raise NotImplementedError
+
+  def pretty_print(self, context: core.JaxprPpContext) -> pp.Doc:
+    return pp.text(f"{{{self}}}")
 
 
 @dataclasses.dataclass
@@ -445,7 +456,7 @@ def shaped_array_ref(
     shape: tuple[int, ...], dtype, weak_type: bool = False) -> AbstractRef:
   return AbstractRef(core.ShapedArray(shape, dtype, weak_type=weak_type))
 
-def _shard_ref(mesh, auto, names, ref_aval: AbstractRef):
+def _shard_ref(mesh, auto, check_rep, names, ref_aval: AbstractRef):
   del mesh
   if names:
     # Can't actually shard a ref, can only close over it.
@@ -453,7 +464,7 @@ def _shard_ref(mesh, auto, names, ref_aval: AbstractRef):
   return ref_aval
 core.shard_aval_handlers[AbstractRef] = _shard_ref
 
-def _unshard_ref(mesh, names, ref_aval: AbstractRef):
+def _unshard_ref(mesh, check_rep, names, ref_aval: AbstractRef):
   del mesh
   if names:
     # Can't actually shard a ref, can only close over it.

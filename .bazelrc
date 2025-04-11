@@ -98,6 +98,7 @@ build:windows --incompatible_strict_action_env=true
 # #############################################################################
 build:nonccl --define=no_nccl_support=true
 
+build --repo_env USE_PYWRAP_RULES=1
 build:posix --copt=-fvisibility=hidden
 build:posix --copt=-Wno-sign-compare
 build:posix --cxxopt=-std=c++17
@@ -131,6 +132,8 @@ build:clang --copt=-Wno-gnu-offsetof-extensions
 build:clang --copt=-Qunused-arguments
 # Error on struct/class mismatches, since this causes link failures on Windows.
 build:clang --copt=-Werror=mismatched-tags
+# Required when building with clang>=19, see jax-ml/jax#27091
+build:clang --copt=-Wno-error=c23-extensions
 
 # Configs for CUDA
 build:cuda --repo_env TF_NEED_CUDA=1

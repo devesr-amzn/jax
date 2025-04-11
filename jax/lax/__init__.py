@@ -261,7 +261,6 @@ from jax._src.lax.special import (
   polygamma as polygamma,
   polygamma_p as polygamma_p,
   random_gamma_grad as random_gamma_grad,
-  random_gamma_grad_p as random_gamma_grad_p,
   regularized_incomplete_beta_p as regularized_incomplete_beta_p,
   zeta as zeta,
   zeta_p as zeta_p,
@@ -377,6 +376,9 @@ from jax._src.lax.parallel import (
   pswapaxes as pswapaxes,
   ragged_all_to_all as ragged_all_to_all,
   ragged_all_to_all_p as ragged_all_to_all_p,
+)
+from jax._src.core import (
+    pvary as pvary,
 )
 from jax._src.lax.other import (
   conv_general_dilated_local as conv_general_dilated_local,

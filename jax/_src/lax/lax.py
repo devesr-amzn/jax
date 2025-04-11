@@ -1953,7 +1953,7 @@ def composite_jvp(*args, **_):
   raise ValueError(
       "JVP rule for composite not implemented. You can use `jax.custom_jvp` to "
       "add support. See "
-      "https://jax.readthedocs.io/en/latest/_autosummary/jax.custom_jvp.html"
+      "https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html"
   )
 
 
@@ -1962,7 +1962,7 @@ def composite_transpose(*args, **_):
   raise ValueError(
       "Transpose rule for composite not implemented. You can use"
       "`jax.custom_jvp` or `jax.custom_vjp` to add support. See "
-      "https://jax.readthedocs.io/en/latest/_autosummary/jax.custom_jvp.html"
+      "https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html"
   )
 
 
@@ -2460,6 +2460,7 @@ DotDimensionNumbers = tuple[tuple[Sequence[int], Sequence[int]],
 def dot_general(lhs: ArrayLike, rhs: ArrayLike, dimension_numbers: DotDimensionNumbers,
                 precision: PrecisionLike = None,
                 preferred_element_type: DTypeLike | None = None,
+                *,
                 out_sharding=None) -> Array:
   """General dot product/contraction operator.
 
@@ -2667,7 +2668,7 @@ def ragged_dot_general(
   )
 
 
-def broadcast(operand: ArrayLike, sizes: Sequence[int], out_sharding=None
+def broadcast(operand: ArrayLike, sizes: Sequence[int], *, out_sharding=None
               ) -> Array:
   """Broadcasts an array, adding new leading dimensions
 
@@ -2689,7 +2690,7 @@ def broadcast(operand: ArrayLike, sizes: Sequence[int], out_sharding=None
                           out_sharding=out_sharding)
 
 def broadcast_in_dim(operand: ArrayLike, shape: Shape,
-                     broadcast_dimensions: Sequence[int], out_sharding=None
+                     broadcast_dimensions: Sequence[int], *, out_sharding=None
                      ) -> Array:
   """Wraps XLA's `BroadcastInDim
   <https://www.tensorflow.org/xla/operation_semantics#broadcastindim>`_
@@ -2732,7 +2733,7 @@ def broadcast_to_rank(x: ArrayLike, rank: int) -> Array:
 
 def reshape(operand: ArrayLike, new_sizes: Shape,
             dimensions: Sequence[int] | None = None,
-            out_sharding: NamedSharding | P | None = None) -> Array:
+            *, out_sharding: NamedSharding | P | None = None) -> Array:
   """Wraps XLA's `Reshape
   <https://www.tensorflow.org/xla/operation_semantics#reshape>`_
   operator.
@@ -3357,7 +3358,9 @@ def zeros_like_shaped_array(aval: ShapedArray) -> Array:
     scalar_zero = np.zeros((), dtype=aval.dtype)
   else:
     scalar_zero = _convert_element_type(0, aval.dtype, aval.weak_type)
-  return broadcast(scalar_zero, aval.shape, out_sharding=aval.sharding)
+  out = broadcast(scalar_zero, aval.shape, out_sharding=aval.sharding)
+  out = core.pvary(out, tuple(aval.vma))
+  return out
 
 ad_util.aval_zeros_likers[ShapedArray] = zeros_like_shaped_array
 
@@ -3378,7 +3381,7 @@ def iota(dtype: DTypeLike, size: int) -> Array:
   return broadcasted_iota(dtype, (size,), 0)
 
 def broadcasted_iota(dtype: DTypeLike, shape: Shape, dimension: int,
-                     out_sharding=None) -> Array:
+                     *, out_sharding=None) -> Array:
   """Convenience wrapper around ``iota``."""
   dtype = dtypes.canonicalize_dtype(dtype)
   shape = canonicalize_shape(shape)
@@ -4065,6 +4068,11 @@ def _nary_lower_hlo(
     out = op(*args, result_accuracy=accuracy_attr(accuracy))
   return [mlir.lower_with_sharding_in_types(ctx, out, aval_out)]
 
+def _unary_with_accuracy_pp_rule(eqn, context, settings):
+  params = dict(eqn.params)
+  if 'accuracy' in params and params['accuracy'] is None:
+    del params['accuracy']
+  return core._pp_eqn(eqn.replace(params=params), context, settings)
 
 _float = {np.floating}
 _complex = {np.complexfloating}
@@ -4127,6 +4135,7 @@ exp_p = standard_unop(_float | _complex, 'exp')
 ad.defjvp2(exp_p, lambda g, ans, x, **kwargs: mul(g, ans))
 mlir.register_lowering(exp_p, partial(_nary_lower_hlo, hlo.exponential))
 batching.ragged_prop_rules[exp_p] = batching.ragged_mask_elementwise_rule
+core.pp_eqn_rules[exp_p] = _unary_with_accuracy_pp_rule
 
 exp2_p = standard_unop(_float | _complex, 'exp2')
 ad.defjvp2(
@@ -4144,19 +4153,23 @@ def _exp2_lower(ctx, x, accuracy):
   ]
 
 mlir.register_lowering(exp2_p, _exp2_lower)
+core.pp_eqn_rules[exp2_p] = _unary_with_accuracy_pp_rule
 
 log_p = standard_unop(_float | _complex, 'log')
 ad.defjvp(log_p, lambda g, x, **kwargs: div(g, x))
 mlir.register_lowering(log_p, partial(_nary_lower_hlo, hlo.log))
+core.pp_eqn_rules[log_p] = _unary_with_accuracy_pp_rule
 
 expm1_p = standard_unop(_float | _complex, 'expm1')
 ad.defjvp2(expm1_p, lambda g, ans, x, **kwargs: mul(g, add(ans, _one(ans))))
 mlir.register_lowering(expm1_p,
                        partial(_nary_lower_hlo, hlo.exponential_minus_one))
+core.pp_eqn_rules[expm1_p] = _unary_with_accuracy_pp_rule
 
 log1p_p = standard_unop(_float | _complex, 'log1p')
 ad.defjvp(log1p_p, lambda g, x, **kwargs: div(g, add(x, _one(x))))
 mlir.register_lowering(log1p_p, partial(_nary_lower_hlo, hlo.log_plus_one))
+core.pp_eqn_rules[log1p_p] = _unary_with_accuracy_pp_rule
 
 tanh_p = standard_unop(_float | _complex, 'tanh')
 ad.defjvp2(
@@ -4164,6 +4177,7 @@ ad.defjvp2(
     lambda g, ans, x, **kwargs: mul(add(g, mul(g, ans)), sub(_one(x), ans)),
 )
 mlir.register_lowering(tanh_p, partial(_nary_lower_hlo, hlo.tanh))
+core.pp_eqn_rules[tanh_p] = _unary_with_accuracy_pp_rule
 
 logistic_p = standard_unop(_float | _complex, 'logistic')
 ad.defjvp2(
@@ -4173,13 +4187,13 @@ ad.defjvp2(
 # TODO(phawkins): switch to LogisticOp lowering; debug numerical problems.
 # mlir.register_lowering(logistic_p, partial(_nary_lower_hlo, hlo.logistic))
 
-
 def logistic_impl(x, accuracy):
   one = _const(x, 1)
   return div(one, add(one, exp(neg(x))))
 
 mlir.register_lowering(logistic_p,
                        mlir.lower_fun(logistic_impl, multiple_results=False))
+core.pp_eqn_rules[logistic_p] = _unary_with_accuracy_pp_rule
 
 def _sin_complex(x):
   # use expm1 instead of exp to avoid cancellation when abs(x) is small
@@ -4218,6 +4232,7 @@ sin_p = standard_unop(_float | _complex, 'sin')
 ad.defjvp(sin_p, lambda g, x, accuracy: mul(g, cos(x, accuracy=accuracy)))
 ad.primitive_linearizations[sin_p] = _sin_p_lin
 mlir.register_lowering(sin_p, _sin_lowering)
+core.pp_eqn_rules[sin_p] = _unary_with_accuracy_pp_rule
 batching.ragged_prop_rules[sin_p] = batching.ragged_mask_elementwise_rule
 
 def _cos_complex(x):
@@ -4243,10 +4258,12 @@ ad.defjvp(
     cos_p, lambda g, x, accuracy: neg(mul(g, sin(x, accuracy=accuracy)))
 )
 mlir.register_lowering(cos_p, _cos_lowering)
+core.pp_eqn_rules[cos_p] = _unary_with_accuracy_pp_rule
 
 tan_p = standard_unop(_float | _complex, 'tan')
 ad.defjvp2(tan_p, lambda g, ans, x, **kwargs: mul(g, add(_const(x, 1), square(ans))))
 mlir.register_lowering(tan_p, partial(_nary_lower_hlo, hlo.tan))
+core.pp_eqn_rules[tan_p] = _unary_with_accuracy_pp_rule
 
 asin_p = standard_unop(_float | _complex, 'asin')
 ad.defjvp(asin_p, lambda g, x: mul(g, rsqrt(sub(_const(x, 1), square(x)))))
@@ -4364,6 +4381,7 @@ _maybe_real = lambda x: real(x) if _iscomplex(x) else x
 sqrt_p = standard_unop(_float | _complex, 'sqrt')
 ad.defjvp2(sqrt_p, lambda g, ans, x, **kwargs: mul(g, div(_const(x, 0.5), ans)))
 mlir.register_lowering(sqrt_p, partial(_nary_lower_hlo, hlo.sqrt))
+core.pp_eqn_rules[sqrt_p] = _unary_with_accuracy_pp_rule
 
 rsqrt_p = standard_unop(_float | _complex, 'rsqrt')
 ad.defjvp2(
@@ -4371,6 +4389,7 @@ ad.defjvp2(
     lambda g, ans, x, **kwargs: mul(g, mul(_const(x, -0.5), div(ans, x))),
 )
 mlir.register_lowering(rsqrt_p, partial(_nary_lower_hlo, hlo.rsqrt))
+core.pp_eqn_rules[rsqrt_p] = _unary_with_accuracy_pp_rule
 
 cbrt_p = standard_unop(_float, 'cbrt')
 ad.defjvp2(
@@ -4380,6 +4399,7 @@ ad.defjvp2(
     ),
 )
 mlir.register_lowering(cbrt_p, partial(_nary_lower_hlo, hlo.cbrt))
+core.pp_eqn_rules[cbrt_p] = _unary_with_accuracy_pp_rule
 
 square_p = standard_unop(_int | _float | _complex, 'square')
 
@@ -7357,7 +7377,11 @@ def _select_jvp(primals, tangents):
 def _select_hlo_lowering_opaque(ctx, which, *cases):
   avals_in = ctx.avals_in
   aval_out, = ctx.avals_out
-  assert all(aval_case == aval_out for aval_case in avals_in[1:])
+  assert all((aval_case.shape, aval_case.dtype) == (aval_out.shape, aval_out.dtype)
+             for aval_case in avals_in[1:])
+  assert all(
+      aval_case == aval_out for aval_case in avals_in[1:]
+      if not aval_case.sharding.mesh.empty and not aval_out.sharding.mesh.empty)
   select_lower = _select_hlo_lowering
 
   physical_aval_out = core.physical_aval(aval_out)
@@ -8426,7 +8450,8 @@ def _propagate_mem_kind_copy(in_mem_kind):
 pxla.memory_kind_propagate_rule[copy_p] = _propagate_mem_kind_copy
 
 def rng_bit_generator(key, shape, dtype=np.uint32,
-                      algorithm=RandomAlgorithm.RNG_DEFAULT, out_sharding=None):
+                      algorithm=RandomAlgorithm.RNG_DEFAULT,
+                      *, out_sharding=None):
   """Stateless PRNG bit generator. Experimental and its use is discouraged.
 
   Returns uniformly distributed random bits with the specified shape and dtype

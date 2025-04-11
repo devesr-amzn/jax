@@ -36,6 +36,7 @@ from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.mesh import get_abstract_mesh
+from jax._src.core import pvary
 from jax._src.lax import lax
 from jax._src.lax import slicing
 from jax._src.lib.mlir import ir
@@ -117,6 +118,8 @@ def psum(x, axis_name, *, axis_index_groups=None):
   """
   if not isinstance(axis_name, (tuple, list)):
     axis_name = (axis_name,)
+  if not axis_name:
+    return x
   if any(isinstance(axis, int) for axis in axis_name) and axis_index_groups is not None:
     raise ValueError("axis_index_groups only supported for sums over just named axes")
   _validate_reduce_axis_index_groups(axis_index_groups)
@@ -141,9 +144,26 @@ def psum(x, axis_name, *, axis_index_groups=None):
       size = math.prod([core.get_axis_env().axis_size(name) for name in named_axes])
     out_flat = tuple(lax._const(leaf, size) * pos_reduce(leaf) for leaf in leaves)
   else:
-    out_flat = psum_p.bind(
-        *leaves, axes=tuple(axis_name), axis_index_groups=axis_index_groups)
+    if config.varying_axes_in_types.value and config._check_rep.value:
+      out_flat = bind_psum_invariant(
+          leaves, axes=tuple(axis_name), axis_index_groups=axis_index_groups)
+    else:
+      out_flat = psum_p.bind(
+          *leaves, axes=tuple(axis_name), axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, out_flat)
+
+def bind_psum_invariant(leaves, *, axes, axis_index_groups):
+  if axis_index_groups is not None:
+    raise NotImplementedError
+  axes_ = frozenset(axes)
+  args_ = []
+  for x in leaves:
+    in_vma = core.get_aval(x).vma
+    args_.append(pvary(x, tuple(pbroadcast_names))
+                 if (pbroadcast_names := axes_ - in_vma) else x)
+  return psum_invariant_p.bind(*args_, axes=axes,
+                               axis_index_groups=axis_index_groups)
+
 
 def pmean(x, axis_name, *, axis_index_groups=None):
   """Compute an all-reduce mean on ``x`` over the pmapped axis ``axis_name``.
@@ -204,7 +224,7 @@ def pmax(x, axis_name, *, axis_index_groups=None):
   _validate_reduce_axis_index_groups(axis_index_groups)
   leaves, treedef = tree_util.tree_flatten(x)
   axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
-  leaves = map(partial(insert_collective_pbroadcast, axis_name), leaves)
+  leaves = map(partial(insert_collective_pvary, axis_name), leaves)
   out_flat = pmax_p.bind(*leaves, axes=axis_name,
                          axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, out_flat)
@@ -235,7 +255,7 @@ def pmin(x, axis_name, *, axis_index_groups=None):
   _validate_reduce_axis_index_groups(axis_index_groups)
   leaves, treedef = tree_util.tree_flatten(x)
   axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
-  leaves = map(partial(insert_collective_pbroadcast, axis_name), leaves)
+  leaves = map(partial(insert_collective_pvary, axis_name), leaves)
   out_flat = pmin_p.bind(*leaves, axes=axis_name,
                          axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, out_flat)
@@ -330,7 +350,7 @@ def ppermute(x, axis_name, perm):
   if not isinstance(axis_name, (list, tuple)):
     axis_name = (axis_name,)
   def bind(leaf):
-    leaf = insert_collective_pbroadcast(axis_name, leaf)
+    leaf = insert_collective_pvary(axis_name, leaf)
     return ppermute_p.bind(leaf, axis_name=axis_name, perm=tuple(map(tuple, perm)))
   return tree_util.tree_map(bind, x)
 
@@ -452,7 +472,7 @@ def all_to_all(x, axis_name, split_axis, concat_axis, *, axis_index_groups=None,
       else:  # concat_axis < split_axis
         x = lax.expand_dims(x, (concat_axis,))  # insert the new axis
         split_axis += 1   # we have a new axis before split_axis now
-    x = insert_collective_pbroadcast(axis_name, x)
+    x = insert_collective_pvary(axis_name, x)
     result = all_to_all_p.bind(x, split_axis=split_axis, concat_axis=concat_axis,
                                axis_name=axis_name,
                                axis_index_groups=axis_index_groups,
@@ -806,8 +826,11 @@ def _allreduce_effectful_abstract_eval(*args, axes, axis_index_groups):
   ]
   return out_avals, {core.NamedAxisEffect(axis) for axis in named_axes}
 
-def _psum2_abstract_eval(name, *args, axes, axis_index_groups):
+def _psum_invariant_abstract_eval(name, *args, axes, axis_index_groups):
   if not config.varying_axes_in_types.value:
+    return psum_p.abstract_eval(
+        *args, axes=axes, axis_index_groups=axis_index_groups)
+  if not config._check_rep.value:
     return psum_p.abstract_eval(
         *args, axes=axes, axis_index_groups=axis_index_groups)
 
@@ -840,13 +863,16 @@ def _psum2_abstract_eval(name, *args, axes, axis_index_groups):
   ]
   return out_avals, {core.NamedAxisEffect(axis) for axis in named_axes}
 
-# TODO(yashkatariya): Replace this with _psum2_abstract_eval
+# TODO(yashkatariya): Replace this with _psum_invariant_abstract_eval
 def _pmin_pmax_abstract_eval(name, *args, axes, axis_index_groups):
   if not config.varying_axes_in_types.value:
     return _allreduce_effectful_abstract_eval(
         *args, axes=axes, axis_index_groups=axis_index_groups)
-  return _psum2_abstract_eval(name, *args, axes=axes,
-                              axis_index_groups=axis_index_groups)
+  if not config._check_rep.value:
+    return _allreduce_effectful_abstract_eval(
+        *args, axes=axes, axis_index_groups=axis_index_groups)
+  return _psum_invariant_abstract_eval(
+      name, *args, axes=axes, axis_index_groups=axis_index_groups)
 
 def _check_axis_names(axes):
   named_axes = tuple(axis for axis in axes if not isinstance(axis, int))
@@ -1356,24 +1382,50 @@ def _ragged_all_to_all_transpose(
     output_t = jax.numpy.where(mask, 0, t)
   return [operand_t, output_t] + [None] * 4
 
+def _ragged_all_to_all_batched_collective(axis_data, vals_in, dims_in,
+                                          axis_name, axis_index_groups):
+  del axis_data
+  if axis_index_groups:
+    raise NotImplementedError("Please open a feature request!")
+
+  operand, output, input_offsets, send_sizes, output_offsets, recv_sizes = vals_in
+  operand_dim, output_dim, input_offsets_dim, send_sizes_dim, output_offsets_dim, recv_sizes_dim = dims_in
+  if not (operand.shape[operand_dim] == output.shape[output_dim] == input_offsets.shape[input_offsets_dim] == send_sizes.shape[send_sizes_dim] == output_offsets.shape[output_offsets_dim] == recv_sizes.shape[recv_sizes_dim]):
+    raise ValueError("all operands must have the same batch sizes")
+
+  sliced_results = []
+  for i in range(operand.shape[operand_dim]):
+    sliced_operand = slicing.slice_in_dim(operand, start_index=i, limit_index=i+1, axis=operand_dim).flatten()
+    sliced_output = slicing.slice_in_dim(output, start_index=i, limit_index=i+1, axis=output_dim).flatten()
+    sliced_input_offsets = slicing.slice_in_dim(input_offsets, start_index=i, limit_index=i+1, axis=input_offsets_dim).flatten()
+    sliced_send_sizes = slicing.slice_in_dim(send_sizes, start_index=i, limit_index=i+1, axis=send_sizes_dim).flatten()
+    sliced_output_offsets = slicing.slice_in_dim(output_offsets, start_index=i, limit_index=i+1, axis=output_offsets_dim).flatten()
+    sliced_recv_sizes = slicing.slice_in_dim(recv_sizes, start_index=i, limit_index=i+1, axis=recv_sizes_dim).flatten()
+    sliced_result = ragged_all_to_all(sliced_operand, sliced_output, sliced_input_offsets, sliced_send_sizes, sliced_output_offsets, sliced_recv_sizes, axis_name=axis_name, axis_index_groups=axis_index_groups)
+    sliced_result = lax.expand_dims(sliced_result, dimensions=(output_dim,))
+    sliced_results.append(sliced_result)
+
+  concat_result = lax.concatenate(sliced_results, dimension=output_dim)
+  return concat_result, operand_dim
+
 ragged_all_to_all_p = core.Primitive('ragged_all_to_all')
 ragged_all_to_all_p.def_effectful_abstract_eval(_ragged_all_to_all_effectful_abstract_eval)
 ad.primitive_jvps[ragged_all_to_all_p] = _ragged_all_to_all_jvp
 ad.primitive_transposes[ragged_all_to_all_p] = _ragged_all_to_all_transpose
 mlir.register_lowering(ragged_all_to_all_p, _ragged_all_to_all_lowering)
+batching.fancy_primitive_batchers[ragged_all_to_all_p] = _ragged_all_to_all_batched_collective
 batching.skippable_batchers[ragged_all_to_all_p] = partial(_names_in_param, 'axis_name')
 
-def insert_collective_pbroadcast(axis_name, x):
+def insert_collective_pvary(axis_name, x):
   if not config.varying_axes_in_types.value:
     return x
+  if not config._check_rep.value:
+    return x
 
-  from jax.experimental import shard_map
   axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
   aval = core.get_aval(x)
   names_union = set(axis_name) | aval.vma
-  pbroadcast_axis_name = tuple(n for n in names_union if n not in aval.vma)
-  if pbroadcast_axis_name:
-    x = shard_map.pbroadcast(x, pbroadcast_axis_name)
+  x = pvary(x, tuple(n for n in names_union if n not in aval.vma))
   return x
 
 def all_gather(x, axis_name, *, axis_index_groups=None, axis=0, tiled=False):
@@ -1445,7 +1497,7 @@ def all_gather(x, axis_name, *, axis_index_groups=None, axis=0, tiled=False):
   axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
   axis_size = psum(1, axis_name, axis_index_groups=axis_index_groups)
   def bind(leaf):
-    leaf = insert_collective_pbroadcast(axis_name, leaf)
+    leaf = insert_collective_pvary(axis_name, leaf)
     return all_gather_p.bind(
         leaf,
         all_gather_dimension=canonicalize_axis(
@@ -1500,6 +1552,8 @@ def _all_gather_lowering(ctx, x, *, all_gather_dimension, axis_name,
 
 def collective_vma_rule(prim_name, axis_name, x_aval):
   if not config.varying_axes_in_types.value:
+    return frozenset()
+  if not config._check_rep.value:
     return frozenset()
   axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
   if any(a not in x_aval.vma for a in axis_name):
@@ -1808,7 +1862,7 @@ def psum_scatter(x, axis_name, *, scatter_dimension=0, axis_index_groups=None,
   axis_size = psum(1, axis_name, axis_index_groups=axis_index_groups)
   axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
   def bind(leaf):
-    leaf = insert_collective_pbroadcast(axis_name, leaf)
+    leaf = insert_collective_pvary(axis_name, leaf)
     return reduce_scatter_p.bind(
         leaf, axis_name=axis_name, scatter_dimension=scatter_dimension,
         axis_index_groups=axis_index_groups, axis_size=axis_size, tiled=tiled)
@@ -1861,13 +1915,14 @@ def _axis_index_lowering(ctx, *, axis_name):
                                          ctx.module_context.axis_env)]
 
 def _axis_index_effectful_abstract_eval(*, axis_name):
-  axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
   effect = {core.NamedAxisEffect(axis_name)}
+  axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
   _check_axis_names(axis_name)
   mesh = get_abstract_mesh()
   sharding = NamedSharding(mesh, P())
   vma = ((frozenset(axis_name) if mesh._any_axis_manual else frozenset())
-         if config.varying_axes_in_types.value else frozenset())
+         if config.varying_axes_in_types.value and config._check_rep.value
+         else frozenset())
   return ShapedArray((), np.int32, sharding=sharding, vma=vma), effect
 
 def _axis_index_batcher(axis_data, vals_in, dims_in, *, axis_name):
@@ -1942,3 +1997,19 @@ mlir.register_lowering(pgather_p, _pgather_parallel_lowering)
 # TODO: Transpose? That requires adding pscatter...
 batching.fancy_primitive_batchers[pgather_p] = _pgather_collective_batcher
 batching.skippable_batchers[pgather_p] = partial(_names_in_param, 'axes')
+
+psum_invariant_p = core.Primitive('psum_invariant')
+psum_invariant_p.multiple_results = True
+psum_invariant_p.def_impl(psum_p.impl)
+psum_invariant_p.def_effectful_abstract_eval(
+    partial(_psum_invariant_abstract_eval, psum_invariant_p.name))
+mlir.register_lowering(psum_invariant_p, mlir._lowerings[psum_p])
+batching.fancy_primitive_batchers[psum_invariant_p] = partial(
+    _batched_reduction_collective, psum_invariant_p,
+    lambda v, axis_size: axis_size * v)
+batching.skippable_batchers[psum_invariant_p] = partial(_names_in_param, 'axes')
+
+def _psum_invariant_transpose_rule(cts, *args, axes, axis_index_groups):
+  del args
+  return core.pvary_p.bind(*cts, axes=axes, axis_index_groups=axis_index_groups)
+ad.deflinear2(psum_invariant_p, _psum_invariant_transpose_rule)

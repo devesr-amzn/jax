@@ -272,7 +272,6 @@ class TraceAnnotation(xla_client.profiler.TraceMe):
   This will cause a "my_label" event to show up on the trace timeline if the
   event occurs while the process is being traced.
   """
-  pass
 
 
 class StepTraceAnnotation(TraceAnnotation):
@@ -333,7 +332,6 @@ def annotate_function(func: Callable, name: str | None = None,
   def wrapper(*args, **kwargs):
     with TraceAnnotation(name, **decorator_kwargs):
       return func(*args, **kwargs)
-    return wrapper
   return wrapper
 
 

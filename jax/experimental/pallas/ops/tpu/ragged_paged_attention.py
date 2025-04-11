@@ -129,7 +129,7 @@ def ref_ragged_paged_attention(
   return jnp.concatenate(outputs, axis=0)
 
 
-# Expect to run these checkes during runtime.
+# Expect to run these checks during runtime.
 def validate_dynamic_inputs(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
     kv_pages: jax.Array,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
@@ -283,19 +283,19 @@ def ragged_paged_attention_kernel(
   # 2. Support arbitrary strided load/store for any last dimension.
   def strided_load_kv(ref, start, step):
     if ref.dtype == jnp.float32:
-      return ref[start::step, :]
+      return ref[start::step, :], ref[start + 1 :: step, :]
     packing = get_dtype_packing(ref.dtype)
     assert ref.dtype == jnp.bfloat16
     assert step % packing == 0
     b_start = start // packing
-    b_offset = start % packing
     b_step = step // packing
-    b_ref = ref.bitcast(jnp.int32)
+    b_ref = ref.bitcast(jnp.uint32)
     b = b_ref[b_start::b_step, :]
-    bw = 32 // packing
-    b = jnp.right_shift(b, bw * b_offset)
-    b = jnp.left_shift(b, bw * (packing - 1))
-    return pltpu.bitcast(b, jnp.float32).astype(jnp.bfloat16)
+    bk = b << 16
+    bv = b & jnp.uint32(0xffff0000)
+    k = pltpu.bitcast(bk, jnp.float32).astype(jnp.bfloat16)
+    v = pltpu.bitcast(bv, jnp.float32).astype(jnp.bfloat16)
+    return k, v
 
   def fold_on_2nd_minor(vec):
     assert vec.dtype == jnp.bfloat16 or vec.dtype == jnp.float32
@@ -315,7 +315,9 @@ def ragged_paged_attention_kernel(
 
   def is_cur_q_blk_needed(q_states):
     done, cur_seq_idx, _ = q_states
-    return jnp.logical_and(done == 0, cur_seq_idx < num_seqs)
+    should_run = jnp.logical_and(q_len_start < cu_q_lens_ref[num_seqs],
+                                 cur_seq_idx < num_seqs)
+    return jnp.logical_and(done == 0, should_run)
 
   def compute_with_cur_q_blk(q_states):
     done, cur_seq_idx, cur_buf_idx = q_states
@@ -535,11 +537,8 @@ def ragged_paged_attention_kernel(
         q = fold_on_2nd_minor(
             q_ref[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :]
         )
-        k = strided_load_kv(
+        k, v = strided_load_kv(
             kv_ref, kv_head_idx * 2, num_combined_kv_heads_per_blk
-        )
-        v = strided_load_kv(
-            kv_ref, kv_head_idx * 2 + 1, num_combined_kv_heads_per_blk
         )
         flash_attention(
             q,
@@ -680,14 +679,14 @@ def ragged_paged_attention(
   validate_static_inputs(q, kv_pages, kv_lens, page_indices, cu_q_lens, num_seqs, sliding_window, soft_cap)
   if mask_value is None:
     mask_value = DEFAULT_MASK_VALUE
-  _, num_q_heads, head_dim = q.shape
+  num_q_tokens, num_q_heads, head_dim = q.shape
   _, page_size, num_combined_kv_heads, _ = kv_pages.shape
   assert num_combined_kv_heads % 2 == 0
   num_kv_heads = num_combined_kv_heads // 2
   num_q_per_blk = num_queries_per_block
   num_kv_pages_per_blk = num_kv_pages_per_block
   num_q_heads_per_kv_head = num_q_heads // num_kv_heads
-  num_q_blks = cdiv(cu_q_lens[num_seqs[0]], num_q_per_blk)
+  num_q_blks = cdiv(num_q_tokens, num_q_per_blk)
   num_q_heads_per_blk, num_combined_kv_heads_per_blk = get_min_heads_per_blk(
       num_q_heads, num_combined_kv_heads, q.dtype, kv_pages.dtype
   )

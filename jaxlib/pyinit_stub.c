@@ -1,4 +1,4 @@
-/* Copyright 2022 The JAX Authors
+/* Copyright 2025 The JAX Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,16 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef JAXLIB_XLA_WEAKREF_LRU_CACHE_H_
-#define JAXLIB_XLA_WEAKREF_LRU_CACHE_H_
+// Stub that reexports Wrapped_PyInit_module as PyInit_module.
 
-// placeholder for index annotation headers
-#include "nanobind/nanobind.h"
+extern void* Wrapped_PyInit_@MODULE_NAME@();
 
-namespace jax {
+#if defined(WIN32) || defined(_WIN32)
+#define EXPORT_SYMBOL __declspec(dllexport)
+#else
+#define EXPORT_SYMBOL __attribute__ ((visibility("default")))
+#endif
 
-void BuildWeakrefLRUCacheAPI(nanobind::module_& m);
-
-}  // namespace jax
-
-#endif  // JAXLIB_XLA_WEAKREF_LRU_CACHE_H_
+EXPORT_SYMBOL void* PyInit_@MODULE_NAME@() {
+  return Wrapped_PyInit_@MODULE_NAME@();
+}

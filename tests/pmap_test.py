@@ -2082,8 +2082,8 @@ class PythonPmapTest(jtu.JaxTestCase):
 
     x = jnp.arange(1.)
     jaxpr = jax.make_jaxpr(jax.linearize(f, x)[1])(x)
-    self.assertIn(' sin[', str(jaxpr))
-    self.assertIn(' cos[', str(jaxpr))
+    self.assertIn(' sin ', str(jaxpr))
+    self.assertIn(' cos ', str(jaxpr))
 
   @parameterized.named_parameters(
       {"testcase_name": f"{suffix}", "remat": remat}
@@ -2100,24 +2100,24 @@ class PythonPmapTest(jtu.JaxTestCase):
     _, f_vjp = jax.vjp(f, x)
     jaxpr = f_vjp.args[0].func.args[1]
     jaxpr_text = str(jaxpr)
-    self.assertEqual(jaxpr_text.count(' sin['), 0)
-    self.assertEqual(jaxpr_text.count(' cos['), 0)
+    self.assertEqual(jaxpr_text.count(' sin '), 0)
+    self.assertEqual(jaxpr_text.count(' cos '), 0)
 
     save_sin = lambda prim, *_, **__: str(prim) == 'sin'
     f = remat(g, policy=save_sin)
     _, f_vjp = jax.vjp(f, x)
     jaxpr = f_vjp.args[0].func.args[1]
     jaxpr_text = str(jaxpr)
-    self.assertEqual(jaxpr_text.count(' sin['), 0)
-    self.assertEqual(jaxpr_text.count(' cos['), 2)
+    self.assertEqual(jaxpr_text.count(' sin '), 0)
+    self.assertEqual(jaxpr_text.count(' cos '), 2)
 
     save_nothing = lambda prim, *_, **__: False
     f = remat(g, policy=save_nothing)
     _, f_vjp = jax.vjp(f, x)
     jaxpr = f_vjp.args[0].func.args[1]
     jaxpr_text = str(jaxpr)
-    self.assertEqual(jaxpr_text.count(' sin['), 1)
-    self.assertEqual(jaxpr_text.count(' cos['), 2)
+    self.assertEqual(jaxpr_text.count(' sin '), 1)
+    self.assertEqual(jaxpr_text.count(' cos '), 2)
 
   def test_axis_name_shadowing_with_vmap(self):
     # vmap-of-pmap with mismatched axis sizes
@@ -3189,7 +3189,7 @@ class EagerPmapMixin:
   def setUp(self):
     super().setUp()
     stack = contextlib.ExitStack()
-    stack.enter_context(jtu.thread_local_config_context(jax_disable_jit=True, jax_eager_pmap=True))
+    stack.enter_context(jtu.thread_local_config_context(jax_disable_jit=True))
     stack.enter_context(jtu.ignore_warning(
         message="Some donated buffers were not usable", category=UserWarning))
     self.addCleanup(stack.close)

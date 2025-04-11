@@ -30,6 +30,12 @@ JaxValueError = error_check.JaxValueError
 
 
 class JaxNumpyErrorTests(jtu.JaxTestCase):
+  def setUp(self):
+    # TODO(b/408148001): Fix thread safety issue.
+    if jtu.TEST_NUM_THREADS.value > 1:
+      self.skipTest("Test does not work with multiple threads")
+    super().setUp()
+
   @parameterized.product(jit=[True, False])
   def test_set_error_if_nan(self, jit):
     def f(x):
@@ -229,6 +235,42 @@ class JaxNumpyErrorTests(jtu.JaxTestCase):
 
       div_func(*args_err)
       with self.assertRaisesRegex(JaxValueError, "Division by zero"):
+        error_check.raise_if_error()
+
+  @parameterized.product(jit=[True, False])
+  def test_can_raise_oob_error_take(self, jit):
+    def f(x, a):
+      return x[a]
+
+    if jit:
+      f = jax.jit(f)
+
+    x = jnp.arange(10)
+    a = jnp.int32(10)
+
+    with jnp_error.error_checking_behavior(oob="ignore"):
+      f(x, a)
+      error_check.raise_if_error()  # should not raise error
+
+    with jnp_error.error_checking_behavior(oob="raise"):
+      f(x, a)
+      with self.assertRaisesRegex(JaxValueError, "Out of bounds"):
+        error_check.raise_if_error()
+
+  def test_can_raise_oob_error_dynamic_slice(self):
+    def f(x, a):
+      return x[:, a:a+4]  # dynamic indices are non-jittable
+
+    x = jnp.arange(10).reshape(2, 5)
+    a = jnp.array(3, dtype=jnp.int32)
+
+    with jnp_error.error_checking_behavior(oob="ignore"):
+      f(x, a)
+      error_check.raise_if_error()  # should not raise error
+
+    with jnp_error.error_checking_behavior(oob="raise"):
+      f(x, a)
+      with self.assertRaisesRegex(JaxValueError, "Out of bounds"):
         error_check.raise_if_error()
 
 

@@ -171,6 +171,7 @@ def generate_test_cases(op_names):
 
 
 @unittest.skipIf(not jtu.is_device_tpu(), "Skipping test on non TPU devices.")
+@jtu.skip_if_stablehlo_version_less_than("1.10.0")
 class UnaryOpsAccuracyTest(jtu.JaxTestCase):
 
   def test_result_accuracy_mode_attr(self):
@@ -253,7 +254,7 @@ class UnaryOpsAccuracyTest(jtu.JaxTestCase):
   @parameterized.named_parameters(
       *generate_test_cases(["exp", "expm1", "exp2"])
   )
-  def test_diff_grad(self, op, x, tp,  **kwargs):
+  def test_diff_grad(self, op, x, tp, **kwargs):
     @jax.jit
     def f_default(x):
       default_op = op(x, accuracy=tp.low)
@@ -367,6 +368,28 @@ class UnaryOpsAccuracyTest(jtu.JaxTestCase):
         xla_extension.XlaRuntimeError, "impl_type.ok()"
     ):
       op(x, accuracy=lax.Tolerance(atol=1e-60, rtol=1e-60, ulps=0))
+
+  def test_accuracy_jaxpr(self):
+    # Since accuracy is not set, the jaxpr should not contain "accuracy".
+    self.assertNotIn(
+        "accuracy",
+        str(
+            jax.make_jaxpr(lambda x: lax.exp(x, accuracy=None))(
+                np.arange(4.0, dtype=np.float32)
+            )
+        ),
+    )
+    # Set accuracy.
+    self.assertIn(
+        "accuracy",
+        str(
+            jax.make_jaxpr(
+                lambda x: lax.exp(
+                    x, accuracy=lax.Tolerance(atol=1e-60, rtol=1e-60, ulps=0)
+                )
+            )(np.arange(4.0, dtype=np.float32))
+        ),
+    )
 
 
 if __name__ == "__main__":

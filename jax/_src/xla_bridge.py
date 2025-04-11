@@ -134,7 +134,7 @@ def tpu_client_timer_callback(timer_secs: float) -> xla_client.Client | None:
     warnings.warn(
       f'TPU backend initialization is taking more than {timer_secs} seconds. '
       'Did you run your code on all TPU hosts? '
-      'See https://jax.readthedocs.io/en/latest/multi_process.html '
+      'See https://docs.jax.dev/en/latest/multi_process.html '
       'for more information.')
 
   # Will log a warning after `timer_secs`.
@@ -290,7 +290,7 @@ def _check_cuda_compute_capability(devices_to_check):
         f"Device {idx} has CUDA compute capability {compute_cap/10} which is "
         "lower than the minimum supported compute capability "
         f"{MIN_COMPUTE_CAPABILITY/10}. See "
-        "https://jax.readthedocs.io/en/latest/installation.html#nvidia-gpu for "
+        "https://docs.jax.dev/en/latest/installation.html#nvidia-gpu for "
         "more details",
         RuntimeWarning
       )
@@ -636,6 +636,8 @@ def register_plugin(
         'node_id': distributed.global_state.process_id,
         'num_nodes': distributed.global_state.num_processes,
     }
+    if (slice_index := distributed.global_state.slice_index) is not None:
+      distribute_options['slice_index'] = slice_index
     if options is not None:
       distribute_options.update(updated_options)
     return xla_client.make_c_api_client(
@@ -897,7 +899,7 @@ def _suggest_missing_backends():
         warning_msg += (
           "This may be due to JAX pre-allocating too much device "
           "memory, leaving too little for CUDA library initialization. See "
-          "https://jax.readthedocs.io/en/latest/gpu_memory_allocation.html "
+          "https://docs.jax.dev/en/latest/gpu_memory_allocation.html "
           "for more details and potential workarounds."
         )
       warning_msg += "(Set TF_CPP_MIN_LOG_LEVEL=0 and rerun for more info.)"
@@ -1084,6 +1086,16 @@ def backend_xla_version(platform=None) -> int | None:
   backend = get_backend(platform)
   return getattr(backend, "xla_version", None)
 
+def backend_stablehlo_version(platform=None) -> int | None:
+  """Returns the StableHLO version of the backend.
+
+  Returns None if the backend does not use PJRT C API or does not have
+  stablehlo_current_version in the plugin attributes. This methon can be used to
+  skip features that are not available before certain stablehlo_current_version
+  if the backend is a plugin and uses stablehlo_current_version.
+  """
+  backend = get_backend(platform)
+  return getattr(backend, "stablehlo_current_version", None)
 
 @lru_cache
 def local_devices(process_index: int | None = None,

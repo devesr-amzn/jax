@@ -272,7 +272,7 @@ def convert(fun_jax: Callable,
       should be `None` (monomorphic argument), or a Python object with the
       same pytree structure as the argument.
       See [how optional parameters are matched to
-      arguments](https://jax.readthedocs.io/en/latest/pytrees.html#applying-optional-parameters-to-pytrees).
+      arguments](https://docs.jax.dev/en/latest/pytrees.html#applying-optional-parameters-to-pytrees).
 
       A shape specification for an array argument should be an object
       `PolyShape(dim0, dim1, ..., dimn)`
@@ -3173,12 +3173,11 @@ tf_impl_with_avals[lax.scan_p] = _convert_jax_impl(
     lax_control_flow._scan_impl,
     extra_name_stack="scan")
 
-tf_impl_with_avals[ad_checkpoint.remat_p] = \
-  _convert_jax_impl(partial(ad_checkpoint.remat_expansion,
-                            # TODO: jax2tf cannot discriminate by platform
-                            is_gpu_platform=False),
-                    multiple_results=True,
-                    extra_name_stack="checkpoint")
+tf_impl_with_avals[ad_checkpoint.remat_p] = _convert_jax_impl(
+    ad_checkpoint.remat_expansion,
+    multiple_results=True,
+    extra_name_stack="checkpoint",
+)
 
 tf_impl[ad_checkpoint.name_p] = lambda x, *, name: x
 
