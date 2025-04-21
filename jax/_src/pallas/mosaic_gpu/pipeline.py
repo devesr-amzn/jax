@@ -40,6 +40,19 @@ import jax.numpy as jnp
 map = util.safe_map
 zip = util.safe_zip
 
+def _get_block_size(bd: pl.Blocked | pl.Element | pl.Squeezed | int | None
+                    ) -> int:
+  match bd:
+    case int():
+      return bd
+    case pl.Blocked(block_size):
+      return block_size
+    case _:
+      raise NotImplementedError(f"Unsupported block size type: {type(bd)}")
+
+def _get_block_shape(spec: pallas_core.BlockSpec):
+  assert spec.block_shape is not None
+  return tuple(_get_block_size(bd) for bd in spec.block_shape)
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -64,10 +77,11 @@ class BufferedRef:
     # We don't allow Python scalars here, because they are interpreted
     # differently depending on the x32/x64 mode.
     assert all(i.dtype == jnp.dtype(jnp.int32) for i in grid_indices)
+    sizes = _get_block_shape(self.spec)
     return tuple(
         pl.Slice(idx * size, size)  # type: ignore[arg-type]
         for idx, size in zip(
-            index_map(*grid_indices), self.spec.block_shape  # type: ignore[arg-type]
+            index_map(*grid_indices), sizes  # type: ignore[arg-type]
         )
     )
 
@@ -201,7 +215,7 @@ def emit_pipeline(
     in_smem_refs, out_smem_refs = util.split_list(
         [
             gpu_core.SMEM(
-                (max_concurrent_steps, *spec.block_shape),  # type: ignore
+                (max_concurrent_steps, *_get_block_shape(spec)),  # type: ignore
                 ref.dtype,
                 transforms=tuple(
                     t.batch(1) for t in getattr(spec, "transforms", ())
@@ -655,8 +669,10 @@ def emit_pipeline_warp_specialized(
           buf_slot = _get_slot(step, not bref.is_index_invariant)
           bref.copy_in(buf_slot, indices, barrier)
         return _inc_grid_by_1(indices, grid)
-      # TODO(apaszke): Unroll when grid is static (need support in lowering).
-      indices = jax.lax.fori_loop(0, prologue_steps, _init_step, indices)
+
+      indices = jax.lax.fori_loop(
+          0, prologue_steps, _init_step, indices, unroll=not has_dynamic_grid
+      )
 
       def memory_loop_body(step, carry):
         indices, = carry
@@ -687,8 +703,9 @@ def emit_pipeline_warp_specialized(
       def _epi_step(step, _):
         for barrier in consumed_barrier_refs:
           gpu_primitives.barrier_wait(barrier.at[step])
-      # TODO(apaszke): Unroll when grid is static (need support in lowering).
-      jax.lax.fori_loop(0, prologue_steps, _epi_step, None)
+      jax.lax.fori_loop(
+          0, prologue_steps, _epi_step, None, unroll=not has_dynamic_grid
+      )
 
     wg_idx = lax.axis_index(wg_axis)
     lax.cond(

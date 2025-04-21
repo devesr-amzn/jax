@@ -19,11 +19,11 @@ from setuptools import setup, find_packages
 
 project_name = 'jax'
 
-_current_jaxlib_version = '0.5.3'
+_current_jaxlib_version = '0.6.0'
 # The following should be updated after each new jaxlib release.
-_latest_jaxlib_version_on_pypi = '0.5.3'
+_latest_jaxlib_version_on_pypi = '0.6.0'
 
-_libtpu_version = '0.0.11.*'
+_libtpu_version = '0.0.13.*'
 
 def load_version_module(pkg_path):
   spec = importlib.util.spec_from_file_location(
@@ -89,24 +89,17 @@ setup(
 
         'cuda': [
           f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-cuda12-plugin[with_cuda]>={_current_jaxlib_version},<={_jax_version}",
+          f"jax-cuda12-plugin[with-cuda]>={_current_jaxlib_version},<={_jax_version}",
         ],
 
         'cuda12': [
           f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-cuda12-plugin[with_cuda]>={_current_jaxlib_version},<={_jax_version}",
-        ],
-
-        # Deprecated alias for cuda12, kept to avoid breaking users who wrote
-        # cuda12_pip in their CI.
-        'cuda12_pip': [
-          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-cuda12-plugin[with_cuda]>={_current_jaxlib_version},<={_jax_version}",
+          f"jax-cuda12-plugin[with-cuda]>={_current_jaxlib_version},<={_jax_version}",
         ],
 
         # Target that does not depend on the CUDA pip wheels, for those who want
         # to use a preinstalled CUDA.
-        'cuda12_local': [
+        'cuda12-local': [
           f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
           f"jax-cuda12-plugin>={_current_jaxlib_version},<={_jax_version}",
         ],

@@ -669,6 +669,12 @@ def _export_lowered(
     # For pmap
     module_kept_var_idx = tuple(range(len(args_avals_flat)))
   shape_poly_state = lowering.compile_args["shape_poly_state"]
+
+  # Make a copy of mlir module as we should not mutate it
+  # because it may be cached
+  context = mlir.make_ir_context()
+  with context, ir.Location.unknown(context):
+    mlir_module = ir.Module.parse(mlir.module_to_bytecode(mlir_module))
   if (not all(core.is_constant_shape(a.shape) for a in args_avals_flat)
       or lowering.compile_args.get("ordered_effects", [])):
     mlir_module = _wrap_main_func(
@@ -840,7 +846,7 @@ def _wrap_main_func(
   See calling convention documentation https://docs.jax.dev/en/latest/export/export.html#module-calling-convention.
 
   Args:
-    module: the HLO module as obtained from lowering.
+    module: a copy of HLO module as obtained from lowering.
     args_avals_flat: the avals for all the arguments of the lowered function,
       which correspond to the array arguments of the `module`.
     args_kwargs_tree: the PyTreeDef corresponding to `(args, kwargs)`, for error
@@ -854,10 +860,9 @@ def _wrap_main_func(
   Returns the wrapped module, without dimension and token arguments.
   """
   dim_vars = shape_poly.all_dim_vars(args_avals_flat)
-  context = mlir.make_ir_context()
+  context = module.context
+  wrapped_module = module
   with context, ir.Location.unknown(context):
-    # Make a copy, do not mutate because it may be cached
-    wrapped_module = ir.Module.parse(mlir.module_to_bytecode(module))
     symbol_table = ir.SymbolTable(wrapped_module.operation)
     orig_main = symbol_table["main"]
     orig_main.attributes["sym_visibility"] = ir.StringAttr.get("private")
@@ -1086,14 +1091,8 @@ _CUSTOM_CALL_TARGETS_GUARANTEED_STABLE = {
     "cu_threefry2x32_ffi",
     # Triton IR does not guarantee stability.
     # "__gpu$xla.gpu.triton",
-    # cholesky on CPU
-    "lapack_spotrf", "lapack_dpotrf", "lapack_cpotrf", "lapack_zpotrf",
     # eigh on TPU
     "Eigh",
-    # eig on CPU
-    "lapack_sgeev", "lapack_dgeev", "lapack_cgeev", "lapack_zgeev",
-    # svd on CPU
-    "lapack_sgesdd", "lapack_dgesdd", "lapack_cgesdd", "lapack_zgesdd",
     # qr and svd on TPU
     "Qr", "ProductOfElementaryHouseholderReflectors",
     # triangular_solve on CPU
@@ -1102,8 +1101,6 @@ _CUSTOM_CALL_TARGETS_GUARANTEED_STABLE = {
     "lapack_sgees", "lapack_dgees", "lapack_cgees", "lapack_zgees",
     # tridiagonal on CPU
     "lapack_ssytrd", "lapack_dsytrd", "lapack_chetrd", "lapack_zhetrd",
-    # hessenberg on CPU
-    "lapack_sgehrd", "lapack_dgehrd", "lapack_cgehrd", "lapack_zgehrd",
     # lu on TPU
     "LuDecomposition",
     # ApproxTopK on TPU
@@ -1220,10 +1217,11 @@ def _hlo_sharding_to_xla_compatible_sharding(
 
 def _hlo_sharding_to_gspmd_sharding(
     hlo_sharding: HloSharding | None,
-    device_assignment: Sequence[jax.Device]) -> sharding.GSPMDSharding | None:
+    device_assignment: Sequence[jax.Device]
+    ) -> sharding_impls.GSPMDSharding | None:
   if hlo_sharding is None:
     return None
-  return sharding.GSPMDSharding(device_assignment, hlo_sharding)
+  return sharding_impls.GSPMDSharding(device_assignment, hlo_sharding)
 
 
 def _hlo_sharding_to_named_sharding(

@@ -361,6 +361,7 @@ from jax._src.lax.parallel import (
   all_to_all_p as all_to_all_p,
   axis_index as axis_index,
   axis_index_p as axis_index_p,
+  axis_size as axis_size,
   pbroadcast as pbroadcast,
   pmax as pmax,
   pmax_p as pmax_p,
@@ -395,3 +396,50 @@ from jax.lax import linalg as linalg
 from jax._src.pjit import with_sharding_constraint as with_sharding_constraint
 from jax._src.pjit import sharding_constraint_p as sharding_constraint_p
 from jax._src.dispatch import device_put_p as device_put_p
+
+import jax._src.lax.lax
+
+_deprecations = {
+    "infeed": (
+        (
+            "jax.lax.infeed was deprecated in JAX v0.6.0 and will be removed in"
+            " JAX v0.7.0."
+        ),
+        jax._src.lax.lax.infeed,
+    ),
+    "infeed_p": (
+        (
+            "jax.lax.infeed_p was deprecated in JAX v0.6.0 and will be removed"
+            " in JAX v0.7.0."
+        ),
+        jax._src.lax.lax.infeed_p,
+    ),
+    "outfeed": (
+        (
+            "jax.lax.outfeed was deprecated in JAX v0.6.0 and will be removed"
+            " in JAX v0.7.0."
+        ),
+        jax._src.lax.lax.outfeed,
+    ),
+    "outfeed_p": (
+        (
+            "jax.lax.outfeed_p was deprecated in JAX v0.6.0 and will be removed"
+            " in JAX v0.7.0."
+        ),
+        jax._src.lax.lax.outfeed_p,
+    ),
+}
+
+import typing as _typing
+
+if _typing.TYPE_CHECKING:
+  infeed = jax._src.lax.lax.infeed
+  infeed_p = jax._src.lax.lax.infeed_p
+  outfeed = jax._src.lax.lax.outfeed
+  outfeed_p = jax._src.lax.lax.outfeed_p
+else:
+  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
+
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del _typing

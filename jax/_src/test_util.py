@@ -54,7 +54,6 @@ from jax._src import util
 from jax._src import mesh as mesh_lib
 from jax._src.cloud_tpu_init import running_in_cloud_tpu_vm
 from jax._src.interpreters import mlir
-from jax._src.lib import jaxlib_extension_version
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.numpy.util import promote_dtypes, promote_dtypes_inexact
 from jax._src.public_test_util import (  # noqa: F401
@@ -370,8 +369,6 @@ def supported_dtypes():
              _dtypes.bfloat16, np.float16, np.float32, np.complex64,
              _dtypes.float8_e4m3fn, _dtypes.float8_e4m3b11fnuz,
              _dtypes.float8_e5m2}
-    if jaxlib_extension_version < 327:
-      types -= {_dtypes.int4, _dtypes.uint4}
   elif device_under_test() == "gpu":
     types = {np.bool_, np.int8, np.int16, np.int32, np.int64,
              np.uint8, np.uint16, np.uint32, np.uint64,
@@ -390,8 +387,6 @@ def supported_dtypes():
              _dtypes.uint4, np.uint8, np.uint16, np.uint32, np.uint64,
              _dtypes.bfloat16, np.float16, np.float32, np.float64,
              np.complex64, np.complex128}
-    if jaxlib_extension_version < 327:
-      types -= {_dtypes.int4, _dtypes.uint4}
   if not config.enable_x64.value:
     types -= {np.uint64, np.int64, np.float64, np.complex128}
   return types
@@ -437,7 +432,9 @@ def stablehlo_version_at_least(required_version: str):
   plugin_version = xla_bridge.backend_stablehlo_version()
   if plugin_version is None:
     return True
-  return hlo.get_smaller_version(plugin_version, required_version) == plugin_version
+  return hlo.get_smaller_version(
+      ".".join(map(str, plugin_version)), required_version
+  ) == plugin_version
 
 def get_tpu_version() -> int:
   if device_under_test() != "tpu":
@@ -606,20 +603,6 @@ def skip_under_pytest(reason: str):
   reason = "Running under pytest: " + reason
   def skip(test_method):
     return unittest.skipIf(is_running_under_pytest(), reason)(test_method)
-  return skip
-
-
-def skip_if_stablehlo_version_less_than(required_version):
-  def skip(test_method):
-    @functools.wraps(test_method)
-    def test_method_wrapper(self, *args, **kwargs):
-      if not stablehlo_version_at_least(required_version):
-        plugin_version = xla_bridge.backend_stablehlo_version()
-        raise unittest.SkipTest(
-          f"Skipping since test requires StableHLO v{required_version}, and plugin"
-          f" version is v{plugin_version}.")
-      return test_method(self, *args, **kwargs)
-    return test_method_wrapper
   return skip
 
 
@@ -1440,7 +1423,7 @@ def with_and_without_mesh(f):
       ('Mesh', (('x', 2),), (('i', 'x'),))
     ))(with_mesh_from_kwargs(f))
 
-def with_user_mesh(sizes, names, axis_types=None):
+def with_explicit_mesh(sizes, names, axis_types=None):
   axis_types = ((mesh_lib.AxisType.Explicit,) * len(names)
                 if axis_types is None else axis_types)
   def decorator(fn):

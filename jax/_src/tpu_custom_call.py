@@ -143,6 +143,7 @@ class CustomCallBackendConfig:
   serialization_format: int | None
   internal_scratch_in_bytes: int | None
   output_memory_spaces: tuple[MemorySpace | None, ...] | None
+  disable_bounds_checks: bool
 
   # We omit the body while printing, because primitive params get embedded
   # in HLO metadata, and the body blows up its size.
@@ -193,6 +194,9 @@ class CustomCallBackendConfig:
         color = memory_space.color if memory_space is not None else -1
         config.write(str(color).encode("ascii"))
       config.write(b"]")
+    if self.disable_bounds_checks:
+      config.write(b', "disable_bounds_checks": ')
+      config.write(str(self.disable_bounds_checks).lower().encode("ascii"))
     config.write(b"}")  # End of custom_call_config.
     if self.device_type is not None:
       config.write(b', "device_type": ')
@@ -248,7 +252,7 @@ def _tpu_custom_call_lowering(
     kernel_name: str | None,
     out_avals: Any,
     input_output_aliases: tuple[tuple[int, int], ...],
-) -> ...:
+) -> ir.OpResultList:
   result_types = [mlir.aval_to_ir_type(aval) for aval in out_avals]
   axis_context = ctx.module_context.axis_context
   if isinstance(axis_context, sharding_impls.SPMDAxisContext):
@@ -562,7 +566,6 @@ def _lower_to_custom_call_config(
     module: ir.Module,
     *,
     backend: str,
-    device_type: str | None,
     vmem_limit_bytes: int | None,
     cost_estimate: CostEstimate | None,
     flags: dict[str, bool | int | float] | None,
@@ -573,7 +576,9 @@ def _lower_to_custom_call_config(
     output_memory_spaces: tuple[MemorySpace | None, ...] | None = None,
     kernel_name: str | None = None,
     ir_version: int | None = None,
+    disable_bounds_checks: bool = False,
 ) -> CustomCallBackendConfig:
+  device_type = _get_device_type(module)
   lowered_module_asm, (
       has_communication,
       has_custom_barrier,
@@ -601,6 +606,7 @@ def _lower_to_custom_call_config(
       needs_hlo_passes=needs_hlo_passes,
       needs_layout_passes=needs_layout_passes,
       output_memory_spaces=output_memory_spaces,
+      disable_bounds_checks=disable_bounds_checks,
   )
 
 
@@ -620,6 +626,7 @@ def _lowered_to_custom_call_config(
     needs_layout_passes: bool,
     device_type: str | None,
     output_memory_spaces: tuple[MemorySpace | None, ...] | None = None,
+    disable_bounds_checks: bool = False,
 ):
   if has_custom_barrier:
     if collective_id is None:
@@ -650,6 +657,7 @@ def _lowered_to_custom_call_config(
       serialization_format,
       internal_scratch_in_bytes,
       output_memory_spaces,
+      disable_bounds_checks,
   )
   return config
 
@@ -671,7 +679,7 @@ def lower_module_to_custom_call(
     has_side_effects: bool,
     serialization_format: int | None,
     output_memory_spaces: tuple[MemorySpace | None, ...] | None,
-    device_type: str | None,
+    disable_bounds_checks: bool = False,
 ) -> Sequence[ir.Value]:
   config = _lower_to_custom_call_config(
       module,
@@ -682,11 +690,11 @@ def lower_module_to_custom_call(
       allow_input_fusion=allow_input_fusion,
       internal_scratch_in_bytes=internal_scratch_in_bytes,
       collective_id=collective_id,
-      device_type=device_type,
       serialization_format=serialization_format,
       output_memory_spaces=output_memory_spaces,
       kernel_name=kernel_name,
       ir_version=get_ir_version(ctx),
+      disable_bounds_checks=disable_bounds_checks,
   )
   return _tpu_custom_call_lowering(
       ctx,
@@ -715,13 +723,12 @@ def as_tpu_kernel(
     has_side_effects: bool = False,
     serialization_format: int | None = 1,
     output_memory_spaces: tuple[MemorySpace | None, ...] | None = None,
+    disable_bounds_checks: bool = False,
 ) -> Callable[..., Any]:
   """Turns an MLIR Mosaic kernel into a JAX-compatible function."""
-  device_type = _get_device_type(module)
   config = _lower_to_custom_call_config(
       module,
       backend=backend,
-      device_type=device_type,
       vmem_limit_bytes=vmem_limit_bytes,
       cost_estimate=cost_estimate,
       flags=flags,
@@ -731,6 +738,7 @@ def as_tpu_kernel(
       serialization_format=serialization_format,
       output_memory_spaces=output_memory_spaces,
       kernel_name=kernel_name,
+      disable_bounds_checks=disable_bounds_checks,
   )
   return _as_jax_callable(
       config,
@@ -749,7 +757,6 @@ def lowered_as_tpu_kernel(
     cost_estimate: CostEstimate | None = None,
     needs_hlo_passes: bool = False,
     needs_layout_passes: bool = False,
-    device_type: str | None = None,
     has_communication: bool = False,
     has_side_effects: bool = False,
     has_custom_barrier: bool = False,
@@ -760,7 +767,9 @@ def lowered_as_tpu_kernel(
     input_output_aliases: tuple[tuple[int, int], ...] = (),
     serialization_format: int | None = None,
     internal_scratch_in_bytes: int | None = None,
+    disable_bounds_checks: bool = False,
 ) -> Callable[..., Any]:
+  device_type = _get_device_type(lowered_module)
   lowered_module_asm = lowered_module.operation.get_asm(
       binary=True, enable_debug_info=True
   )
@@ -778,6 +787,7 @@ def lowered_as_tpu_kernel(
       has_communication=has_communication,
       needs_hlo_passes=needs_hlo_passes,
       needs_layout_passes=needs_layout_passes,
+      disable_bounds_checks=disable_bounds_checks,
   )
   return _as_jax_callable(
       config,

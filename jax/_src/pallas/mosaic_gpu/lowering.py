@@ -471,11 +471,13 @@ def _eval_index_map(
   )
   result = []
   for i, b in zip(block_indices, block_mapping.block_shape):
-    if b is pallas_core.mapped:
-      result.append(i)
-    else:
-      # TODO(slebedev): Use a type-agnostic multiplication wrapper.
-      result.append(arith_dialect.muli(_as_index(i), _as_index(b)))
+    match b:
+      case pallas_core.Squeezed() | pallas_core.Element():
+        result.append(i)
+      case pallas_core.Blocked():
+        result.append(arith_dialect.muli(_as_index(i), _as_index(b)))
+      case _:
+        raise ValueError(f"Unsupported block dim type: {b}")
   return tuple(result)
 
 
@@ -507,7 +509,7 @@ def _check_block_mappings(
           + err_details(bm)
       )
 
-    if not isinstance(bm.indexing_mode, pallas_core.Blocked):
+    if any(isinstance(b, pallas_core.Element) for b in bm.block_shape):
       raise NotImplementedError(
           "Only Blocked indexing mode is supported in Mosaic GPU lowering.\n\n"
           + err_details(bm)
@@ -548,7 +550,6 @@ def _block_spec_from_block_mapping(
       bm.block_shape,
       index_map,
       memory_space=bm.transformed_block_aval.memory_space,
-      indexing_mode=bm.indexing_mode,
       transforms=bm.transforms,
   )
 
@@ -2140,12 +2141,12 @@ def _lower_jaxpr_to_for_loop(
     ctx: LoweringRuleContext,
     jaxpr: jax_core.Jaxpr,
     start: ir.Value,
-    length: ir.Value,
+    length: ir.Value | int,
     consts,
     *args,
     has_loop_index: bool,
+    unroll: bool = False,
 ):
-
   _consts_avals, arg_avals = util.split_list(ctx.avals_in, [len(consts)])
   arg_avals = arg_avals[has_loop_index:]
   out_avals = []
@@ -2164,7 +2165,6 @@ def _lower_jaxpr_to_for_loop(
     )
     return [v if a else _ensure(v, av) for a, v, av in zip(is_acc, vals, avals)]
 
-  @mgpu.fori(length, as_values(args, arg_avals))
   def loop(loop_index, body_args):
     if has_loop_index:
       loop_index = arith_dialect.addi(loop_index, start)
@@ -2176,7 +2176,16 @@ def _lower_jaxpr_to_for_loop(
     )
     return as_values(outs, out_avals)
 
-  return loop.results
+  if unroll:
+    assert isinstance(length, int)
+    outs = as_values(args, arg_avals)
+    for i in range(length):
+      outs = loop(_ir_constant(i, start.type), outs)
+    return outs
+  else:
+    if not isinstance(length, ir.Value):
+      length = _ir_constant(length, start.type)
+    return mgpu.fori(length, as_values(args, arg_avals))(loop).results
 
 
 @register_lowering_rule(lax.scan_p, mgpu.LoweringSemantics.Lane)
@@ -2197,10 +2206,10 @@ def _scan_lowering_rule(
   if (
       (num_extensive := len(args) - num_consts - num_carry)
       or reverse
-      or unroll != 1
+      or not (unroll == 1 or unroll == length)
   ):
     raise NotImplementedError
-  del linear, num_extensive, reverse, unroll
+  del linear, num_extensive, reverse
 
   jaxpr, jaxpr_consts = jaxpr.jaxpr, jaxpr.consts
   if jaxpr_consts:
@@ -2216,17 +2225,24 @@ def _scan_lowering_rule(
     start, *args = args
     index_aval, *_ = arg_avals
     start: ir.Value = _ensure_ir_value(start, index_aval.dtype)
-    length = _ir_constant(length, start.type)
   else:
     start = _i32_constant(0)
-    length = _i32_constant(length)
+
   for_out = _lower_jaxpr_to_for_loop(
-      ctx, jaxpr, start, length, consts, *args, has_loop_index=has_loop_index
+      ctx,
+      jaxpr,
+      start,
+      length,
+      consts,
+      *args,
+      has_loop_index=has_loop_index,
+      unroll=unroll == length,
   )
   if has_loop_index:
     # Need to return the final loop index value if the outer scan expects
     # it as an output.
-    return [length, *for_out]
+    loop_index = arith_dialect.addi(start, _ir_constant(length, start.type))
+    return [loop_index, *for_out]
   return for_out
 
 

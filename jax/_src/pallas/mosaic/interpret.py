@@ -20,7 +20,7 @@ import gc
 import itertools
 import math
 import threading
-from typing import Any, Literal
+from typing import Any, Callable,Literal
 
 import jax
 from jax import lax
@@ -38,6 +38,7 @@ from jax._src import pjit
 from jax._src.state import discharge as state_discharge
 from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
+from jax._src.typing import Array
 from jax._src.util import (
     safe_map,
     safe_zip,
@@ -74,10 +75,10 @@ class TPUInterpretParams:
       is waiting on a DMA semaphore that will be signaled when the read or write
       is complete.
       Default: "on_wait".
-    detect_races: If True, a dynamic, happens-before race detector will be
-      used to detect data races during kernel interpretation.  If any races are
-      detected, a message will be printed and `races.races_found` will be set
-      to True.
+    detect_races: If True, a dynamic, happens-before race detector will be used
+      to detect data races during kernel interpretation.  If any races are
+      detected, a message will be printed and `races.races_found` will be set to
+      True.
       Default: False.
     skip_floating_point_ops: If True, operations that produce only floating
       point values will not be interpreted; instead, their results will be
@@ -85,14 +86,25 @@ class TPUInterpretParams:
       operands to any operation will be replaced with (arrays of) `jnp.inf`.
       Default: False.
     uninitialized_memory: If "nan", allocated buffers are initialized to
-      to contain all NaNs (or to their maximum possible value for integers).
-      If "zero", allocated buffers are initialized to all zeros.
+      contain all NaNs (or to their maximum possible value for integers). If
+      "zero", allocated buffers are initialized to all zeros.
       Default: "nan".
+    random_seed: Seed for random number generator used during interpretation.
+      Currently random numbers are used to randomize the grid coordinates along
+      dimensions with 'parallel' semantics.
+      Default: None.
+    grid_point_recorder: Callback that is invoked by the interpreter for each
+      grid point in the order in which the grid points are traversed. This is
+      intended for inspecting the randomization of coordinates along grid
+      dimensions with 'parallel' semantics.
+      Default: None.
   """
   dma_execution_mode: Literal["eager", "on_wait"] = "on_wait"
   detect_races: bool = False
   skip_floating_point_ops: bool = False
   uninitialized_memory: Literal["nan", "zero"] = "nan"
+  random_seed: int | None = None
+  grid_point_recorder: Callable[[tuple[jnp.int32, ...]], None] | None = None
 
 
 VectorClock = np.ndarray
@@ -1024,7 +1036,7 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params, interpret_params):
       value = Placeholder(value.shape, value.dtype)
     env[var] = value
 
-  jax.util.safe_map(write, jaxpr.constvars + jaxpr.invars, args)
+  jax._src.util.safe_map(write, jaxpr.constvars + jaxpr.invars, args)
 
   # Get the device ID.
   axis_sizes = jax_core.get_axis_env().axis_sizes
@@ -1050,7 +1062,7 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params, interpret_params):
       # not need to do any reads if `interpret_params.skip_floating_point_ops`
       # is True. If this is the case, we want to avoid materializing the read
       # array into the jaxpr when this function is traced.
-      deferred_invals = functools.partial(jax.util.safe_map, read, eqn.invars)
+      deferred_invals = functools.partial(jax._src.util.safe_map, read, eqn.invars)
 
       if prim is primitives.load_p:
         (ref, transforms, mask, _) = jax.tree.unflatten(
@@ -1325,9 +1337,9 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params, interpret_params):
           out = prim.bind(*subfuns, *deferred_invals(), **bind_params)
 
       out = out if prim.multiple_results else [out]
-      jax.util.safe_map(write, eqn.outvars, out)
+      jax._src.util.safe_map(write, eqn.outvars, out)
 
-  return jax.util.safe_map(read, jaxpr.outvars)
+  return jax._src.util.safe_map(read, jaxpr.outvars)
 
 def _compute_start_indices(
     block_mapping, loop_idx, *args, compiler_params, interpret_params):
@@ -1335,18 +1347,23 @@ def _compute_start_indices(
   block_indices = _interpret_jaxpr(
       jaxpr.jaxpr, *jaxpr.consts, *loop_idx, *args,
       compiler_params=compiler_params, interpret_params=interpret_params)
-  if isinstance(block_mapping.indexing_mode, pallas_core.Blocked):
-    ret = jnp.array(
-        tuple(
-            i if b is pallas_core.mapped else b * i
-            for b, i in zip(block_mapping.block_shape, block_indices)
-        ),
-        dtype=jnp.int32,
-    )
-  elif isinstance(block_mapping.indexing_mode, pallas_core.Unblocked):
-    ret = block_indices
-  else:
-    raise RuntimeError(f"Unknown indexing mode: {block_mapping.indexing_mode}")
+  def _get_start_index(i, b):
+    match b:
+      case pallas_core.Squeezed():
+        return i
+      case pallas_core.Element():
+        return i
+      case pallas_core.Blocked():
+        return i * b.block_size
+      case _:
+        raise ValueError(f"Unsupported block dim type: {type(b)}")
+  ret = jnp.array(
+      tuple(
+          _get_start_index(i, b)
+          for i, b in zip(block_indices, block_mapping.block_shape)
+      ),
+      dtype=jnp.int32,
+  )
   return ret
 
 def _get_next_indices(grid, indices):
@@ -1357,6 +1374,96 @@ def _get_next_indices(grid, indices):
     carry = dim_size == i
     next_indices.append(jnp.where(carry, 0, i))
   return tuple(reversed(next_indices))
+
+def _get_parallel_dim_semantics(
+    compiler_params: dict[str, Any], grid: tuple[int, ...]
+) -> tuple[bool, ...]:
+  """Returns a tuple of booleans indicating whether the corresponding dimension in `grid` is parallel."""
+  dimension_semantics = compiler_params.get('mosaic', {}).get(
+      'dimension_semantics', None
+  )
+  if dimension_semantics is None:
+    return (False,) * len(grid)
+  return tuple(ds == 'parallel' for ds in dimension_semantics)
+
+_GridPointCoordinatesPerDim = tuple[Array, ...]
+
+def _get_randomized_grid_coordinates(
+    grid: tuple[int, ...],
+    compiler_params: dict[str, Any],
+    random_seed: int | None,
+) -> _GridPointCoordinatesPerDim:
+  """Returns a tuple of randomized coordinates for each 'parallel' dimension in `grid`.
+
+  For a dimension with 'parallel' semantics at position `d` in the grid, the
+  returned tuple contains a random permutation of the sequence `[0,...,
+  grid[d] - 1]` at index `d`. For each dimension with 'arbitrary' semantics,
+  the resulting tuple contains an empty array. (Inserting an empty arry for an
+  'arbitrary' dimension at position `d` in the grid, instead of the sequence
+  `[0,..., grid[d] - 1]`, allows `grid[d]` to be a dynamic value, i.e. a value
+  not known at Jax trace time.)
+
+  Args:
+    grid: Tuple of sizes of the dimensions in the grid.
+    compiler_params: Representation of a `mosaic_core.TPUCompilerParams` object
+      as a dictionary.
+    parallel_semantics_per_dim: A tuple of booleans indicating whether the
+      corresponding dimension in the grid has parallel semantics.
+    random_seed: The seed to use for randomizing coordinates in parallel
+      dimensions.
+  """
+  parallel_semantics_per_dim = _get_parallel_dim_semantics(
+      compiler_params, grid
+  )
+
+  key = jax.random.key(random_seed or 0)
+  grid_point_coordinates = []
+  for dim_size, parallel_dim in zip(grid, parallel_semantics_per_dim):
+    if parallel_dim:
+      # The size of a dimension with `parallel` semantics must be known at Jax
+      # trace time. This ensures that the arguments to `jnp.arange` and
+      # `jax.random.permutation` below are valid.
+      dim_size = jax_core.concrete_or_error(None, dim_size)
+
+      coordindates_along_dim = jnp.arange(dim_size, dtype=jnp.int32)
+      key, subkey = jax.random.split(key)
+      coordindates_along_dim = jax.random.permutation(
+          subkey, coordindates_along_dim
+      )
+      grid_point_coordinates.append(coordindates_along_dim)
+    else:
+      grid_point_coordinates.append(jnp.array((), dtype=jnp.int32))
+
+  return tuple(grid_point_coordinates)
+
+
+def _get_grid_point(
+    loop_indices: tuple[Array, ...],
+    grid_point_coordinates: _GridPointCoordinatesPerDim,
+) -> Array:
+  """Indexes each entry in `grid_point_coordinates` with the corresponding entry in `loop_indices`.
+
+  If an entry in `grid_point_coordinates` is an empty array, the corresponding
+  entry in the returned array is the corresponding entry in `loop_indices`.
+  Otherwise, the returned array contains the entry in `grid_point_coordinates`
+  indexed with the corresponding entry in `loop_indices`.
+
+  Args:
+    loop_indices: A tuple of loop indices.
+    grid_point_coordinates: A tuple of coordinate arrays for each dimension in
+      the grid. Dimensions with 'arbitrary' semantics are represented by empty
+      arrays. Dimensions with 'parallel' semantics are represented by arrays of
+      randomized coordinates.
+
+  Returns:
+    A 1-dimensional array containing the coordinates for the grid point
+    corresponding to the specified `loop_indices`.
+  """
+  grid_point = []
+  for li, coords in zip(loop_indices, grid_point_coordinates):
+    grid_point.append(li if jnp.size(coords) == 0 else coords[li])
+  return jnp.array(grid_point, dtype=np.int32)
+
 
 def _maybe_dynamic_slice(start_idx, block_shape, value, is_indexing):
   start_idx = tuple(jnp.array(s, dtype=jnp.int32) for s in start_idx)
@@ -1411,7 +1518,7 @@ def interpret_pallas_call(
     input_output_aliases: tuple[tuple[int, int], ...],
     grid_mapping: GridMapping,
     mesh: pallas_core.Mesh | None,
-    compiler_params: mosaic_core.TPUCompilerParams,
+    compiler_params: dict[str, Any],
     cost_estimate: CostEstimate,
     out_avals: tuple[jax_core.AbstractValue, ...],
     interpret_params: TPUInterpretParams,
@@ -1446,13 +1553,13 @@ def interpret_pallas_call(
       ordered=True)
 
   # Pad input arguments.
-  is_indexing_dim = [
-      tuple(b is pallas_core.mapped for b in bm.block_shape)
+  is_squeeze_dim = [
+      tuple(isinstance(b, pallas_core.Squeezed) for b in bm.block_shape)
       for bm in grid_mapping.block_mappings
   ]
   block_shapes = [
-      tuple(1 if i else b for i, b in zip(iid, bm.block_shape))
-      for iid, bm in zip(is_indexing_dim, grid_mapping.block_mappings)
+      pallas_core._get_block_shape(bm.block_shape)
+      for bm in grid_mapping.block_mappings
   ]
   num_inputs = grid_mapping.num_inputs
   input_args = [
@@ -1568,6 +1675,10 @@ def interpret_pallas_call(
     # Base case is always one iteration when grid is ()
     num_iterations = 1
 
+  randomized_grid_coordinates = _get_randomized_grid_coordinates(
+      grid, compiler_params, interpret_params.random_seed  # type: ignore[arg-type]
+  )
+
   def _get_local_grid_env(loop_idx):
     if grid_mapping.local_grid_env is not None:
       return grid_mapping.local_grid_env(loop_idx, grid)
@@ -1607,13 +1718,19 @@ def interpret_pallas_call(
       The carry for the next iteration.
     """
     iteration_idx, loop_idx, prev_start_indices, cur_start_indices = carry
+    if interpret_params.grid_point_recorder is not None:
+      grid_point = _get_grid_point(loop_idx, randomized_grid_coordinates)
+      callback.io_callback(interpret_params.grid_point_recorder, (), grid_point)
 
     with pallas_core.grid_env(_get_local_grid_env(loop_idx)):
       next_loop_idx = _get_next_indices(grid, loop_idx)
+      next_grid_point = _get_grid_point(
+          next_loop_idx, randomized_grid_coordinates
+      )
       next_start_indices = [
           _compute_start_indices(
               bm,
-              next_loop_idx,
+              next_grid_point,
               *scalar_buffer_ids,
               compiler_params=compiler_params,
               interpret_params=interpret_params,
@@ -1633,7 +1750,7 @@ def interpret_pallas_call(
                 for st, sz, iid in zip(
                     cur_start_indices[index],
                     block_shapes[index],
-                    is_indexing_dim[index],
+                    is_squeeze_dim[index],
                 )
             ),
             shape=input_args[index].shape,
@@ -1701,7 +1818,7 @@ def interpret_pallas_call(
                 for st, sz, iid in zip(
                     cur_start_indices[num_inputs + index],
                     block_shapes[num_inputs + index],
-                    is_indexing_dim[num_inputs + index],
+                    is_squeeze_dim[num_inputs + index],
                 )
             ),
             shape=output_vals[index].shape,
@@ -1739,11 +1856,14 @@ def interpret_pallas_call(
       return iteration_idx + 1, next_loop_idx, cur_start_indices, next_start_indices
 
   initial_loop_idx = (jnp.int32(0),) * len(grid)
+  initial_grid_point = _get_grid_point(
+      initial_loop_idx, randomized_grid_coordinates
+  )
   with pallas_core.grid_env(_get_local_grid_env(initial_loop_idx)):
     initial_start_indices = [
         _compute_start_indices(
             bm,
-            initial_loop_idx,
+            initial_grid_point,
             *scalar_buffer_ids,
             compiler_params=compiler_params,
             interpret_params=interpret_params,

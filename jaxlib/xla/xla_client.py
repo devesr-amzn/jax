@@ -58,9 +58,6 @@ _version = 330
 # In JAX, reference this via jax._src.lib.ifrt_version.
 _ifrt_version = _xla.ifrt_version_number
 
-# Version number for MLIR:Python components.
-mlir_api_version = 58
-
 xla_platform_names = {
     'cpu': 'Host',
     'gpu': 'CUDA',
@@ -78,7 +75,7 @@ def make_cpu_client(
     num_nodes=1,
     collectives=None,
     num_devices=None,
-) -> ...:
+) -> Client:
   register_custom_call_handler('cpu', _xla.register_custom_call_target)
   register_custom_type_id_handler('cpu', _xla.register_custom_type_id)
   return _xla.get_tfrt_cpu_client(

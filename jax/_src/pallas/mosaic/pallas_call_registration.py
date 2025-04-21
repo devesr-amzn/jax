@@ -238,11 +238,11 @@ def pallas_call_tpu_lowering_rule(
       allow_input_fusion=mosaic_params.get("allow_input_fusion"),
       input_output_aliases=input_output_aliases,
       serialization_format=mosaic_params.get("serialization_format", 1),
-      device_type=mosaic_params.get("device_type"),
       internal_scratch_in_bytes=mosaic_params.get("internal_scratch_in_bytes"),
       collective_id=mosaic_params.get("collective_id", None),
       has_side_effects=mosaic_params.get("has_side_effects", False),
       output_memory_spaces=output_memory_spaces,
+      disable_bounds_checks=mosaic_params.get("disable_bounds_checks"),
   )
   _maybe_cast_to_bool = lambda x, aval: x.astype(
       jax.numpy.bool_) if aval.dtype == jax.numpy.bool_ else x

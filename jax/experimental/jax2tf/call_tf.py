@@ -40,9 +40,7 @@ from jax._src import ad_util
 from jax._src import core
 from jax._src import effects
 from jax._src import util
-from jax._src.lib import xla_client
 from jax._src.lib import xla_extension as _xla
-from jax._src.lib import jaxlib_extension_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import func as func_dialect
 from jax._src.lib.mlir.dialects import hlo
@@ -348,8 +346,7 @@ def _call_tf_impl(*args_jax_flat, callable_flat_tf, **_):
     if (isinstance(arg_jax, jax.Array) and
         list(arg_jax.devices())[0].platform in _DLPACK_PLATFORMS and
         arg_jax.dtype.type in dlpack.SUPPORTED_DTYPES):
-      arg_dlpack = jax.dlpack.to_dlpack(arg_jax)
-      return tf.experimental.dlpack.from_dlpack(arg_dlpack)
+      return tf.experimental.dlpack.from_dlpack(arg_jax.__dlpack__())
     # The following avoids copies to the host on CPU, always for Array
     # and even for ndarray if they are sufficiently aligned.
     # TODO(necula): on TPU this copies to the host!
@@ -599,11 +596,7 @@ def _call_tf_lowering(
              "\n\nCaught TensorFlow exception: " + str(e))
       raise ValueError(msg) from e
 
-  if jaxlib_extension_version >= 324:
-    stablehlo = _xla.mlir.hlo_to_stablehlo(func_tf_hlo)
-  else:
-    xla_comp = xla_client.XlaComputation(func_tf_hlo)
-    stablehlo = _xla.mlir.xla_computation_to_mlir_module(xla_comp)
+  stablehlo = _xla.mlir.hlo_to_stablehlo(func_tf_hlo)
   submodule = ir.Module.parse(stablehlo)
   symtab = ir.SymbolTable(submodule.operation)
   callee_result_types = symtab["main"].type.results

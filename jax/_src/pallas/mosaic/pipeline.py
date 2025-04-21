@@ -82,8 +82,11 @@ def _get_tpu_generation() -> int:
   kind = get_default_device().device_kind
   if kind.endswith(' lite'):
     kind = kind[:-len(' lite')]
-  assert kind[:5] == "TPU v", kind
-  return int(kind[5])
+  if kind.startswith("TPU v"):
+    return int(kind[5])
+  else:
+    assert "TPU7x" in kind
+    return 7
 
 def _make_tiling(shape: tuple[int, ...], dtype: np.dtype) -> tuple[int, ...]:
   # For a n-dimensional shape, returns (8, 128) for the last 2 dimensions
@@ -988,7 +991,7 @@ def _partition_grid(
     num_cores = pl.num_programs(core_axis)
     core_id = pl.program_id(core_axis)
   else:
-    num_cores = jax.lax.psum(1, core_axis)
+    num_cores = jax.lax.axis_size(core_axis)
     core_id = jax.lax.axis_index(core_axis)
   # Check that num_cores is statically known
   if not isinstance(num_cores, int):

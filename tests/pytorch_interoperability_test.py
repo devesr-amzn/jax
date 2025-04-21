@@ -77,8 +77,7 @@ class DLPackTest(jtu.JaxTestCase):
     rng = jtu.rand_default(self.rng())
     np = rng(shape, dtype)
     x = jnp.array(np)
-    dlpack = jax.dlpack.to_dlpack(x)
-    y = torch.utils.dlpack.from_dlpack(dlpack)
+    y = torch.utils.dlpack.from_dlpack(x)
     if dtype == jnp.bfloat16:
       # .numpy() doesn't work on Torch bfloat16 tensors.
       self.assertAllClose(np,

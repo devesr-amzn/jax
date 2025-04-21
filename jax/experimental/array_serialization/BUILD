@@ -35,9 +35,12 @@ pytype_library(
         "serialization.py",
     ],
     visibility = ["//visibility:public"],
-    deps = ["//jax"] + py_deps([
-        "numpy",
+    deps = [
+        "//jax",
+        "//jax/experimental/array_serialization:tensorstore_impl",
+    ] + py_deps([
         "absl/logging",
+        "numpy",
     ]),
 )
 
@@ -45,10 +48,19 @@ jax_multiplatform_test(
     name = "serialization_test",
     srcs = ["serialization_test.py"],
     enable_configs = [
-        "tpu_v3_2x2",
+        "tpu_v3_x4",
     ],
     deps = [
+        ":serialization",
         "//jax:experimental",
-        "//jax/experimental/array_serialization:serialization",
     ],
+)
+
+pytype_library(
+    name = "tensorstore_impl",
+    srcs = ["tensorstore_impl.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//jax"] + py_deps([
+        "numpy",
+    ]),
 )

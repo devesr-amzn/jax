@@ -740,12 +740,6 @@ class LoadedExecutable:
   def execute_with_token(
       self, arguments: Sequence[ArrayImpl]
   ) -> Tuple[List[ArrayImpl], Token]: ...
-  def execute_sharded_on_local_devices(
-      self, arguments: Sequence[List[ArrayImpl]]
-  ) -> List[List[ArrayImpl]]: ...
-  def execute_sharded_on_local_devices_with_tokens(
-      self, arguments: Sequence[List[ArrayImpl]]
-  ) -> Tuple[List[List[ArrayImpl]], ShardedToken]: ...
   def execute_sharded(
       self, arguments: Sequence[List[ArrayImpl]], with_tokens: bool = ...
   ) -> ExecuteResults: ...
@@ -858,9 +852,8 @@ class DistributedRuntimeClient:
   def key_value_set_bytes(self, key: str, value: bytes,
                           allow_overwrite: bool = False) -> _Status: ...
   def key_value_delete(self, key: str) -> _Status: ...
-  def wait_at_barrier(
-      self, barrier_id: str, timeout_in_ms: int, process_ids: Optional[List[int]]
-  ) -> _Status: ...
+  def wait_at_barrier(self, barrier_id: str, timeout_in_ms: int,
+                      process_ids: Optional[List[int]] = None) -> _Status: ...
   def get_live_nodes(self, process_ids: List[int]) -> _Status: ...
 
 def get_distributed_runtime_service(
@@ -932,14 +925,12 @@ class NamedSharding(Sharding):
       spec: Any,
       *,
       memory_kind: Optional[str] = None,
-      _manual_axes: frozenset[Any] = frozenset(),
       _logical_device_ids: tuple[int, ...] | None = None,
   ): ...
   mesh: Any
   spec: Any
   _memory_kind: Optional[str]
   _internal_device_list: DeviceList
-  _manual_axes: frozenset[Any]
   _logical_device_ids: tuple[int, ...] | None
 
 class SingleDeviceSharding(Sharding):

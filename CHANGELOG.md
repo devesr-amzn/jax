@@ -16,6 +16,12 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
 
 ## Unreleased
 
+* New features:
+  * Added {func}`jax.lax.axis_size` which returns the size of the mapped axis
+    given its name.
+
+## JAX 0.6.0 (April 16, 2025)
+
 * Breaking changes
 
   * {func}`jax.numpy.array` no longer accepts `None`. This behavior was
@@ -24,11 +30,25 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     which was added temporarily in v0.4.36 to allow users to opt out of the
     new "stackless" tracing machinery.
   * Removed the `config.jax_eager_pmap` config option.
+  * Disallow the calling of `lower` and `trace` AOT APIs on the result
+    of `jax.jit` if there have been subsequent wrappers applied.
+    Previously this worked, but silently ignored the wrappers.
+    The workaround is to apply `jax.jit` last among the wrappers,
+    and similarly for `jax.pmap`.
+    See {jax-issue}`#27873`.
+  * The `cuda12_pip` extra for `jax` has been removed; use `pip install jax[cuda12]`
+    instead.
 
 * Changes
   * The minimum CuDNN version is v9.8.
   * JAX is now built using CUDA 12.8. All versions of CUDA 12.1 or newer remain
     supported.
+  * JAX package extras are now updated to use dash instead of underscore to
+    align with PEP 685. For instance, if you were previously using `pip install jax[cuda12_local]`
+    to install JAX, run `pip install jax[cuda12-local]` instead.
+  * {func}`jax.jit` now requires `fun` to be passed by position, and additional
+    arguments to be passed by keyword. Doing otherwise will result in a
+    DeprecationWarning in v0.6.X, and an error in starting in v0.7.X.
 
 * Deprecations
 
@@ -45,10 +65,25 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
   * The deprecated use of {func}`jax.ffi.ffi_call` with inline arguments is no
     longer supported. {func}`~jax.ffi.ffi_call` now unconditionally returns a
     callable.
+  * The following exports in `jax.lib.xla_client` are deprecated:
+    `get_topology_for_devices`, `heap_profile`, `mlir_api_version`, `Client`,
+    `CompileOptions`, `DeviceAssignment`, `Frame`, `HloSharding`, `OpSharding`,
+    `Traceback`.
+  * The following internal APIs in `jax.util` are deprecated:
+    `HashableFunction`, `as_hashable_function`, `cache`, `safe_map`, `safe_zip`,
+    `split_dict`, `split_list`, `split_list_checked`, `split_merge`, `subvals`,
+    `toposort`, `unzip2`, `wrap_name`, and `wraps`.
+  * `jax.dlpack.to_dlpack` has been deprecated. You can usually pass a JAX
+    `Array` directly to the `from_dlpack` function of another framework. If you
+    need the functionality of `to_dlpack`, use the `__dlpack__` attribute of an
+    array.
+  * `jax.lax.infeed`, `jax.lax.infeed_p`, `jax.lax.outfeed`, and
+    `jax.lax.outfeed_p` are deprecated and will be removed in JAX v0.7.0.
   * Several previously-deprecated APIs have been removed, including:
     * From `jax.lib.xla_client`: `ArrayImpl`, `FftType`, `PaddingType`,
       `PrimitiveType`, `XlaBuilder`, `dtype_to_etype`,
-      `ops`, `register_custom_call_target`, `shape_from_pyval`.
+      `ops`, `register_custom_call_target`, `shape_from_pyval`, `Shape`,
+      `XlaComputation`.
     * From `jax.lib.xla_extension`: `ArrayImpl`, `XlaRuntimeError`.
     * From `jax`: `jax.treedef_is_leaf`, `jax.tree_flatten`, `jax.tree_map`,
       `jax.tree_leaves`, `jax.tree_structure`, `jax.tree_transpose`, and
@@ -62,6 +97,8 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
       `raise_to_shaped_mappings`, `reset_trace_state`, `str_eqn_compact`,
       `substitute_vars_in_output_ty`, `typecompat`, and `used_axis_names_jaxpr`. Most
       have no public replacement, though a few are available at {mod}`jax.extend.core`.
+    * The `vectorized` argument to {func}`~jax.pure_callback` and
+      {func}`~jax.ffi.ffi_call`. Use the `vmap_method` parameter instead.
 
 ## jax 0.5.3 (Mar 19, 2025)
 
@@ -82,6 +119,30 @@ Patch release of 0.5.1
   * Fixes TPU metric logging and `tpu-info`, which was broken in 0.5.1
 
 ## jax 0.5.1 (Feb 24, 2025)
+
+* Breaking changes
+  * The jit tracing cache now keys on input NamedShardings. Previously, the
+    tracing cache did not include sharding information at all
+    (although subsequent jit caches did like lowering and compilation caches),
+    so two equivalent shardings of different types would not retrace,
+    but now they do. For example:
+    ```python
+    @jax.jit
+    def f(x):
+      return x
+
+    # inp1.sharding is of type SingleDeviceSharding
+    inp1 = jnp.arange(8)
+    f(inp1)
+
+    mesh = jax.make_mesh((1,), ('x',))
+    # inp2.sharding is of type NamedSharding
+    inp2 = jax.device_put(jnp.arange(8), NamedSharding(mesh, P('x')))
+    f(inp2)  # tracing cache miss
+    ```
+    In the above example, calling `f(inp1)` and then `f(inp2)` will lead to a
+    tracing cache miss because the shardings have changed on the abstract values
+    while tracing.
 
 * New Features
   * Added an experimental {func}`jax.experimental.custom_dce.custom_dce`

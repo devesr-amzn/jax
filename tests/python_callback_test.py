@@ -28,7 +28,6 @@ from jax._src import core
 from jax._src import dispatch
 from jax._src import test_util as jtu
 from jax._src import util
-from jax._src.lib import jaxlib_extension_version
 from jax.experimental import io_callback
 from jax.experimental import pjit
 from jax.experimental.shard_map import shard_map
@@ -588,8 +587,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
 
   @parameterized.parameters("int2", "int4", "uint2", "uint4")
   def test_subbyte_operands(self, dtype: str):
-    if jaxlib_extension_version <= 321:
-      self.skipTest("Requires jaxlib_extension_version >= 322.")
     def get(x):
       return x
     def f(x):
@@ -613,8 +610,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
 
   @parameterized.parameters("int2", "int4", "uint2", "uint4")
   def test_subbyte_results(self, dtype: str):
-    if jaxlib_extension_version <= 321:
-      self.skipTest("Requires jaxlib_extension_version >= 322.")
     def get():
       return np.arange(8, dtype=dtype)
 
@@ -1041,25 +1036,10 @@ class PureCallbackTest(jtu.JaxTestCase):
   def test_vmap_method_raise(self):
     @jax.vmap
     def f(x):
-      # Setting vectorized to None disables the current default behavior of
-      # falling back on sequential.
-      return jax.pure_callback(np.sin, x, x, vectorized=None)
+      return jax.pure_callback(np.sin, x, x)
 
     with self.assertRaisesRegex(NotImplementedError, "vmap is only supported"):
       f(jnp.arange(4.))
-
-  def test_deprecated_vectorized(self):
-    def f(x, **kwargs):
-      return jax.pure_callback(np.sin, x, x, **kwargs)
-
-    with self.assertWarnsRegex(DeprecationWarning, "The default behavior"):
-      jax.vmap(f)(jnp.arange(4.0))
-
-    with self.assertWarnsRegex(DeprecationWarning, "The vectorized argument"):
-      f(jnp.arange(4.0), vectorized=True)
-
-    with self.assertWarnsRegex(DeprecationWarning, "The vectorized argument"):
-      f(jnp.arange(4.0), vectorized=False)
 
   def test_vmap_method_expand_dims(self):
     def callback(x, y):

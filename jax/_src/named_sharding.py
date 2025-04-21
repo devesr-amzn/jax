@@ -42,7 +42,7 @@ class AUTO:
     self.mesh = mesh
 
   def _to_sdy_sharding(self, ndim: int) -> SdyArraySharding:
-    dim_shardings = [SdyDimSharding(axes=[], is_closed=False)
+    dim_shardings = [SdyDimSharding(axes=[], is_open=True)
                      for _ in range(ndim)]
     return SdyArraySharding(self.mesh.shape_tuple, dim_shardings)
 
@@ -112,20 +112,17 @@ class NamedSharding(JSharding.Sharding):
   mesh: mesh_lib.Mesh | mesh_lib.AbstractMesh
   spec: PartitionSpec
   _memory_kind: str | None
-  _manual_axes: frozenset[MeshAxisName]
   _logical_device_ids: tuple[int, ...] | None
 
   @use_cpp_method()
   def __init__(
       self, mesh: mesh_lib.Mesh | mesh_lib.AbstractMesh, spec: PartitionSpec, *,
-      memory_kind: str | None = None, _manual_axes=frozenset(),
-      _logical_device_ids=None):
+      memory_kind: str | None = None, _logical_device_ids=None):
     self.mesh = mesh
     self.spec = spec
     self._memory_kind = memory_kind
-    self._manual_axes = _manual_axes
     self._logical_device_ids = _logical_device_ids
-    check_pspec(self.mesh, self.spec, self._manual_axes)
+    check_pspec(self.mesh, self.spec)
 
   def __repr__(self):
     mem = '' if self.memory_kind is None else f', memory_kind={self.memory_kind}'
@@ -137,7 +134,6 @@ class NamedSharding(JSharding.Sharding):
   def __reduce__(self):
     return (type(self), (self.mesh, self.spec),
             {'memory_kind': self.memory_kind,
-             '_manual_axes': self._manual_axes,
              '_logical_device_ids': self._logical_device_ids})
 
   @property
@@ -147,8 +143,7 @@ class NamedSharding(JSharding.Sharding):
   def __hash__(self):
     if not hasattr(self, '_hash'):
       self._hash = hash(
-          (self.mesh, self.memory_kind, self.spec, self._manual_axes,
-           self._logical_device_ids))
+          (self.mesh, self.memory_kind, self.spec, self._logical_device_ids))
     return self._hash
 
   def __eq__(self, other):
@@ -158,7 +153,6 @@ class NamedSharding(JSharding.Sharding):
       return True
     if (self.spec != other.spec
         or self.memory_kind != other.memory_kind
-        or self._manual_axes != other._manual_axes
         or self._logical_device_ids != other._logical_device_ids):
       return False
     return self.mesh is other.mesh or self.mesh == other.mesh
@@ -242,11 +236,11 @@ class NamedSharding(JSharding.Sharding):
     return named_sharding_to_xla_hlo_sharding(self, num_dimensions)
 
   def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
-    dim_shardings = [SdyDimSharding(axes=[], is_closed=True)
+    dim_shardings = [SdyDimSharding(axes=[], is_open=False)
                      for _ in range(num_dimensions)]
     for i, dim_spec in enumerate(self.spec):
       if dim_spec is PartitionSpec.UNCONSTRAINED:
-        dim_shardings[i].is_closed = False
+        dim_shardings[i].is_open = True
       elif dim_spec is None:
         # Already empty and closed sharding.
         pass
@@ -274,14 +268,13 @@ def get_array_mapping(
 @dataclasses.dataclass
 class SdyDimSharding:
   axes: Sequence[str]
-  is_closed: bool
+  is_open: bool
   priority: int | None = None
 
   def build(self) -> sdy.DimensionShardingAttr:
     return sdy.DimensionShardingAttr.get(
         [sdy.AxisRefAttr.get(axis) for axis in self.axes],
-        is_closed=self.is_closed,
-        priority=self.priority)
+        is_closed=not self.is_open, priority=self.priority)
 
   def __repr__(self):
     return f'SdyDimSharding({self._custom_repr()})'
@@ -289,7 +282,7 @@ class SdyDimSharding:
   def _custom_repr(self):
     axes_repr = ', '.join(f"'{a}'" for a in self.axes)
     open_repr = ''
-    if not self.is_closed:
+    if self.is_open:
       open_repr = ', ?' if self.axes else '?'
     priority_repr = '' if self.priority is None else f'p{self.priority}'
     return f'{{{axes_repr}{open_repr}}}{priority_repr}'
@@ -334,9 +327,7 @@ def named_sharding_to_xla_hlo_sharding(
   mesh_axis_pos = {name: i for i, name in enumerate(self.mesh.axis_names)}
 
   special_axes = {}
-  mesh_manual_axes = {n for n, t in self.mesh._name_to_type.items()
-                      if t == mesh_lib.AxisType.Manual}
-  manual_axes = self._manual_axes.union(mesh_manual_axes)
+  manual_axes = frozenset(self.mesh.manual_axes)
   if manual_axes:
     axis_names = self.mesh.axis_names
     for manual_axis in manual_axes:
@@ -421,7 +412,7 @@ def array_mapping_to_axis_resources(array_mapping: ArrayMapping):
 @cache(max_size=128, trace_context_in_key=False)
 def check_pspec(mesh, spec, _manual_axes=frozenset()):
   _check_unique_resources(spec, "NamedSharding spec", mesh)
-  _check_mesh_resource_axis(mesh, spec, _manual_axes)
+  _check_mesh_resource_axis(mesh, spec)
 
 class DuplicateSpecError(Exception):
   def __init__(self, message, mesh, pspec):
@@ -456,7 +447,7 @@ def _check_unique_resources(pspec: PartitionSpec, arg_name: str, mesh=None
         mesh=mesh, pspec=pspec)
 
 
-def _check_mesh_resource_axis(mesh, pspec, _manual_axes):
+def _check_mesh_resource_axis(mesh, pspec):
   for p in pspec:
     if p is PartitionSpec.UNCONSTRAINED or p is None:
       continue
@@ -466,10 +457,6 @@ def _check_mesh_resource_axis(mesh, pspec, _manual_axes):
         raise ValueError(
             f"Resource axis: {r} of {pspec} "
             f"is not found in mesh: {tuple(mesh.shape.keys())}.")
-      if r in _manual_axes:
-        raise ValueError(
-            f"Axis: {r} of {pspec} "
-            f"is also found in manual_axes: {_manual_axes}.") from None
     if not all(mesh._name_to_type[p[0]] == mesh._name_to_type[r] for r in p):
       raise ValueError(
           'AxisTypes should be the same in a tuple subset of PartitionSpec:'
