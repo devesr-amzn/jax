@@ -4971,6 +4971,11 @@ class APITest(jtu.JaxTestCase):
     with config.use_direct_linearize(True):
       jax.grad(my_sin_p.bind)(1.0)  # doesn't crash
 
+  def test_ensure_compile_time_eval_no_leaks(self):
+    # https://github.com/jax-ml/jax/issues/25847
+    with jax.ensure_compile_time_eval():
+      jnp.linalg.solve(jnp.eye(3), jnp.ones(3))  # doesn't crash
+
 
 class RematTest(jtu.JaxTestCase):
 
@@ -8390,6 +8395,22 @@ class CustomJVPTest(jtu.JaxTestCase):
       return f(x, f(x, 1.))
 
     jax.jvp(jax.vmap(g), (jnp.ones(3),), (jnp.ones(3),))  # don't crash
+
+  def test_symbolic_zero_under_vmap_of_jit(self):
+    # https://github.com/jax-ml/jax/issues/28144
+    @jax.custom_jvp
+    def f(x):
+        return x + 1
+
+    @f.defjvp
+    def f_jvp(x, t):
+        (x,) = x
+        (t,) = t
+        z = custom_derivatives_public.zero_from_primal(x, symbolic_zeros=True)
+        return f(x), z
+
+    x = jnp.arange(3.0)
+    jax.jvp(jax.vmap(jax.jit(f)), (x,), (x,))  # doesn't crash
 
 
 class CustomVJPTest(jtu.JaxTestCase):
