@@ -358,7 +358,7 @@ def disable_jit(disable: bool = True):
   ...   return y + 3
   ...
   >>> print(f(jax.numpy.array([1, 2, 3])))  # doctest:+ELLIPSIS
-  Value of y is Traced<ShapedArray(int32[3])>with<DynamicJaxprTrace...>
+  Value of y is Traced<int32[3]>with<DynamicJaxprTrace...>
   [5 7 9]
 
   Here ``y`` has been abstracted by :py:func:`jit` to a :py:class:`ShapedArray`,
@@ -1468,10 +1468,8 @@ def pmap(
         " removed from JAX. Please migrate to pjit and remove global_arg_shapes"
         " from pmap.")
 
-  # TODO(yashkatariya): Move this out after shard_map is out of experimental and
-  # in _src
   if config.pmap_shmap_merge.value:
-    from jax.experimental.shard_map import pmap
+    from jax._src.shard_map import pmap
     return pmap(fun, axis_name, in_axes=in_axes, out_axes=out_axes,
                 static_broadcasted_argnums=static_broadcasted_argnums,
                 devices=devices, backend=backend,
@@ -1994,10 +1992,27 @@ def _lift_linearized(jaxpr, primal_avals, io_tree, out_pvals, consts, *py_args):
     for primal_aval, tangent_aval in zip(primal_avals, tangent_avals):
       expected_tangent_aval  = primal_aval.to_tangent_aval()
       if not core.typecompat(expected_tangent_aval, tangent_aval):
-        raise ValueError("linearized function called on tangent values inconsistent with "
-                         "the original primal values: "
-                         f"got tangent aval {tangent_aval} for primal aval {primal_aval} "
-                         f"but expected {expected_tangent_aval}")
+        extra_msg = ''
+        if (isinstance(primal_aval, core.ShapedArray) and
+            isinstance(tangent_aval, core.ShapedArray) and
+            primal_aval.vma != tangent_aval.vma):
+          pvary_applications = []
+          if left := tangent_aval.vma - primal_aval.vma:
+            pvary_applications.append(
+                f"applying `jax.lax.pvary(..., {tuple(left)})` to the primal"
+                " value passed to `jax.linearize`")
+          if left := primal_aval.vma - tangent_aval.vma:
+            pvary_applications.append(
+                f"applying `jax.lax.pvary(..., {tuple(left)})` to the tangent"
+                " value passed to the callable `f_jvp` returned by"
+                " `jax.linearize`")
+          extra_msg = " \nThis might be fixed by:\n" + "\n".join(
+              f"  * {d};" for d in pvary_applications)
+        raise ValueError(
+            "linearized function called on tangent values inconsistent with "
+            "the original primal values:\n"
+            f"Got tangent aval {tangent_aval} for primal aval {primal_aval} "
+            f"but expected {expected_tangent_aval}.{extra_msg}")
     tangents_out = eval_jaxpr(jaxpr, consts, *tangents)
     tangents_out_ = iter(tangents_out)
     full_out = [pval.get_known() if pval.is_known() else next(tangents_out_)

@@ -254,6 +254,7 @@ py_library_providing_imports_info(
         "_src/public_test_util.py",
         "_src/random.py",
         "_src/shard_alike.py",
+        "_src/shard_map.py",
         "_src/sourcemap.py",
         "_src/stages.py",
         "_src/tree.py",
@@ -670,7 +671,6 @@ pytype_strict_library(
             "experimental/pallas/**/*.py",
         ],
         exclude = [
-            "experimental/pallas/gpu.py",
             "experimental/pallas/mosaic_gpu.py",
             "experimental/pallas/ops/gpu/**/*.py",
             "experimental/pallas/ops/tpu/**/*.py",
@@ -783,7 +783,6 @@ pytype_strict_library(
 pytype_strict_library(
     name = "pallas_triton",
     srcs = [
-        "experimental/pallas/gpu.py",
         "experimental/pallas/triton.py",
     ],
     visibility = [

@@ -42,7 +42,7 @@ from jax.lax import with_sharding_constraint
 from jax._src import prng
 from jax.sharding import PartitionSpec as P, Mesh
 from jax.experimental import multihost_utils
-from jax.experimental.shard_map import shard_map
+from jax._src.shard_map import shard_map
 from jax._src.compilation_cache import is_persistent_cache_enabled
 from jax.experimental.custom_partitioning import (
     custom_partitioning, SdyShardingRule, BATCHING)
@@ -61,7 +61,7 @@ from jax._src.mesh import AxisType
 from jax._src.interpreters import pxla
 from jax._src import xla_bridge
 from jax._src.lib import xla_client as xc
-from jax._src.lib import xla_extension
+from jax._src.lib import _jax
 from jax._src.util import curry, unzip2
 
 config.parse_flags_with_absl()
@@ -902,8 +902,11 @@ class PJitTest(jtu.BufferDonationTestCase):
     def check_outfeed(x_fn):
       for didx, d in enumerate(devices):
         x = x_fn(didx)
-        y, = d.transfer_from_outfeed(
-            xc.shape_from_pyval((x,)).with_major_to_minor_layout_if_absent())
+        y = d.transfer_from_outfeed(
+            xc.Shape.array_shape(
+                xc.PrimitiveType.F32, x.shape
+            ).with_major_to_minor_layout_if_absent()
+        )
         self.assertAllClose(x, y, check_dtypes=True)
 
     logging.info('Transferring from outfeed for the pjit call')
@@ -3615,6 +3618,9 @@ class ArrayPjitTest(jtu.JaxTestCase):
     if jtu.is_device_tpu(5, 'e'):
       self.skipTest('TPU v5e does not support computations that run on a '
                     'non-singleton subset of cores.')
+    if jtu.is_device_tpu(6, 'e'):
+      self.skipTest('TPU v6e does not support computations that run on a '
+                    'non-singleton subset of cores.')
 
     def _test(fun, inp, np_inp, in_s):
       out = fun(inp)
@@ -3738,48 +3744,12 @@ class ArrayPjitTest(jtu.JaxTestCase):
       out = with_sharding_constraint(jnp.arange(8), P(['x']))
     self.assertEqual(out.sharding, NamedSharding(mesh, P('x')))
 
-  def test_sharding_preserved_trivial(self):
-    if config.use_shardy_partitioner.value:
-      raise unittest.SkipTest("Shardy doesn't support PositionalSharding")
-    mesh = jtu.create_mesh((2, 1), ('x', 'y'))
-    ns = NamedSharding(mesh, P('x'))
-    ps = PositionalSharding(jax.devices()[:2]).reshape(2, 1)
-
-    arr = jax.device_put(np.arange(8).reshape(8, 1), ns)
-    arr2 = jax.device_put(np.arange(8).reshape(8, 1), ps)
-
-    def identity(x):
-      return x
-
-    out = pjit(identity)(arr)
-    self.assertIsInstance(out.sharding, NamedSharding)
-
-    out2 = pjit(identity)(arr2)
-    self.assertIsInstance(out2.sharding, PositionalSharding)
-
   def test_wsc_error_on_none(self):
     with self.assertRaisesRegex(
         ValueError,
         'One of with_sharding_constraint arguments got sharding None which is'
         ' not allowed'):
       with_sharding_constraint(jnp.arange(8), None)
-
-  def test_sharding_preserved_aot(self):
-    mesh = jtu.create_mesh((2, 1), ('x', 'y'))
-    ns = NamedSharding(mesh, P('x'))
-    ps = PositionalSharding(jax.devices()[:2]).reshape(2, 1)
-
-    arr = jax.device_put(np.arange(8).reshape(8, 1), ns)
-    arr2 = jax.device_put(np.arange(8).reshape(8, 1), ps)
-
-    compiled = pjit(lambda x: x * 2).lower(arr).compile()
-    out = compiled(arr)
-    self.assertIsInstance(out.sharding, NamedSharding)
-
-    out2 = compiled(arr2)
-    # The sharding won't be PositionalSharding since the pjit was already
-    # Compiled which bakes in the output sharding.
-    self.assertIsInstance(out2.sharding, NamedSharding)
 
   def test_sharding_on_output_with_vmap(self):
     mesh = jtu.create_mesh((2, 1), ('x', 'y'))
@@ -4512,7 +4482,7 @@ class ArrayPjitTest(jtu.JaxTestCase):
       return x + y[..., jnp.newaxis]
 
     f = jax.jit(shard_map(
-        _f, mesh, in_specs=(P(None, 'i'), P(None)),
+        _f, mesh=mesh, in_specs=(P(None, 'i'), P(None)),
         out_specs=P(None, 'i')))
     f(jnp.zeros((2, 16)), jnp.ones(2))
 
@@ -4530,7 +4500,7 @@ class ArrayPjitTest(jtu.JaxTestCase):
       return x + y[..., jnp.newaxis]
 
     f = jax.jit(shard_map(
-        _f, mesh, in_specs=(P(None, 'i'), P(None)),
+        _f, mesh=mesh, in_specs=(P(None, 'i'), P(None)),
         out_specs=P(None, 'i')))
     f(jnp.zeros((2, 16)), jnp.ones(2))
 
@@ -6971,7 +6941,7 @@ class ShardingInTypesTest(jtu.JaxTestCase):
       return const * 2
 
     shmap_f = shard_map(f, mesh=mesh, in_specs=(), out_specs=P('x'),
-                        auto=frozenset({'y'}))
+                        axis_names={'x'})
     f = jax.jit(shmap_f)
     out = f()
     self.assertArraysEqual(out, jnp.concatenate([const * 2, const * 2]))
@@ -7282,6 +7252,7 @@ class ShardingInTypesTest(jtu.JaxTestCase):
       out = reshard(np.arange(8), P('x'))
       self.assertEqual(out.sharding, NamedSharding(mesh, P('x')))
     finally:
+      self.assertIsNone(prev_mesh)
       jax.sharding.set_mesh(prev_mesh)
 
   @jtu.with_explicit_mesh((2,), ('x',))
@@ -7551,6 +7522,58 @@ class ShardingInTypesTest(jtu.JaxTestCase):
       x_j = x.at[j].get(out_sharding=jax.typeof(x).sharding)
       return x.at[i].set(x_j)
     f2(x,i,j)  # doesn't crash
+
+  @jtu.with_explicit_mesh((4, 2), ('x', 'y'))
+  def test_conv_general_dilated(self, mesh):
+    arr = jax.device_put(np.zeros((16, 128, 8)), P('x', 'y'))
+
+    @jax.jit
+    def f(x):
+      # Conv1D across sharded y-axis:
+      out = jax.lax.conv_general_dilated(
+          x, np.zeros((5, 8, 10)),
+          window_strides=(1,), padding='SAME', feature_group_count=1,
+          lhs_dilation=(1,), rhs_dilation=(1,),
+          dimension_numbers=('NWC', 'WIO', 'NWC'))
+      self.assertEqual(out.aval.sharding.spec, P('x', 'y', None))
+      # Max pooling along sharded y-axis.
+      out2 = jax.lax.reduce_window(
+          out, -np.inf, jax.lax.max, (1,2,1), (1,2,1), 'SAME')
+      self.assertEqual(out2.aval.sharding.spec, P('x', 'y', None))
+      return out2
+
+    out = f(arr)
+    self.assertEqual(out.sharding, NamedSharding(mesh, P('x', 'y', None)))
+    self.check_wsc_in_lowered(f.lower(arr).as_text())
+
+    jax.jit(jax.grad(lambda x: f(x).sum()))(arr)  # doesn't crash
+
+    with self.assertRaises(core.ShardingTypeError):
+      arr2 = jax.device_put(np.zeros((16, 128, 8)), P('x', None, 'y'))
+      f(arr2)
+
+  @parameterized.named_parameters(
+      ('spec1', P('x', 'y', None)),
+      ('spec2', P('x', None, 'y')),
+      ('spec3', P(None, 'x', 'y')),
+      ('spec4', P(('x', 'y'), None, None))
+  )
+  @jtu.with_explicit_mesh((4, 2), ('x', 'y'))
+  def test_reduce_window(self, spec, mesh):
+    arr = jax.device_put(np.zeros((16, 128, 8)), spec)
+
+    @jax.jit
+    def f(x):
+      out = jax.lax.reduce_window(
+          x, -np.inf, jax.lax.max, (1,2,1), (1,2,1), 'SAME')
+      self.assertEqual(out.aval.sharding.spec, spec)
+      return out
+
+    out = f(arr)
+    self.assertEqual(out.sharding, NamedSharding(mesh, spec))
+    self.check_wsc_in_lowered(f.lower(arr).as_text())
+
+    jax.jit(jax.grad(lambda x: f(x).sum()))(arr)  # doesn't crash
 
 
 @jtu.pytest_mark_if_available('multiaccelerator')
@@ -7978,12 +8001,12 @@ class UtilTest(jtu.JaxTestCase):
 
   def test_hlo_sharding_iota_tile_error(self):
     self.assertRaisesRegex(
-        xla_extension.XlaRuntimeError,
+        _jax.XlaRuntimeError,
         'INVALID_ARGUMENT: `dims` should not be empty.',
         lambda: xc.HloSharding.iota_tile(())
     )
     self.assertRaisesRegex(
-        xla_extension.XlaRuntimeError,
+        _jax.XlaRuntimeError,
         'INVALID_ARGUMENT: Cannot reshape from',
         lambda: xc.HloSharding.iota_tile(
             (2, 2),
@@ -7992,7 +8015,7 @@ class UtilTest(jtu.JaxTestCase):
         ),
     )
     self.assertRaisesRegex(
-        xla_extension.XlaRuntimeError,
+        _jax.XlaRuntimeError,
         'INVALID_ARGUMENT: `reshape_dims` and `transpose_perm` should have the'
         ' same size',
         lambda: xc.HloSharding.iota_tile(
@@ -8001,7 +8024,7 @@ class UtilTest(jtu.JaxTestCase):
         ),
     )
     self.assertRaisesWithLiteralMatch(
-        xla_extension.XlaRuntimeError,
+        _jax.XlaRuntimeError,
         'INVALID_ARGUMENT: `subgroup_types`(3) should not have more dimensions '
         'than `dims`(2).',
         lambda: xc.HloSharding.iota_tile(

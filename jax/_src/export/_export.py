@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""JAX APIs for exporting JAX functions for interoperation.
-
-"""
+"""JAX APIs for exporting JAX functions for interoperation."""
 
 from __future__ import annotations
 
@@ -43,7 +41,7 @@ from jax._src import mesh as mesh_lib
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.lib import xla_client
-from jax._src.lib import xla_extension
+from jax._src.lib import _jax
 from jax._src.lib.mlir import ir, passmanager
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.lib.mlir.dialects import func as func_dialect
@@ -691,7 +689,7 @@ def _export_lowered(
   # Shardy was used during lowering if we can find the Shardy mesh in the
   # module. Note that the mesh should have been lifted by the
   # `sdy-lift-inlined-meshes` pass in mlir.py.
-  shardy_enabled = xla_extension.sdy.lowered_with_shardy(
+  shardy_enabled = _jax.sdy.lowered_with_shardy(
       mlir.module_to_bytecode(mlir_module))
 
   mlir_module_serialized = _module_to_bytecode(mlir_module, shardy_enabled)
@@ -811,7 +809,7 @@ def _export_lowered(
 
 def _module_to_bytecode(module: ir.Module, shardy_enabled: bool) -> bytes:
   if shardy_enabled:
-    mlir_str = xla_extension.sdy.sdy_round_trip_export_pipeline(
+    mlir_str = _jax.sdy.sdy_round_trip_export_pipeline(
         mlir.module_to_bytecode(module))
   else:
     mlir_str = mlir.module_to_bytecode(module)
@@ -1118,6 +1116,7 @@ _CUSTOM_CALL_TARGETS_GUARANTEED_STABLE = {
     "ApproxTopK", "stablehlo.dynamic_approx_top_k",
     "tf.call_tf_function",  # From jax2tf.call_tf(func, call_tf_graph=True)
     "tpu_custom_call",  # Pallas/TPU kernels
+    "mosaic_gpu",  # Pallas Mosaic GPU kernels
     # TODO(burmako): maintain backwards compatibility for these, until they
     # are upstreamed to StableHLO.
     # See https://github.com/openxla/stablehlo/issues/8.
@@ -1214,16 +1213,6 @@ def expand_in_shardings(in_shardings: Sequence[LoweringSharding],
   for idx, in_s in zip(sorted(module_kept_var_idx), in_shardings):
     all_in_shardings[idx] = in_s
   return tuple(all_in_shardings)
-
-
-def _hlo_sharding_to_xla_compatible_sharding(
-    hlo_sharding: HloSharding | None,
-    mesh: sharding.Mesh) -> sharding.Sharding | None:
-  if hlo_sharding is None:
-    return None
-  return sharding_impls._gspmd_to_named_sharding_via_mesh(
-      _hlo_sharding_to_gspmd_sharding(hlo_sharding, tuple(mesh.devices.flat)),  # type: ignore[arg-type]
-      mesh)
 
 
 def _hlo_sharding_to_gspmd_sharding(
@@ -1442,11 +1431,12 @@ def _call_exported_lowering(ctx: mlir.LoweringRuleContext, *args,
     ctx.module_context.shape_poly_state.uses_dim_vars = True
   submodule = ir.Module.parse(exported.mlir_module())
 
-  shardy_enabled = xla_extension.sdy.lowered_with_shardy(
-      mlir.module_to_bytecode(submodule))
+  submodule_bc = mlir.module_to_bytecode(submodule)
+  shardy_enabled = _jax.sdy.lowered_with_shardy(submodule_bc)
   if shardy_enabled:
-    submodule = ir.Module.parse(xla_extension.sdy.sdy_round_trip_import_shardings(
-        mlir.module_to_bytecode(submodule)))
+    submodule = ir.Module.parse(
+        _jax.sdy.sdy_round_trip_import_shardings(submodule_bc)
+    )
 
   with submodule.context:
     pipeline = passmanager.PassManager.parse(
@@ -1455,7 +1445,7 @@ def _call_exported_lowering(ctx: mlir.LoweringRuleContext, *args,
 
   mesh = None
   if shardy_enabled:
-    sdy_mesh_axes = xla_extension.sdy.get_mesh(mlir.module_to_bytecode(submodule))
+    sdy_mesh_axes = _jax.sdy.get_mesh(mlir.module_to_bytecode(submodule))
     mesh = (mesh_lib.AbstractMesh(*list(zip(*sdy_mesh_axes))[::-1])
             if sdy_mesh_axes else mesh_lib.empty_abstract_mesh)
 

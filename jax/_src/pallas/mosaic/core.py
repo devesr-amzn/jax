@@ -87,7 +87,7 @@ class TPUCompilerParams(pallas_core.CompilerParams):
     serialization_format: The serialization format for the kernel body.
     disable_bounds_checks: Disable bounds checks in the kernel.
   """
-  PLATFORM: ClassVar[str] = "mosaic"
+  BACKEND: ClassVar[pallas_core.Backend] = "mosaic_tpu"
   dimension_semantics: (
       Sequence[Literal["parallel", "arbitrary"] | GridDimensionSemantics] | None
   ) = None
@@ -224,7 +224,7 @@ def _tensorcore_mesh_discharge_rule(
     mesh,
     jaxpr,
     compiler_params: Any | None,
-    interpret: bool,
+    interpret: Any,
     debug: bool,
     cost_estimate: pallas_core.CostEstimate | None,
     name: str,
