@@ -1274,7 +1274,7 @@ class PJitTest(jtu.BufferDonationTestCase):
                 b:f32[1] = pjit[
                   name=<lambda>
                   jaxpr={ lambda ; a:f32[1] c:f32[]. let b:f32[1] = mul a c in (b,) }
-                ] a 1.0
+                ] a 1.0:f32
               in (b,) }
         """).strip(),
     )
@@ -1308,7 +1308,7 @@ class PJitTest(jtu.BufferDonationTestCase):
             { lambda ; a:f32[1]. let
                 b:i32[] c:f32[1] = pjit[
                   name=<lambda>
-                  jaxpr={ lambda ; a:f32[1]. let  in (2, a) }
+                  jaxpr={ lambda ; a:f32[1]. let  in (2:i32, a) }
                 ] a
               in (b, c) }
         """).strip(),
@@ -4467,6 +4467,14 @@ class ArrayPjitTest(jtu.JaxTestCase):
     self.assertLen(traced.in_avals, 2)
     self.assertLen(traced.in_avals[0], 1)
     self.assertLen(traced.in_avals[1], 0)  # empty kwarg
+
+  def test_in_out_shardings_unconstrained_error(self):
+    mesh = jtu.create_mesh((1,), ('x',))
+
+    with self.assertRaisesRegex(
+        ValueError, "Unconstrained dims are not allowed"):
+      jax.jit(lambda x: x,
+              in_shardings=NamedSharding(mesh, P(P.UNCONSTRAINED, 'x')))
 
   def test_empty_io_callback_under_shard_map(self):
     if config.use_shardy_partitioner.value:

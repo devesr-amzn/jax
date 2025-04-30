@@ -114,6 +114,18 @@ jax_multiplatform_test(
     },
 )
 
+jax_multiplatform_test(
+    name = "buffer_callback_test",
+    srcs = ["buffer_callback_test.py"],
+    enable_backends = [
+        "cpu",
+        "gpu",
+    ],
+    deps = [
+        "//jax:experimental_buffer_callback",
+    ],
+)
+
 jax_py_test(
     name = "config_test",
     srcs = ["config_test.py"],
@@ -585,17 +597,17 @@ jax_multiplatform_test(
     name = "lax_scipy_special_functions_test",
     srcs = ["lax_scipy_special_functions_test.py"],
     backend_tags = {
-        "gpu": ["noasan"],  # Times out.
         "cpu": [
-            "noasan",
-            "notsan",
-        ],  # Times out.
+            "nomsan",  # Times out.
+            "notsan",  # Times out.
+        ],
     },
     shard_count = {
         "cpu": 20,
         "gpu": 30,
         "tpu": 20,
     },
+    tags = ["noasan"],  # Times out under asan.
     deps = py_deps("numpy") + py_deps("scipy") + py_deps("absl/testing"),
 )
 
@@ -992,6 +1004,10 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "scipy_spatial_test",
     srcs = ["scipy_spatial_test.py"],
+    shard_count = {
+        "cpu": 4,
+        "gpu": 4,
+    },
     deps = py_deps("scipy"),
 )
 
