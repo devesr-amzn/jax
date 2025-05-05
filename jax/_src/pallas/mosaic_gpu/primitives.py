@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Sequence, Callable
 import dataclasses
 import enum
+import functools
 import itertools
 import math
 from typing import Any, Literal
@@ -33,6 +34,7 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith as arith_dialect
 from jax._src.lib.mlir.dialects import llvm as llvm_dialect
 from jax._src.lib.mlir.dialects import memref as memref_dialect
+from jax._src.lib.mlir.dialects import gpu as gpu_dialect
 from jax._src.lib.mlir.dialects import nvvm as nvvm_dialect
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as gpu_core
@@ -43,6 +45,7 @@ from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
+from jax.experimental.mosaic.gpu import tcgen05
 import jax.numpy as jnp
 
 
@@ -617,6 +620,8 @@ barrier_arrive_p.multiple_results = True
 def _barrier_arrive_abstract_eval(barrier, *args, **params):
   del args, params  # Unused.
   _check_ref(barrier, "barrier", gpu_core.SMEM)
+  if getattr(barrier.inner_aval.dtype, "for_tensor_core", False):
+    raise ValueError("Cannot arrive on a tensor core barrier.")
   return (), {gpu_core._memory_effect}
 
 
@@ -705,12 +710,14 @@ def _barrier_wait_lowering(
     *flat_transforms,
     transforms_treedef,
 ):
-  del ctx  # Unused.
+  barrier_aval = ctx.avals_in[0]
   transforms = transforms_treedef.unflatten(flat_transforms)
   indexer = _extract_barrier_indexer(transforms)
+  for_tensor_core = getattr(
+      barrier_aval.inner_aval.dtype, "for_tensor_core", False)
   if indexer is not None:
     barrier = barrier.__getitem__(*map(lowering._as_index, indexer.indices))
-  barrier.wait()
+  barrier.wait(for_tensor_core=for_tensor_core)
   return ()
 
 
@@ -721,7 +728,7 @@ def barrier_wait(barrier: pallas_core.AbstractMemoryRef) -> None:
   )
   flat_transforms, transforms_treedef = tree_util.tree_flatten(transforms)
   barrier_wait_p.bind(
-      barrier, *flat_transforms, transforms_treedef=transforms_treedef
+      barrier, *flat_transforms, transforms_treedef=transforms_treedef,
   )
 
 
@@ -1111,6 +1118,177 @@ def _wgmma_accumulator_deref_lowering(ctx: lowering.LoweringRuleContext, acc):
   )
 
 
+# MMA for TensorCore gen 5.
+tcgen05_mma_p = jax_core.Primitive("tcgen05_mma")
+tcgen05_mma_p.multiple_results = True
+
+def tcgen05_mma(acc: _Ref,
+                a: _Ref,
+                b: _Ref,
+                barrier: _Ref,
+                accumulate: bool | jax.Array = True):
+  """Asynchronous matrix-multiply accumulate for TensorCore gen 5 (Blackwell).
+
+  Args:
+    acc: The accumulator. Must be a TMEM Ref.
+    a: The left-hand side. Must be a TMEM/SMEM Ref.
+    b: The right-hand side. Must be an SMEM Ref.
+    barrier: Barrier Ref for synchronizing with the tensor core. Should have
+      for_tensor_core set to True.
+    accumulate: Whether to accumulate into acc or overwrite it.
+  """
+  acc_m, acc_n = acc.shape
+  lhs_m, lhs_k = a.shape
+  rhs_k, rhs_n = b.shape
+  if acc_m != lhs_m:
+    raise ValueError(
+        f"Accumulator and LHS have incompatible shapes. Accumulator: {acc.shape}. LHS: {a.shape}.")
+  if acc_n != rhs_n:
+    raise ValueError(
+        f"Accumulator and RHS have incompatible shapes. Accumulator: {acc.shape}. RHS: {b.shape}.")
+  if lhs_k != rhs_k:
+    raise ValueError(
+        f"LHS and RHS have incompatible shapes. LHS: {a.shape}. RHS: {b.shape}.")
+
+  if isinstance(a, pallas_core.TransformedRef):
+    a_transforms_leaves, a_transforms_tree = jax.tree.flatten(a.transforms)
+    a = a.ref
+  else:
+    a_transforms_leaves, a_transforms_tree = [], None
+
+  if isinstance(b, pallas_core.TransformedRef):
+    b_transforms_leaves, b_transforms_tree = jax.tree.flatten(b.transforms)
+    b = b.ref
+  else:
+    b_transforms_leaves, b_transforms_tree = [], None
+
+  tcgen05_mma_p.bind(acc, a, b, barrier, accumulate,
+                      *a_transforms_leaves, *b_transforms_leaves,
+                      a_transforms_tree=a_transforms_tree,
+                      b_transforms_tree=b_transforms_tree,
+                      collective=False)
+
+@tcgen05_mma_p.def_abstract_eval
+def _tcgen05_mma_abstract_eval(acc, a, b, barrier, accumulate,
+                               *transforms_leaves,
+                               a_transforms_tree, b_transforms_tree,
+                               collective):
+  del (accumulate, transforms_leaves, a_transforms_tree, b_transforms_tree)
+  if collective:
+    raise NotImplementedError("Collective MMA not yet implemented.")
+
+  if acc.memory_space != gpu_core.GPUMemorySpace.TMEM:
+    raise ValueError("Accumulator must be a TMEM Ref.")
+  if a.memory_space != gpu_core.GPUMemorySpace.SMEM:
+    raise ValueError("LHS must be an SMEM Ref. TMEM not yet supported.")
+  if b.memory_space != gpu_core.GPUMemorySpace.SMEM:
+    raise ValueError("RHS must be an SMEM Ref.")
+
+  for_tensor_core = getattr(
+      barrier.inner_aval.dtype, "for_tensor_core", False)
+  if not for_tensor_core:
+    raise ValueError("MMA barrier must have for_tensor_core set to True.")
+
+  return []
+
+@lowering.register_lowering_rule(tcgen05_mma_p, *gpu_core.LANExWG_SEMANTICS)
+@lowering.register_lowering_rule(tcgen05_mma_p, *gpu_core.LANExWARP_SEMANTICS)
+def _tcgen05_mma_lowering(
+    ctx: lowering.LoweringRuleContext,
+    acc: tcgen05.TMEMRef,
+    a_ref,
+    b_ref,
+    barrier_ref: mgpu.BarrierRef,
+    accumulate: bool | ir.Value,
+    *transforms_leaves,
+    a_transforms_tree,
+    b_transforms_tree,
+    collective: bool,
+):
+  _, a_aval, b_aval, *_ = ctx.avals_in
+  lhs_swizzle: int = 128
+  lhs_transpose: bool = False
+  if a_transforms_tree is not None:
+    a_transforms_leaves, b_transforms_leaves = util.split_list(
+        transforms_leaves, [a_transforms_tree.num_leaves]
+    )
+
+    a_transforms = a_transforms_tree.unflatten(a_transforms_leaves)
+    a_ref, a_transforms = lowering._handle_transforms(
+        a_ref, a_transforms, handle_transposes=False, handle_reshapes=True
+    )
+    match a_transforms:
+      case (gpu_core.UnswizzleRef(lhs_swizzle), gpu_core.UntileRef(lhs_tiling)):
+        lhs_transpose = False
+      case (
+          gpu_core.UnswizzleRef(lhs_swizzle),
+          gpu_core.UntileRef(lhs_tiling),
+          gpu_core.TransposeRef((1, 0)),
+      ):
+        lhs_transpose = True
+      case _:
+        raise NotImplementedError(
+            f"Unsupported transforms: {a_transforms}."
+        )
+    swizzle_elems = lhs_swizzle // a_aval.dtype.itemsize
+    if lhs_tiling != (8, swizzle_elems):
+      raise ValueError("MMA lhs tiling does not fit swizzle. "
+                       f"{lhs_tiling=} expected={(8, swizzle_elems)}")
+  else:
+    b_transforms_leaves = transforms_leaves  # type: ignore
+
+  b_transforms = b_transforms_tree.unflatten(b_transforms_leaves)
+  b_ref, b_transforms = lowering._handle_transforms(
+      b_ref, b_transforms, handle_transposes=False, handle_reshapes=True
+  )
+  match b_transforms:
+    case (gpu_core.UnswizzleRef(rhs_swizzle), gpu_core.UntileRef(rhs_tiling)):
+      rhs_transpose = False
+    case (
+        gpu_core.UnswizzleRef(rhs_swizzle),
+        gpu_core.UntileRef(rhs_tiling),
+        gpu_core.TransposeRef((1, 0)),
+    ):
+      rhs_transpose = True
+    case _:
+      raise NotImplementedError(
+          f"Unsupported transforms: {b_transforms}."
+      )
+
+  swizzle_elems = rhs_swizzle // b_aval.dtype.itemsize
+  if rhs_swizzle != lhs_swizzle:
+    raise ValueError("MMA rhs swizzle must match lhs swizzle."
+                      f" {lhs_swizzle=} {rhs_swizzle=}")
+  if rhs_tiling != (8, swizzle_elems):
+    raise ValueError("MMA rhs tiling does not fit swizzle"
+                      f" {rhs_tiling=} expected={(8, swizzle_elems)}")
+  if lhs_transpose or rhs_transpose:
+    raise NotImplementedError("Lowering does not yet support transpose")
+  if isinstance(accumulate, bool):
+    accumulate = mgpu.c(accumulate, ir.IntegerType.get_signless(1))
+
+  predicate = ctx.module_ctx.single_lane_predicate
+  if collective:
+    index = ir.IndexType.get()
+    is_leader_block = arith_dialect.cmpi(
+        arith_dialect.CmpIPredicate.eq,
+        ctx.launch_ctx.cluster_idx(gpu_dialect.Dimension.x), mgpu.c(0, index))
+    predicate = arith_dialect.andi(predicate, is_leader_block)
+  with mgpu.when(predicate):
+    tcgen05.mma(
+              acc,
+              a_ref,
+              b_ref,
+              a_swizzle=rhs_swizzle,
+              b_swizzle=lhs_swizzle,
+              accumulate=accumulate,
+              collective=collective,
+          )
+    tcgen05.commit_arrive(barrier_ref,
+                          collective=collective,
+                          ctx=ctx.launch_ctx)
+  return []
+
 class Layout(enum.Enum):
   #: [m, n] matrix, where m % 64 == 0 == n % 8.
   WGMMA = enum.auto()
@@ -1476,7 +1654,17 @@ inline_mgpu_p.multiple_results = True
 
 @dataclasses.dataclass(frozen=True)
 class RefType:
-  ...
+  transforms: tuple[gpu_core.MemoryRefTransform, ...] = ()
+
+
+def _undo_transforms(
+    raw_ref: pallas_core.AbstractMemoryRef,
+    memory_transforms: Sequence[gpu_core.MemoryRefTransform],
+):
+  """Extract the `Transform`s that reverse the `MemoryRefTransform`s"""
+  tmp_ref = state_types.TransformedRef(raw_ref, transforms=())
+  tmp_ref = functools.reduce(lambda r, t: t.undo(r), reversed(memory_transforms), tmp_ref)
+  return tmp_ref.transforms
 
 
 def inline_mgpu(arg_types=(), return_type=None):
@@ -1540,30 +1728,30 @@ def inline_mgpu(arg_types=(), return_type=None):
 
       # Strip the transforms from the refs since they will be recorded in
       # the types.
-      raw_refs_flat_args = []
+      ref_transforms = []
+      raw_flat_args = []
       for a, t in zip(flat_args, flat_arg_types):
-        def traced_ty(ty):
-          return isinstance(a, jax_core.Tracer) and isinstance(a.aval, ty)
-
-        if isinstance(t, ParameterizedLayout) and traced_ty(jax_core.ShapedArray):
-          raw_refs_flat_args.append(a)
-        elif isinstance(t, RefType) and traced_ty(_Ref):
-          ref, transforms = a, ()
-          if isinstance(a, state_types.TransformedRef):
-            ref, transforms = ref.ref, ref.transforms
-
-          raw_refs_flat_args.append(ref)
-          if transforms:
-            raise NotImplementedError("Transformed refs (or types) are not supported.")
+        if isinstance(a, state_types.TransformedRef) and isinstance(t, RefType):
+          raw_flat_args.append(a.ref)
+          ref_transforms.append(a.transforms)
+        elif isinstance(aval := jax_core.get_aval(a), jax_core.ShapedArray) and isinstance(t, (ParameterizedLayout, Layout)):
+          raw_flat_args.append(a)
+          ref_transforms.append(None)
+        elif isinstance(aval, state.AbstractRef) and isinstance(t, RefType):
+          raw_flat_args.append(a)
+          ref_transforms.append(())
         else:
           raise ValueError(f"Mismatched type: {a, t}")
 
+      flat_ref_transforms, pytree_ref_transforms = jax.tree.flatten(ref_transforms)
       flat_ret = inline_mgpu_p.bind(
-          *flat_args,
-          args_treedef=treedef,
+          *raw_flat_args,
+          *flat_ref_transforms,
+          flat_arg_types=flat_arg_types,
           flat_ret_ty=flat_ret_ty,
           pytree_ret_ty=pytree_ret_ty,
-          flat_arg_types=flat_arg_types,
+          pytree_args=treedef,
+          pytree_ref_transforms=pytree_ref_transforms,
           mgpu_fn=f,
       )
       return jax.tree.unflatten(pytree_ret_ty, flat_ret)
@@ -1574,18 +1762,20 @@ def inline_mgpu(arg_types=(), return_type=None):
 
 @inline_mgpu_p.def_effectful_abstract_eval
 def _inline_mgpu_abstract_eval(
-    *flat_args,
-    args_treedef,
+    *flat_args_and_transforms,
     flat_arg_types,
     flat_ret_ty,
+    pytree_args,
+    pytree_ref_transforms,
     pytree_ret_ty,
     mgpu_fn,
 ):
-  del args_treedef, flat_arg_types, pytree_ret_ty, mgpu_fn  # Unused.
+  del flat_arg_types, pytree_ret_ty, pytree_ref_transforms, mgpu_fn  # Unused.
   aval_return = tuple(
       jax_core.ShapedArray(x.shape, x.dtype) for x in flat_ret_ty
   )
   # TODO(cperivol): Let the user set the effects.
+  flat_args = flat_args_and_transforms[:pytree_args.num_leaves]
   return aval_return, {
       gpu_core._wgmma_pipeline_effect,
       gpu_core._memory_effect,
@@ -1609,8 +1799,18 @@ def _type_check_mgpu(v, ty):
       pass
     case (GPUShapeDtypeStruct(), mgpu.FragmentedArray()):
       mlir_dtype = mgpu_utils.dtype_to_ir_type(ty.dtype)
-      if v.mlir_dtype != mlir_dtype or ty.shape != v.shape or v.layout != ty.layout.to_mgpu():
-        raise ValueError(f"Array type mismatch at {v} != {ty}.")
+      if v.mlir_dtype != mlir_dtype:
+        raise ValueError(
+            f"Array dtype mismatch: expected {v.mlir_dtype} got {mlir_dtype}."
+        )
+      if ty.shape != v.shape:
+        raise ValueError(
+            f"Array shape mismatch: expected {ty.shape} got {v.shape}."
+        )
+      if v.layout != ty.layout.to_mgpu():
+        raise ValueError(
+            f"Array layout mismatch: expected {v.layout} got {ty.layout.to_mgpu()}."
+        )
     case (Layout() , mgpu.FragmentedArray()) | (ParameterizedLayout(), mgpu.FragmentedArray()):
       if ty.to_mgpu() != v.layout:
         raise ValueError(f"Unexpected layout for {v} (expected: {ty})")
@@ -1621,17 +1821,40 @@ def _type_check_mgpu(v, ty):
 @lowering.register_lowering_rule(inline_mgpu_p, mgpu.LoweringSemantics.Lane)
 def _inline_mgpu_lowering_rule(
     ctx: lowering.LoweringRuleContext,
-    *flat_args,
+    *flat_args_and_transforms,
     mgpu_fn: Callable[..., Any],
     flat_arg_types,
     flat_ret_ty,
+    pytree_args,
+    pytree_ref_transforms,
     pytree_ret_ty,
-    args_treedef,
 ):
+  flat_args = flat_args_and_transforms[:pytree_args.num_leaves]
+  flat_arg_avals = ctx.avals_in[:pytree_args.num_leaves]
+  ref_transforms = pytree_ref_transforms.unflatten(flat_args_and_transforms[pytree_args.num_leaves:])
   for a, t in zip(flat_args, flat_arg_types):
     _type_check_mgpu(a, t)
 
-  args = jax.tree.unflatten(args_treedef, flat_args)
+  flat_transformed = []
+  for a, aval, t, transforms in zip(
+      flat_args, flat_arg_avals, flat_arg_types, ref_transforms, strict=True
+  ):
+    if not isinstance(t, RefType):
+      flat_transformed.append(a)
+      assert transforms is None
+      continue
+    assert isinstance(aval, pallas_core.AbstractMemoryRef)
+    a, user_transforms = lowering._handle_transforms(a, transforms, handle_transposes=False)
+    # Transforms that do not originate from a MemoryRefTransform are
+    # applied implicitly (eg by emit-pipeline) and therefore we do not
+    # expect the user to pass them to the type. The transforms not
+    # passed by the user here will be discharged.
+    ty_transforms = _undo_transforms(aval, t.transforms)
+    if ty_transforms != tuple(user_transforms):
+      raise ValueError(f"Transform mismatch: got {user_transforms}, expected {ty_transforms}")
+    flat_transformed.append(a)
+
+  args = jax.tree.unflatten(pytree_args, flat_transformed)
   ret = mgpu_fn(ctx.launch_ctx, *args)
   ret_leaves, ret_tree = jax.tree.flatten(
       ret, is_leaf=lambda x: isinstance(x, mgpu.FragmentedArray)

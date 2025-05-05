@@ -23,7 +23,18 @@ package(
 py_library(
     name = "mosaic_gpu",
     data = [":libmosaic_gpu_runtime.so"],
-    deps = [":_mosaic_gpu_ext"],
+    deps = [
+        ":_mosaic_gpu_ext",
+        ":mosaic_gpu_support",
+    ],
+)
+
+cc_library(
+    name = "mosaic_gpu_support",
+    deps = [
+        ":custom_call",
+        ":runtime",
+    ],
 )
 
 cc_library(
@@ -155,6 +166,7 @@ cc_library(
         "@llvm-project//mlir:ArithTransforms",
         "@llvm-project//mlir:BuiltinToLLVMIRTranslation",
         "@llvm-project//mlir:ComplexToLLVM",
+        "@llvm-project//mlir:ControlFlowDialect",
         "@llvm-project//mlir:ControlFlowToLLVM",
         "@llvm-project//mlir:ConversionPasses",
         "@llvm-project//mlir:ExecutionEngine",

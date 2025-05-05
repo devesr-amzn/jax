@@ -219,10 +219,11 @@ def _run_scoped_resource_estimator(
   for v in jaxpr.invars:
     aval = v.aval
     if isinstance(aval.dtype, gpu_core.BarrierType):
+      multiplier = 1 if aval.dtype.for_tensor_core else ctx.arrival_multiplier
       rs += Resources(
           barrier_counts=collections.Counter([
               mgpu.Barrier(
-                  aval.dtype.num_arrivals * ctx.arrival_multiplier, *aval.shape
+                  aval.dtype.num_arrivals * multiplier, *aval.shape
               )
           ])
       )
@@ -803,7 +804,7 @@ def lower_jaxpr_to_module(
     # Each range is 2 events, each event is 4 bytes.
     prof_spec = mgpu_profiler.ProfilerSpec(params.profile_space * 2 * 4)
     prof_ctx = ProfilerContext(params.profile_dir, prof_spec)
-  module, new_out_shapes, _, launch_ctx, scratch_arr = (
+  module, new_out_shapes, _, launch_ctx = (
       mgpu_core._lower_as_gpu_kernel(
           body,
           grid=tuple(map(operator.mul, parallel_grid, cluster)),
@@ -819,13 +820,18 @@ def lower_jaxpr_to_module(
   )
 
   if lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
+    # We need to run CSE first in orderto remove dead-code for which layout
+    # inference does not work.
+    pm = mlir.passmanager.PassManager.parse("builtin.module(cse)", module.context)
+    pm.run(module.operation)
+
     # Run Python lowering passes. The remaining passes will be run in C++ in
     # jax/jaxlib/mosaic/gpu/custom_call.cc
     mgpu.infer_layout(module)  # pytype: disable=attribute-error
     mgpu.infer_transforms(module)  # pytype: disable=attribute-error
     mgpu.lower_mgpu_dialect(module, launch_ctx)  # pytype: disable=attribute-error
 
-  mgpu_core._initialize_scratch(launch_ctx, scratch_arr)
+  launch_ctx.scratch.finalize_size()
 
   if gmem_scratch_shapes:
     new_out_shapes = new_out_shapes[:-len(gmem_scratch_shapes)]
@@ -1348,8 +1354,9 @@ def _swap_lowering_rule(
 def _swap_lowering_rule_wg(
     ctx: LoweringRuleContext, x_smem, value, *leaves, tree
 ):
-  if not ir.VectorType.isinstance(value.type):
-    raise TypeError(f"Can only store vectors (got {value}).")
+  shape = ctx.avals_out[0].shape
+  if shape and not ir.VectorType.isinstance(value.type):
+    raise TypeError(f"Can only store scalars or vectors (got {value}).")
   if not ir.MemRefType.isinstance(x_smem.type):
     raise TypeError(f"Can only store to references (got {x_smem}).")
 
@@ -1362,7 +1369,6 @@ def _swap_lowering_rule_wg(
         "Transforms are not yet implemented for warpgroup semantics"
     )
 
-  shape = ctx.avals_out[0].shape
   ty = ir.VectorType.get(shape, mgpu_utils.dtype_to_ir_type(x_aval.dtype))
   if shape:
     zero_index = arith_dialect.constant(ir.IndexType.get(), 0)
@@ -2102,11 +2108,12 @@ def _run_scoped_lowering_rule(
           input_refs.append(acc)
         should_discharge.append(True)
       elif isinstance(aval.dtype, gpu_core.BarrierType):
+        multiplier = (1 if aval.dtype.for_tensor_core else
+                      ctx.estimator_ctx.arrival_multiplier)
         barrier_ref = alloc_stack.enter_context(
             ctx.module_ctx.reserve_barrier(
                 mgpu.Barrier(
-                    aval.dtype.num_arrivals
-                    * ctx.estimator_ctx.arrival_multiplier,
+                    aval.dtype.num_arrivals * multiplier,
                     *aval.shape,
                 )
             )
@@ -2465,7 +2472,7 @@ def _cond_lowering_rule(ctx: LoweringRuleContext, index, *args, branches):
   def _yielded_values(outs, avals):
     ret = []
     for out, aval in zip(outs, avals):
-      if isinstance(out, mgpu.FragmentedArray):
+      if isinstance(out, (mgpu.WGMMAAccumulator, mgpu.FragmentedArray)):
         ret.append(out)
       else:
         ret.append(_ensure_ir_value(out, aval.dtype))

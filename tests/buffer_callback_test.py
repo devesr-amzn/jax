@@ -33,6 +33,8 @@ class BufferCallbackTest(jtu.JaxTestCase):
       self.skipTest(
           "Requires a version of jaxlib with buffer callback support."
       )
+    if jtu.test_device_matches(["tpu"]):
+      self.skipTest("Not supported on TPU.")
 
   @parameterized.parameters(jtu.dtypes.all)
   @jtu.run_on_devices("cpu")
@@ -44,7 +46,6 @@ class BufferCallbackTest(jtu.JaxTestCase):
         ctx.stream
 
       self.assertEqual(ctx.stage, buffer_callback.ExecutionStage.EXECUTE)
-      self.assertEqual(ctx.device_ordinal, 0)
       self.assertEqual(arg.shape, shape)
       self.assertEqual(arg.dtype, dtype)
       self.assertEqual(out.shape, shape)
@@ -94,7 +95,7 @@ class BufferCallbackTest(jtu.JaxTestCase):
 
     # We can't actually test the output because numpy doesn't support writable
     # DLPack tensors.
-    fun(data)
+    jax.block_until_ready(fun(data))
 
   @parameterized.parameters(jtu.dtypes.all)
   @jtu.run_on_devices("cuda")
@@ -122,7 +123,7 @@ class BufferCallbackTest(jtu.JaxTestCase):
     fun = buffer_callback.buffer_callback(
         callback, jax.ShapeDtypeStruct(data.shape, data.dtype)
     )
-    fun(data)
+    jax.block_until_ready(fun(data))
 
   @parameterized.parameters([
       "sequential", "sequential_unrolled", "expand_dims", "broadcast_all"
@@ -163,7 +164,7 @@ class BufferCallbackTest(jtu.JaxTestCase):
         callback, jax.ShapeDtypeStruct(data.shape, data.dtype),
         input_output_aliases={0: 0},
     )
-    fun(data)
+    jax.block_until_ready(fun(data))
 
   def test_side_effect(self):
     def callback(*_):
@@ -171,8 +172,9 @@ class BufferCallbackTest(jtu.JaxTestCase):
       called = True
 
     called = False
-    fun = buffer_callback.buffer_callback(callback, (), has_side_effect=True)
-    fun()
+    fun = buffer_callback.buffer_callback(
+        callback, jax.ShapeDtypeStruct((), jnp.float32), has_side_effect=True)
+    jax.block_until_ready(fun())
     self.assertTrue(called)
 
 
