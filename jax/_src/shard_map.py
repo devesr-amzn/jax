@@ -146,7 +146,7 @@ def _get_default_infer():
 
 # TODO(yashkatariya): We need a singleton which users can provide to `in_axes`
 # to tell smap to infer in_specs from args when mesh is fully explicit.
-def smap(f, in_axes, out_axes, axis_name: AxisName):
+def smap(f, /, *, in_axes=Infer, out_axes, axis_name: AxisName):
   if isinstance(axis_name, (list, tuple)):
     raise TypeError(
         f"smap axis_name should be a `str` or a `Hashable`, but got {axis_name}")
@@ -170,66 +170,24 @@ def smap(f, in_axes, out_axes, axis_name: AxisName):
                        is_leaf=lambda x: x is None))
   out_specs = tree_map(partial(_axes_to_pspec, axis_name), out_axes,
                        is_leaf=lambda x: x is None)
-  return shard_map(f, axis_names={axis_name}, in_specs=in_specs,
-                   out_specs=out_specs)
+  return _shard_map(f, mesh=None, in_specs=in_specs, out_specs=out_specs,
+                    axis_names={axis_name}, check_vma=True, _smap=True)
 
 
 def _shard_map(f: Callable, *, mesh: Mesh | AbstractMesh | None,
                in_specs: Specs, out_specs: Specs | Callable[[], Specs],
                axis_names: Set[AxisName], check_vma: bool,
-               _skip_mesh_check: bool = False) -> Callable:
+               _skip_mesh_check: bool = False, _smap: bool = False) -> Callable:
   if not callable(f):
     raise TypeError("shard_map requires a callable for its first argument, "
                     f"but got {f} of type {type(f)}.")
 
-  if mesh is None:
-    mesh = get_abstract_mesh()
-    if mesh.empty:
-      raise ValueError(
-          "The context mesh cannot be empty. Either use"
-          " `jax.sharding.use_mesh(mesh)` to enter into a mesh context or pass"
-          " a mesh to `shard_map` via the `mesh` keyword argument.")
-  else:
-    ctx_mesh = get_abstract_mesh()
-    if (not _skip_mesh_check and not ctx_mesh.empty and
-        mesh.abstract_mesh != ctx_mesh):
-      raise ValueError(
-          f"The context mesh {ctx_mesh} should match the mesh passed to"
-          f" shard_map {mesh}")
-
-  if not isinstance(mesh, (Mesh, AbstractMesh)):
-    raise TypeError("shard_map requires a `jax.sharding.Mesh` or a "
-                    "`jax.sharding.AbstractMesh` instance for its "
-                    f"second argument, but got {mesh} of type {type(mesh)}.")
-
-  if not isinstance(axis_names, (frozenset, set)):
-    raise TypeError(
-        "`axis_names` argument of shard_map should be of type `frozenset` or"
-        f" `set`. Got type: {type(axis_names)}")
-  if isinstance(axis_names, set):
-    axis_names = frozenset(axis_names)
-  if not axis_names:
-    axis_names = frozenset(mesh.axis_names)
-  if not axis_names.issubset(mesh.axis_names):
-    raise ValueError(
-        f"jax.shard_map requires axis_names={axis_names} to be a subset of "
-        f"mesh.axis_names={mesh.axis_names}")
-
-  # TODO(yashkatariya): Maybe we don't have to be this strict?
-  if mesh._any_axis_auto_or_manual and in_specs is None:
-    raise TypeError(
-        "shard_map in_specs argument must be a pytree of"
-        " `jax.sharding.PartitionSpec` instances, but it was None when mesh"
-        f" has `Auto` axes {mesh}")
-
-  if in_specs is not None:
-    _check_specs(SpecErrorType.input, in_specs, axis_names)
-  if not callable(out_specs):
-    _check_specs(SpecErrorType.out, out_specs, axis_names)
-
   @util.wraps(f)
   @traceback_util.api_boundary
   def wrapped(*args):
+    nonlocal mesh, axis_names
+    mesh, axis_names = _shmap_checks(mesh, axis_names, in_specs, out_specs,
+                                     _skip_mesh_check, _smap)
     fun = lu.wrap_init(
         f, debug_info=api_util.debug_info("shard_map", f, args, {}))
     args_flat, in_tree = tree_flatten(args)
@@ -242,9 +200,8 @@ def _shard_map(f: Callable, *, mesh: Mesh | AbstractMesh | None,
       e, *_ = prefix_errors(in_specs, args)
       raise e('shard_map in_specs') from None
 
-    # TODO(yashkatariya): Relax this and convert only `None`s in `in_specs_flat`
-    # and accept the other specs as is.
-    if mesh._are_all_axes_explicit and in_specs is None:
+    if (in_specs is None and
+        all(mesh._name_to_type[a] == AxisType.Explicit for a in axis_names)):
       arg_s = [typeof(a).sharding for a in args_flat]
       assert all(i is None for i in in_specs_flat), in_specs_flat
       in_specs_flat = [_manual_spec(axis_names, s.spec) for s in arg_s]
@@ -294,6 +251,59 @@ def _shard_map(f: Callable, *, mesh: Mesh | AbstractMesh | None,
         raise ValueError(msg) from None
     return tree_unflatten(out_tree(), out_flat)
   return wrapped
+
+
+def _shmap_checks(mesh, axis_names, in_specs, out_specs, _skip_mesh_check,
+                  _smap):
+  if mesh is None:
+    mesh = get_abstract_mesh()
+    if mesh.empty:
+      raise ValueError(
+          "The context mesh cannot be empty. Use"
+          " `jax.sharding.use_mesh(mesh)` to enter into a mesh context")
+  else:
+    ctx_mesh = get_abstract_mesh()
+    if (not _skip_mesh_check and not ctx_mesh.empty and
+        mesh.abstract_mesh != ctx_mesh):
+      raise ValueError(
+          f"The context mesh {ctx_mesh} should match the mesh passed to"
+          f" shard_map {mesh}")
+
+  if not isinstance(mesh, (Mesh, AbstractMesh)):
+    raise TypeError("shard_map requires a `jax.sharding.Mesh` or a "
+                    "`jax.sharding.AbstractMesh` instance for its "
+                    f"second argument, but got {mesh} of type {type(mesh)}.")
+
+  if not isinstance(axis_names, (frozenset, set)):
+    raise TypeError(
+        "`axis_names` argument of shard_map should be of type `frozenset` or"
+        f" `set`. Got type: {type(axis_names)}")
+  if isinstance(axis_names, set):
+    axis_names = frozenset(axis_names)
+  if not axis_names:
+    axis_names = frozenset(mesh.axis_names)
+  if not axis_names.issubset(mesh.axis_names):
+    raise ValueError(
+        f"jax.shard_map requires axis_names={axis_names} to be a subset of "
+        f"mesh.axis_names={mesh.axis_names}")
+
+  if (in_specs is None and
+      not all(mesh._name_to_type[a] == AxisType.Explicit for a in axis_names)):
+    axis_types = ', '.join(str(mesh._name_to_type[a]) for a in axis_names)
+    if _smap:
+      msg = (f"in_axes was not specified when axis_name={axis_names} was of"
+             f" type {axis_types}")
+    else:
+      msg = ("shard_map in_specs argument must be a pytree of"
+             " `jax.sharding.PartitionSpec` instances, but it was `None` when"
+             f" {axis_names=} are of type {axis_types}")
+    raise TypeError(msg)
+
+  if in_specs is not None:
+    _check_specs(SpecErrorType.input, in_specs, axis_names)
+  if not callable(out_specs):
+    _check_specs(SpecErrorType.out, out_specs, axis_names)
+  return mesh, axis_names
 
 
 # Internally use AxisNames = dict[int, tuple[AxisName, ...]], not PartitionSpecs
@@ -597,7 +607,8 @@ def _as_manual_mesh(mesh, manual_axes: frozenset):
     if cur_mesh._name_to_type[a] == AxisType.Auto:
       auto_axes.add(a)
     else:
-      assert cur_mesh._name_to_type[a] == AxisType.Explicit, cur_mesh._name_to_type[a]
+      assert cur_mesh._name_to_type[a] == AxisType.Explicit, (
+          a, cur_mesh._name_to_type[a])
       explicit_axes.add(a)
 
   new_axis_types = []

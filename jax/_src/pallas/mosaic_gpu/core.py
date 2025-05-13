@@ -124,10 +124,14 @@ class GPUMemorySpace(enum.Enum):
       self,
       shape: tuple[int, ...],
       dtype: jnp.dtype,
+      *,
       transforms: Sequence[MemoryRefTransform] = (),
+      packed: bool | None = None,
+      collective: bool | None = None
   ) -> pallas_core.MemoryRef:
     # A convenience function for constructing MemoryRef types.
-    return GPUMemoryRef(shape, dtype, memory_space=self, transforms=transforms)
+    return GPUMemoryRef(shape, dtype, memory_space=self, transforms=transforms,
+                        packed=packed, collective=collective)
 
 
 class SemaphoreType(enum.Enum):
@@ -178,13 +182,16 @@ def kernel(
   def wrapper(*operands):
     def stateful(operand_and_out_refs):
       operand_refs, out_refs = operand_and_out_refs
+      mesh = GPUMesh(**mesh_kwargs)
+      thread_name = mesh.thread_name if mesh.thread_name is not None else ()
       def cmap_body():
         pallas_primitives.run_scoped(
             lambda *scratch_refs: body(*operand_refs, *out_refs, *scratch_refs),
             *scratch_shapes,
+            collective_axes=thread_name,
         )
       pallas_core.core_map(
-          GPUMesh(**mesh_kwargs), compiler_params=compiler_params
+          mesh, compiler_params=compiler_params
       )(cmap_body)
     _, outs = state_discharge.run_state(stateful)(
         (operands, jax.tree.map(jnp.zeros_like, out_shape))
@@ -219,13 +226,32 @@ def _is_known_divisible(value, divisor, fuel=10) -> bool:
 class GPUMemoryRef(pallas_core.MemoryRef):
   transforms: Sequence[MemoryRefTransform] = ()
 
+  # Whether to allow TMEM packing for sub 4-byte dtypes.
+  packed: bool | None = dataclasses.field(default=None, kw_only=True)
+  collective: bool | None = dataclasses.field(default=None, kw_only=True)
+
+  def __post_init__(self):
+    if self.memory_space != GPUMemorySpace.TMEM:
+      if self.packed is not None:
+        raise ValueError("Packed option is only supported for TMEM.")
+      if self.collective is not None:
+        raise ValueError("Collective option is only supported for TMEM.")
+
   def get_ref_aval(self) -> _Ref:
     aval = jax_core.ShapedArray(self.shape, self.dtype)
     for t in self.transforms:
       aval = t(aval)
-    ref = pallas_core.TransformedRef(
-        AbstractMemoryRef(aval, memory_space=self.memory_space), ()
-    )
+    if self.memory_space == GPUMemorySpace.TMEM:
+      ref = pallas_core.TransformedRef(
+          AbstractTMEMRef(aval,
+                          memory_space=self.memory_space,
+                          packed=self.packed,
+                          collective=self.collective), ()
+      )
+    else:
+      ref = pallas_core.TransformedRef(
+          AbstractMemoryRef(aval, memory_space=self.memory_space), ()
+      )
     for t in reversed(self.transforms):
       ref = t.undo(ref)
     if not ref.transforms:
@@ -917,6 +943,17 @@ def _as_accum(ref) -> WGMMAAbstractAccumulatorRef:
       inner_aval=ref.inner_aval,
       memory_space=ref.memory_space,  # pytype: disable=attribute-error
   )
+
+class AbstractTMEMRef(AbstractMemoryRef):
+  __slots__ = ["inner_aval", "memory_space", "packed", "collective"]
+
+  def __init__(self, inner_aval, memory_space, packed, collective):
+    super().__init__(inner_aval, memory_space)
+    self.packed = packed
+    self.collective = collective
+
+  def __repr__(self) -> str:
+    return f'TMEM({self.inner_aval.str_short()},packed={self.packed})'
 
 
 _WARPGROUP_AXIS_NAME = object()

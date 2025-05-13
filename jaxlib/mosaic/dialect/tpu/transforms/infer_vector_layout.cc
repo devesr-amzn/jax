@@ -320,7 +320,7 @@ class VectorLayoutInferer {
         if (inferStore<vector::StoreOp>(op).failed()) {
           return failure();
         }
-      } else if (auto op = dyn_cast<vector::TransposeOp>(any_op)) {
+      } else if (auto op = dyn_cast<tpu::TransposeOp>(any_op)) {
         if (infer(op).failed()) {
           return failure();
         }
@@ -757,9 +757,28 @@ class VectorLayoutInferer {
     if (op.getType().getRank() < 2) {
       NYI("Unsupported 1D shape");
     }
+    // TODO(b/337384645): Currently we assume {0, 0} offsets in the input
+    // layout. Relax this assumption.
     auto layout = VectorLayout(bitwidth, {0, 0}, nativeTiling(bitwidth),
                                ImplicitDim::kNone);
-    setLayout(op, {layout, kNoLayout}, layout);
+    // Calculate the offsets for the output layout.
+    LayoutOffsets offsets_out = layout.offsets();
+    // We assume there are no implicit dims.
+    int tiling_dim = op.getDimension() - (op.getType().getRank() - 2);
+    if (auto amount = op.getAmount().getDefiningOp<arith::ConstantOp>();
+        amount && (tiling_dim == 0 || tiling_dim == 1)) {
+      if (auto integer_attr = dyn_cast<IntegerAttr>(amount.getValue())) {
+        const int64_t tile_size = layout.tiling()[tiling_dim];
+        const int64_t dim_size = op.getType().getShape()[op.getDimension()];
+        const int64_t shift = integer_attr.getValue().getSExtValue();
+        if (dim_size % tile_size != 0) {
+          offsets_out[tiling_dim] = (dim_size - (shift % dim_size)) % tile_size;
+        }
+      }
+    }
+    auto out_layout = VectorLayout(bitwidth, offsets_out,
+                                   nativeTiling(bitwidth), ImplicitDim::kNone);
+    setLayout(op, {layout, kNoLayout}, out_layout);
     return success();
   }
 
@@ -1622,7 +1641,7 @@ class VectorLayoutInferer {
     return success();
   }
 
-  LogicalResult infer(vector::TransposeOp op) {
+  LogicalResult infer(tpu::TransposeOp op) {
     auto permutation = op.getPermutation();
     TPU_CHECK_OP(permutation.size() > 1,
                  "Vector and scalar transpose should be a no-op and removed");
@@ -1910,7 +1929,7 @@ class VectorLayoutInferer {
           continue;
         }
       }
-      if (auto transpose = dyn_cast<vector::TransposeOp>(operand.getOwner())) {
+      if (auto transpose = dyn_cast<tpu::TransposeOp>(operand.getOwner())) {
         auto perm = transpose.getPermutation();
         auto rank = perm.size();
         // Only permutations that actually swap the last two dims need it.

@@ -1578,9 +1578,8 @@ def check_aval_layout_compatibility(
     if l is None or isinstance(l, AutoLayout):
       continue
     name_str = f' with pytree key path {name}' if name else ''
-    shape = aval.shape
     try:
-      l.check_compatible_aval(shape)
+      l.check_compatible_aval(aval.shape)
     except ValueError as e:
       raise ValueError(
           f'One of {what_aval}{name_str} is incompatible with its layout '
@@ -1955,7 +1954,7 @@ def pjit_staging_rule(trace, *args, **params):
     assert next(out_tracers_, None) is None
   elif any(isinstance(c, core.MutableArray) for c in jaxpr.consts):
     jaxpr, consts = pxla._move_mutable_consts(jaxpr)
-    consts = map(partial(trace.new_const, source_info=source_info), consts)
+    consts = [trace.new_const(c, source_info) for c in consts]
     in_shardings = (*params['in_shardings'],) + (UNSPECIFIED,) * len(consts)
     in_layouts = (*params['in_layouts'],) + (None,) * len(consts)
     donated_invars = (*params['donated_invars'],) + (False,) * len(consts)
@@ -1975,8 +1974,8 @@ def _pjit_forwarding(jaxpr, out_shardings, out_layouts):
             for fwd, os, ol in zip(in_fwd, out_shardings, out_layouts)]
   keep = [f is None for f in in_fwd]
   jaxpr = pe.prune_closed_jaxpr_outputs(jaxpr, keep)
-  out_shardings = [o for o, k in zip(out_shardings, keep) if k]
-  out_layouts   = [o for o, k in zip(out_layouts  , keep) if k]
+  out_shardings = tuple(o for o, k in zip(out_shardings, keep) if k)
+  out_layouts   = tuple(o for o, k in zip(out_layouts  , keep) if k)
   return jaxpr, in_fwd, out_shardings, out_layouts
 
 def pjit_forwarding_rule(eqn):
@@ -1985,11 +1984,10 @@ def pjit_forwarding_rule(eqn):
   jaxpr, in_fwd, out_shardings, out_layouts = _pjit_forwarding(
       eqn.params['jaxpr'], eqn.params['out_shardings'], eqn.params['out_layouts'])
   new_outvars = [v for v, f in zip(eqn.outvars, in_fwd) if f is None]
-  new_params = dict(eqn.params, jaxpr=jaxpr, out_shardings=(*out_shardings,),
-                    out_layouts=(*out_layouts,))
+  new_params = dict(eqn.params, jaxpr=jaxpr, out_shardings=out_shardings,
+                    out_layouts=out_layouts)
   new_eqn = eqn.replace(params=new_params, outvars=new_outvars)
-  fwd_vars = [eqn.invars[f] if f is not None else None for f in in_fwd]
-  return fwd_vars, new_eqn
+  return in_fwd, new_eqn
 # TODO(mattjj): Remove pjit_forwarding_rule and also in staging rule.
 pe.forwarding_rules[pjit_p] = pjit_forwarding_rule
 
@@ -2143,7 +2141,7 @@ def _insert_axis_partitions(spec, dim, val):
   too_short = dim - len(spec)
   if too_short > 0:
     spec += (None,) * too_short
-  new_partitions = tuple_insert(spec, dim, val)
+  new_partitions = tuple_insert(spec, dim, val)  # type: ignore
   return PartitionSpec(*new_partitions)
 
 def _pjit_batcher_for_sharding(
@@ -2718,7 +2716,7 @@ def with_sharding_constraint(x, shardings):
   .. _Distributed arrays and automatic parallelization: https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html
   """
   x_flat, tree = tree_flatten(x)
-
+  x_avals_flat = [core.shaped_abstractify(x) for x in x_flat]
   layouts, shardings = _split_layout_and_sharding(shardings)
 
   user_shardings = prepare_axis_resources(
@@ -2754,13 +2752,11 @@ def with_sharding_constraint(x, shardings):
                         for s in shardings_flat]
 
   pjit_check_aval_sharding(
-      shardings_flat, x_flat, ("",) * len(shardings_flat),
+      shardings_flat, x_avals_flat, ("",) * len(shardings_flat),
       "with_sharding_constraint arguments",
       allow_uneven_sharding=True)
-
   check_shardings_are_auto(shardings_flat)
-
-  check_aval_layout_compatibility(user_layouts_flat, x_flat,
+  check_aval_layout_compatibility(user_layouts_flat, x_avals_flat,
                                   ("",) * len(user_layouts_flat),
                                   "with_sharding_constraint arguments")
 
@@ -3068,24 +3064,24 @@ def _get_new_mesh(axes: str | tuple[str, ...] | None,
   return mesh_to_use.update_axis_types({a: axis_type for a in axes})
 
 def auto_axes(fun, *, axes: str | tuple[str, ...] | None = None,
-              out_shardings=None):
+              out_sharding=None):
   def decorator(*args, **kwargs):
-    if out_shardings is None:
-      if "out_shardings" in kwargs:
-        _out_shardings = kwargs.pop("out_shardings")
+    if out_sharding is None:
+      if "out_sharding" in kwargs:
+        _out_sharding = kwargs.pop("out_sharding")
       else:
-        raise TypeError("Missing required keyword argument: 'out_shardings'")
+        raise TypeError("Missing required keyword argument: 'out_sharding'")
     else:
-      _out_shardings = out_shardings
+      _out_sharding = out_sharding
     new_mesh = _get_new_mesh(
-        axes, mesh_lib.AxisType.Auto, 'auto_axes', shardings=_out_shardings,
+        axes, mesh_lib.AxisType.Auto, 'auto_axes', shardings=_out_sharding,
         error_on_manual_to_auto_explicit=True)
     with mesh_lib.use_abstract_mesh(new_mesh):
       in_specs = tree_map(lambda a: core.modify_spec_for_auto_manual(
           core.get_aval(a).sharding.spec, new_mesh), args)
       args = mesh_cast(args, in_specs)
       out = fun(*args, **kwargs)
-    return mesh_cast(out, _out_shardings)
+    return mesh_cast(out, _out_sharding)
   return decorator
 
 @contextlib.contextmanager
@@ -3096,19 +3092,19 @@ def use_auto_axes(*axes):
 
 
 def explicit_axes(fun, *, axes: str | tuple[str, ...] | None = None,
-                  in_shardings=None):
+                  in_sharding=None):
   def decorator(*args, **kwargs):
-    if in_shardings is None:
-      if "in_shardings" in kwargs:
-        _in_shardings = kwargs.pop("in_shardings")
+    if in_sharding is None:
+      if "in_sharding" in kwargs:
+        _in_sharding = kwargs.pop("in_sharding")
       else:
-        raise TypeError("Missing required keyword argument: 'in_shardings'")
+        raise TypeError("Missing required keyword argument: 'in_sharding'")
     else:
-      _in_shardings = in_shardings
+      _in_sharding = in_sharding
     new_mesh = _get_new_mesh(axes, mesh_lib.AxisType.Explicit, 'explicit_axes',
                              error_on_manual_to_auto_explicit=True)
     with mesh_lib.use_abstract_mesh(new_mesh):
-      args = mesh_cast(args, _in_shardings)
+      args = mesh_cast(args, _in_sharding)
       out = fun(*args, **kwargs)
     out_specs = tree_map(lambda o: core.modify_spec_for_auto_manual(
         core.get_aval(o).sharding.spec, mesh_lib.get_abstract_mesh()), out)
@@ -3126,6 +3122,7 @@ def use_explicit_axes(*axes):
 
 def with_layout_constraint(x, layouts):
   x_flat, tree = tree_flatten(x)
+  x_avals_flat = [core.shaped_abstractify(x) for x in x_flat]
   layouts_flat = tuple(flatten_axes("with_layout_constraint layouts", tree,
                                     layouts))
   if any(not isinstance(l, DeviceLocalLayout) for l in layouts_flat):
@@ -3133,7 +3130,7 @@ def with_layout_constraint(x, layouts):
         'layouts passed to `with_layout_constraint` must be of type'
         f' `DeviceLocalLayout`. Got {[type(l) for l in layouts_flat]}')
   check_aval_layout_compatibility(
-      layouts_flat, x_flat, ("",) * len(layouts_flat),
+      layouts_flat, x_avals_flat, ("",) * len(layouts_flat),
       "with_layout_constraint arguments")
   outs = [layout_constraint_p.bind(xf, layout=l)
           for xf, l in zip(x_flat, layouts_flat)]

@@ -142,15 +142,15 @@ def pallas_call_tpu_lowering_rule(
   tpu.register_dialect(mlir_ctx)
 
   def lower_module(for_verification: bool):
-    if for_verification or tpu_core.runtime_assert_enabled():
+    if for_verification:
       mlir_ctx.allow_unregistered_dialects = True
     with mlir_ctx, ir.Location.unknown(mlir_ctx):
       return lowering.lower_jaxpr_to_module(
           ctx,
-          mlir_ctx,
           grid_mapping,
           jaxpr,
           dimension_semantics=mosaic_params.dimension_semantics,
+          kernel_type=mosaic_params.kernel_type,
           mesh=jax_mesh,
           for_verification=for_verification,
           dynamic_shape_replacement_enabled=pallas_core.dynamic_shapes_export_enabled(),

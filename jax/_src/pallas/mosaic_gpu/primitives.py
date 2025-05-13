@@ -450,9 +450,6 @@ jax_core.pp_eqn_rules[copy_gmem_to_smem_p] = _copy_gmem_to_smem_pp_eqn
 @lowering.register_lowering_rule(
     copy_gmem_to_smem_p, mgpu.LoweringSemantics.Lane)
 @lowering.register_lowering_rule(
-    copy_gmem_to_smem_p, mgpu.LoweringSemantics.Lane,
-    primitive_semantics=gpu_core.PrimitiveSemantics.Warp)
-@lowering.register_lowering_rule(
     copy_gmem_to_smem_p, mgpu.LoweringSemantics.Warpgroup
 )
 def _copy_gmem_to_smem_lowering(
@@ -465,6 +462,7 @@ def _copy_gmem_to_smem_lowering(
     dst_transforms_treedef,
     barrier_transforms_treedef,
     collective_axes,
+    warpgroup_sync: bool = True,
 ):
   flat_src_transforms, flat_dst_transforms, flat_barrier_transforms = (
       util.split_list(
@@ -509,6 +507,8 @@ def _copy_gmem_to_smem_lowering(
     # arrive with the whole transfer size, while everyone else arrives with 0.
     # But we should continue using this scheme as it's likely to be faster.
     bytes //= WARPGROUP_SIZE
+    if warpgroup_sync:
+      mgpu.warpgroup_barrier()  # Make sure all reads have completed.
     barrier.arrive_expect_tx(bytes)
     ctx.launch_ctx.async_copy(
         src_ref=src,
@@ -540,6 +540,12 @@ def _copy_gmem_to_smem_lowering(
       collective=ir.ArrayAttr.get([]),
   )
   return ()
+
+lowering.register_lowering_rule(
+    copy_gmem_to_smem_p,
+    mgpu.LoweringSemantics.Lane,
+    primitive_semantics=gpu_core.PrimitiveSemantics.Warp,
+)(functools.partial(_copy_gmem_to_smem_lowering, warpgroup_sync=False))
 
 
 def copy_gmem_to_smem(
@@ -1124,8 +1130,19 @@ def tcgen05_mma(acc: _Ref,
                 a: _Ref,
                 b: _Ref,
                 barrier: _Ref,
-                accumulate: bool | jax.Array = True):
+                accumulate: bool | jax.Array = True,
+                collective_axis: str | None = None):
   """Asynchronous matrix-multiply accumulate for TensorCore gen 5 (Blackwell).
+
+  If run in collective mode, `acc`, `a` (LHS), and `b` (RHS) should correspond
+  to half of the total inputs to the MMA, where `acc` and `a` (LHS) are split
+  in half along the rows and `b` (RHS) is split along the columns like so:
+
+   -----------    -----------   -----------
+   |  ACC1   |    |  LHS1   |   |    |    |
+   ----------- += ----------- @ |RHS1|RHS2|
+   |  ACC2   |    |  LHS2   |   |    |    |
+   -----------    -----------   -----------
 
   Args:
     acc: The accumulator. Must be a TMEM Ref.
@@ -1134,10 +1151,15 @@ def tcgen05_mma(acc: _Ref,
     barrier: Barrier Ref for synchronizing with the tensor core. Should have
       for_tensor_core set to True.
     accumulate: Whether to accumulate into acc or overwrite it.
+    collective_axis: The name of the cluster axis along which to perform
+      a collective MMA. The cluster axis should have a size of exactly 2,
+      and must be on the minormost cluster axis.
   """
   acc_m, acc_n = acc.shape
   lhs_m, lhs_k = a.shape
   rhs_k, rhs_n = b.shape
+  if collective_axis is not None:
+    acc_n /= 2
   if acc_m != lhs_m:
     raise ValueError(
         f"Accumulator and LHS have incompatible shapes. Accumulator: {acc.shape}. LHS: {a.shape}.")
@@ -1164,23 +1186,30 @@ def tcgen05_mma(acc: _Ref,
                       *a_transforms_leaves, *b_transforms_leaves,
                       a_transforms_tree=a_transforms_tree,
                       b_transforms_tree=b_transforms_tree,
-                      collective=False)
+                      collective_axis=collective_axis)
 
 @tcgen05_mma_p.def_abstract_eval
 def _tcgen05_mma_abstract_eval(acc, a, b, barrier, accumulate,
                                *transforms_leaves,
                                a_transforms_tree, b_transforms_tree,
-                               collective):
+                               collective_axis):
   del (accumulate, transforms_leaves, a_transforms_tree, b_transforms_tree)
-  if collective:
-    raise NotImplementedError("Collective MMA not yet implemented.")
 
   if acc.memory_space != gpu_core.GPUMemorySpace.TMEM:
     raise ValueError("Accumulator must be a TMEM Ref.")
-  if a.memory_space != gpu_core.GPUMemorySpace.SMEM:
-    raise ValueError("LHS must be an SMEM Ref. TMEM not yet supported.")
+  if a.memory_space not in (gpu_core.GPUMemorySpace.SMEM,
+                            gpu_core.GPUMemorySpace.TMEM):
+    raise ValueError("LHS must be a TMEM/SMEM Ref.")
   if b.memory_space != gpu_core.GPUMemorySpace.SMEM:
     raise ValueError("RHS must be an SMEM Ref.")
+
+  if collective_axis is not None:
+    if not acc.collective:
+      raise ValueError(
+          "Accumulator Ref must be collective if collective_axis is set.")
+    if a.memory_space == gpu_core.GPUMemorySpace.TMEM and not a.collective:
+      raise ValueError(
+          "LHS TMEM Ref must be collective if collective_axis is set.")
 
   for_tensor_core = getattr(
       barrier.inner_aval.dtype, "for_tensor_core", False)
@@ -1201,10 +1230,10 @@ def _tcgen05_mma_lowering(
     *transforms_leaves,
     a_transforms_tree,
     b_transforms_tree,
-    collective: bool,
+    collective_axis,
 ):
   _, a_aval, b_aval, *_ = ctx.avals_in
-  lhs_swizzle: int = 128
+  lhs_swizzle: int | None = None
   lhs_transpose: bool = False
   if a_transforms_tree is not None:
     a_transforms_leaves, b_transforms_leaves = util.split_list(
@@ -1254,31 +1283,51 @@ def _tcgen05_mma_lowering(
       )
 
   swizzle_elems = rhs_swizzle // b_aval.dtype.itemsize
-  if rhs_swizzle != lhs_swizzle:
+  if lhs_swizzle is None:
+    lhs_swizzle = rhs_swizzle
+  elif rhs_swizzle != lhs_swizzle:
     raise ValueError("MMA rhs swizzle must match lhs swizzle."
                       f" {lhs_swizzle=} {rhs_swizzle=}")
   if rhs_tiling != (8, swizzle_elems):
     raise ValueError("MMA rhs tiling does not fit swizzle"
                       f" {rhs_tiling=} expected={(8, swizzle_elems)}")
-  if lhs_transpose or rhs_transpose:
-    raise NotImplementedError("Lowering does not yet support transpose")
+  if lhs_transpose:
+    if isinstance(a_ref, tcgen05.TMEMRef):
+      raise ValueError("TMEM transpose not allowed.")
+    a_ref = mgpu.memref_transpose(a_ref, (1, 0, 3, 2))
+  if rhs_transpose:
+    b_ref = mgpu.memref_transpose(b_ref, (1, 0, 3, 2))
   if isinstance(accumulate, bool):
     accumulate = mgpu.c(accumulate, ir.IntegerType.get_signless(1))
 
   predicate = ctx.module_ctx.single_lane_predicate
-  if collective:
+  collective = False
+  if collective_axis is not None:
+    cluster_axis = lowering._resolve_cluster_axis(
+        ctx.module_ctx.axis_names, collective_axis)
+    if cluster_axis != gpu_dialect.Dimension(0):
+      # Note: resolve_cluster_axis checks if axis_names exists.
+      assert ctx.module_ctx.axis_names is not None
+      if len(ctx.module_ctx.axis_names.cluster) <= 1:
+        raise ValueError("No cluster axes found.")
+      minormost_cluster_axis = ctx.module_ctx.axis_names.cluster[0]
+      raise ValueError(
+          "Can only perform collective MMA along minormost cluster axis. "
+          f"Got {collective_axis}, expected {minormost_cluster_axis}.")
     index = ir.IndexType.get()
     is_leader_block = arith_dialect.cmpi(
         arith_dialect.CmpIPredicate.eq,
-        ctx.launch_ctx.cluster_idx(gpu_dialect.Dimension.x), mgpu.c(0, index))
+        ctx.launch_ctx.cluster_idx(cluster_axis), mgpu.c(0, index))
     predicate = arith_dialect.andi(predicate, is_leader_block)
+    collective = True
+
   with mgpu.when(predicate):
     tcgen05.mma(
               acc,
               a_ref,
               b_ref,
-              a_swizzle=rhs_swizzle,
-              b_swizzle=lhs_swizzle,
+              a_swizzle=lhs_swizzle,
+              b_swizzle=rhs_swizzle,
               accumulate=accumulate,
               collective=collective,
           )
@@ -1286,6 +1335,27 @@ def _tcgen05_mma_lowering(
                           collective=collective,
                           ctx=ctx.launch_ctx)
   return []
+
+
+commit_tmem_p = jax_core.Primitive("commit_tmem")
+commit_tmem_p.multiple_results = True
+
+
+@commit_tmem_p.def_effectful_abstract_eval
+def _commit_tmem_abstract_eval():
+  return (), {gpu_core._memory_effect}
+
+
+@lowering.register_lowering_rule(commit_tmem_p, mgpu.LoweringSemantics.Lane)
+def _commit_tmem_lowering(_):
+  tcgen05.commit_tmem()
+  return ()
+
+
+def commit_tmem():
+  """Commits all writes to TMEM, making them visible to loads and MMA."""
+  commit_tmem_p.bind()
+
 
 class Layout(enum.Enum):
   #: [m, n] matrix, where m % 64 == 0 == n % 8.
@@ -1298,6 +1368,8 @@ class Layout(enum.Enum):
 
   WG_SPLAT = enum.auto()
   WG_STRIDED = enum.auto()
+
+  TCGEN05 = enum.auto()
 
   def __call__(self, *args, **kwargs) -> ParameterizedLayout:
     return ParameterizedLayout(self, args, kwargs)
@@ -1324,6 +1396,9 @@ class Layout(enum.Enum):
         return mgpu.WGSplatFragLayout(*args, **kwargs)  # pytype: disable=missing-parameter
       case Layout.WG_STRIDED:
         return mgpu.WGStridedFragLayout(*args, **kwargs)  # pytype: disable=missing-parameter
+      case Layout.TCGEN05:
+        check_no_args()
+        return mgpu.TCGEN05_LAYOUT
 
 @dataclasses.dataclass(frozen=True)
 class ParameterizedLayout:
