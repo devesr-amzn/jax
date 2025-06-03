@@ -44,6 +44,7 @@ from jax._src.state import types as state_types
 from jax._src.state.types import TransformedRef
 import jax.numpy as jnp
 
+
 class DynamicGridDim:
   def __repr__(self):
     return "DynamicGridDim"
@@ -271,6 +272,7 @@ class MemorySpace(enum.Enum):
   ANY = "any"  # Unrestricted memory space (usually HBM)
   ERROR = "error"  # Memory space for checkify errors.
   INDEX = "index"  # Memory space for scalar prefetch arguments.
+  KEY = "key"  # Memory space for PRNG keys.
 
   def __str__(self) -> str:
     return self.value
@@ -954,7 +956,7 @@ index_map_grid_aval = jax_core.ShapedArray((), jnp.int32)
 class ScratchShape(Protocol):
   def get_array_aval(self) -> jax_core.AbstractValue:
     ...
-  def get_ref_aval(self) -> state.AbstractRef:
+  def get_ref_aval(self) -> state.AbstractRef | TransformedRef:
     ...
 
 
@@ -1077,7 +1079,7 @@ def get_grid_mapping(
     if in_specs_tree != in_tree:
       raise ValueError(
           pytreedef_mismatch_err_msg("`in_specs`", in_specs_tree,
-                                     "inputs", in_tree))
+                                     "`inputs`", in_tree))
   else:
     flat_in_specs = [no_block_spec] * len(in_avals)
 
@@ -1248,7 +1250,7 @@ def _core_map_abstract_eval(*args, jaxpr, mesh, **kwargs):
   if interpret:
     try:
       from jax._src.pallas.mosaic import interpret as mosaic_tpu_interpret  # Avoid circular dependency.
-      if isinstance(interpret, mosaic_tpu_interpret.TPUInterpretParams):
+      if isinstance(interpret, mosaic_tpu_interpret.InterpretParams):
         effs = mosaic_tpu_interpret.get_interpret_effects()
     except ImportError:
       pass
@@ -1351,7 +1353,7 @@ def _core_map_typecheck_rule(_, *in_atoms, jaxpr, mesh, **kwargs):
   if interpret:
     try:
       from jax._src.pallas.mosaic import interpret as mosaic_tpu_interpret  # Avoid circular dependency.
-      if isinstance(interpret, mosaic_tpu_interpret.TPUInterpretParams):
+      if isinstance(interpret, mosaic_tpu_interpret.InterpretParams):
         effs = mosaic_tpu_interpret.get_interpret_effects()
     except ImportError:
       pass

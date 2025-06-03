@@ -13,6 +13,24 @@ Remember to align the itemized text with the first line of an item within a list
 
 ## Unreleased
 
+* New functionality
+
+  * Added a new decorator {func}`jax.experimental.pallas.loop` which allows
+    to write stateless loops as functions.
+
+* Deprecations
+
+  * {class}`jax.experimental.pallas.triton.TritonCompilerParams` has been
+    renamed to {class}`jax.experimental.pallas.triton.CompilerParams`. The
+    old name is deprecated and will be removed in a future release.
+  * {class}`jax.experimental.pallas.tpu.TPUCompilerParams`
+    and {class}`jax.experimental.pallas.tpu.TPUMemorySpace` have been
+    renamed to {class}`jax.experimental.pallas.tpu.CompilerParams`
+    and {class}`jax.experimental.pallas.tpu.MemorySpace`. The
+    old names are deprecated and will be removed in a future release.
+
+## Released with jax 0.6.1
+
 * Removals
 
   * Removed previously deprecated {mod}`jax.experimental.pallas.gpu`. To use
@@ -26,6 +44,11 @@ Remember to align the itemized text with the first line of an item within a list
     `block_shape` for each entry that needs unblocked indexing.
   * {func}`jax.experimental.pallas.pallas_call` now requires `compiler_params`
     to be a backend-specific dataclass instead of a param to value mapping.
+  * {func}`jax.experimental.pallas.debug_check` is now supported both on
+    TPU and Mosaic GPU. Previously, this functionality was only supported
+    on TPU and required using the APIs from {mod}`jax.experimental.checkify`.
+    Note that debug checks are not executed unless
+    {data}`jax.experimental.pallas.enable_debug_checks` is set.
 
 ## Released with jax 0.5.0
 

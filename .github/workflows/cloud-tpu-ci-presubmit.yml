@@ -25,9 +25,7 @@ on:
 
 # This should also be set to read-only in the project settings, but it's nice to
 # document and enforce the permissions here.
-permissions:
-  contents: read
-
+permissions: {}
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   # Don't cancel in-progress jobs for main/release branches.
@@ -54,7 +52,7 @@ jobs:
     needs: [build-jax-artifacts]
     uses: ./.github/workflows/pytest_tpu.yml
     # Begin Presubmit Naming Check - name modification requires internal check to be updated
-    name: "TPU test (jaxlib=head, v5e-8)"
+    name: "TPU test (jaxlib=head)"
     with:
       runner: "linux-x86-ct5lp-224-8tpu"
       cores: "8"

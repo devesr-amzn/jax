@@ -69,6 +69,8 @@ effects.remat_allowed_effects.add_type(DebugEffect)
 effects.remat_allowed_effects.add_type(OrderedDebugEffect)
 effects.custom_derivatives_allowed_effects.add_type(DebugEffect)
 effects.custom_derivatives_allowed_effects.add_type(OrderedDebugEffect)
+effects.partial_eval_kept_effects.add_type(DebugEffect)
+effects.partial_eval_kept_effects.add_type(OrderedDebugEffect)
 
 # `debug_callback_p` is the main primitive for staging out Python callbacks.
 debug_callback_p = core.Primitive('debug_callback')
@@ -126,10 +128,10 @@ def debug_callback_jvp_rule(primals, tangents, **params):
   return debug_callback_p.bind(*primals, **params), []
 ad.primitive_jvps[debug_callback_p] = debug_callback_jvp_rule
 
-def debug_callback_transpose_rule(*flat_args, callback: Callable[..., Any],
-    effect: DebugEffect):
-  del flat_args, callback, effect
-  raise ValueError("Transpose doesn't support debugging callbacks.")
+def debug_callback_transpose_rule(_, *flat_args, callback: Callable[..., Any],
+                                  effect: DebugEffect, partitioned):
+  del callback, effect, partitioned
+  return [None for _ in flat_args]
 ad.primitive_transposes[debug_callback_p] = debug_callback_transpose_rule
 
 def _debug_callback_partial_auto(axis_context, *args, **params):
@@ -164,14 +166,16 @@ def debug_callback_lowering(ctx, *args, effect, partitioned, callback, **params)
       # If we have fully manual sharding during lowering, that means the JAX
       # program has per-device semantics, so we run the callback on each device.
       if config.use_shardy_partitioner.value:
-        assert len(ctx.avals_out) == 1
-        sharding = sharding_impls.SdyArrayShardingList([
-            sharding_impls.SdyArraySharding(
+        ndim = 0
+        if ctx.avals_out and isinstance(ctx.avals_out[0], core.ShapedArray):
+          ndim = ctx.avals_out[0].ndim
+        sharding = sharding_impls.SdyArrayList([
+            sharding_impls.SdyArray(
                 mesh_shape=(),
-                dimension_shardings=[
-                    sharding_impls.SdyDimSharding(axes=[], is_open=False)
-                ] * ctx.avals_out[0].ndim,
-                logical_device_ids=())])
+                dim_shardings=[
+                    sharding_impls.SdyDim(axes=[], is_open=False)
+                ] * ndim,
+                logical_device_ids=(0,))])
       else:
         sharding = xc.OpSharding()
         sharding.type = xc.OpSharding.Type.MANUAL
@@ -182,9 +186,9 @@ def debug_callback_lowering(ctx, *args, effect, partitioned, callback, **params)
     # program has bulk array semantics, so we run the callback with a MAXIMAL
     # sharding and hence execute it only once on the full logical value).
     if config.use_shardy_partitioner.value:
-      sharding = sharding_impls.SdyArrayShardingList([
-          sharding_impls.SdyArraySharding(
-              mesh_shape=(), dimension_shardings=[], logical_device_ids=(0,))])
+      sharding = sharding_impls.SdyArrayList([
+          sharding_impls.SdyArray(
+              mesh_shape=(), dim_shardings=[], logical_device_ids=(0,))])
     else:
       sharding = xc.OpSharding()
       sharding.type = xc.OpSharding.Type.MAXIMAL

@@ -151,7 +151,7 @@ def mma(
     element_type2 = a.dtype
     if collective:
       raise NotImplementedError("Collective not supported for TMEMRef")
-    if a.layout != (expected_layout := _infer_tmem_layout(a.shape, collective, packing=2)):
+    if a.layout != (expected_layout := _infer_tmem_layout(a.shape, packing=2)):
       raise ValueError(
           f"A layout mismatch: expected {expected_layout}, got {a.layout}"
       )
@@ -173,9 +173,14 @@ def mma(
     raise ValueError(
         f"Accumulator shape mismatch: expected {(m, n * num_cta)}, got {d.shape}"
     )
-  if d.layout != (expected_layout := _infer_tmem_layout(d.shape, collective, packing=1)):
+  expected_d_layout = (
+      TMEM_COLLECTIVE_N512_LAYOUT
+      if collective and n * num_cta == 512
+      else TMEM_DEFAULT_LAYOUT
+  )
+  if d.layout != expected_d_layout:
     raise ValueError(
-        f"Accumulator layout mismatch: expected {expected_layout}, got {d.layout}"
+        f"Accumulator layout mismatch: expected {expected_d_layout}, got {d.layout}"
     )
   f32 = ir.F32Type.get()
   f16 = ir.F16Type.get()
@@ -195,7 +200,7 @@ def mma(
           f" type f32 or f16, but got: {d.dtype}"
       )
   else:
-    raise NotImplementedError(f"Unsupported element type: {element_type}", type(element_type))
+    raise NotImplementedError(f"Unsupported element type: {element_type}")
 
   # Step 2. Decide on the instruction shapes we'll use. Note that with swizzles,
   # instructions must be issued in groups of the same width as the swizzle.
@@ -477,6 +482,17 @@ def tmem_load(tmem_addr, shape, num, pack: bool):
   return [llvm.extractvalue(i32, regs, [i]) for i in range(num_out_regs)]
 
 
+def wait_tmem_load():
+  llvm.inline_asm(
+      ir.Type.parse("!llvm.void"),
+      [],
+      "tcgen05.wait::ld.sync.aligned;",
+      "",
+      has_side_effects=True,
+  )
+  utils.warpgroup_barrier()
+
+
 def tmem_store(tmem_addr, shape, num, regs, unpack: bool):
   num_out_regs, regs_vector = _tmem_access_helper(shape, num)
   pack_mod = ".unpack::16b" if unpack else ""
@@ -559,9 +575,7 @@ class TMEMLayout:
     return num_tiles // tiles_in_row * cols_in_tile
 
 
-def _infer_tmem_layout(
-    shape: tuple[int, int], collective: bool, packing: int = 1
-) -> TMEMLayout:
+def _infer_tmem_layout(shape: tuple[int, int], packing: int = 1) -> TMEMLayout:
   if shape[0] > TMEM_ROWS:
     raise ValueError(
         "Can only infer TMEM layout for shapes with at most 128 rows, got:"
@@ -582,13 +596,13 @@ def _infer_tmem_layout(
         "Can only infer TMEM layout for shapes with column count that's a"
         f" multiple of 8, got: {shape[1]}"
     )
-  if collective and shape[1] == 512:
-    return TMEMLayout(
-        elements_in_tile=(shape[0], 128), column_tile_stride=2, packing=packing
-    )
-  else:
-    return TMEMLayout(elements_in_tile=(shape[0], 8), packing=packing)
+  return TMEMLayout(elements_in_tile=(shape[0], 8), packing=packing)
 
+
+TMEM_DEFAULT_LAYOUT = TMEMLayout(elements_in_tile=(TMEM_ROWS, 8), packing=1)
+TMEM_COLLECTIVE_N512_LAYOUT = TMEMLayout(
+    elements_in_tile=(TMEM_ROWS, 128), column_tile_stride=2, packing=1
+)
 
 @dataclasses.dataclass(frozen=True)
 class TMEMRef:
@@ -658,6 +672,8 @@ class TMEMRef:
     col_idx = base_idx[1]
     if not isinstance(col_idx, ir.Value):
       col_idx = arith.constant(i32, col_idx)
+    if col_idx.type == ir.IndexType.get():
+      col_idx = arith.index_cast(i32, col_idx)
     if packing != 1:
       col_idx = arith.divui(col_idx, arith.constant(i32, packing))
     return TMEMRef(
@@ -832,7 +848,7 @@ def _transfer_32xcols(
   regs_per_instr = atom_shape[0] * atom_shape[1] // (utils.WARP_SIZE * reg_packing)
   # We artificially lower the instr_num compared to its limits, because higher
   # values can lead to register spills..
-  instr_num = min(total_num, 64 // regs_per_instr)
+  instr_num = min(total_num, 32 // regs_per_instr)
   assert 32 % atom_rows == 0
   num_row_steps = 32 // atom_rows
   for lane_step in range(num_row_steps):

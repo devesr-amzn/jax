@@ -50,7 +50,7 @@ from jax._src import core
 from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax._src.lax import lax as lax_internal
-from jax._src.util import safe_zip, NumpyComplexWarning, tuple_update
+from jax._src.util import safe_zip, tuple_update
 
 config.parse_flags_with_absl()
 
@@ -1065,6 +1065,14 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
                                              "Passing arguments 'a', 'a_min' or 'a_max' to jax.numpy.clip is deprecated"):
       jnp.clip(jnp.arange(4), a_min=2, a_max=3)
 
+  def testClipUpperPrecedence(self):
+    a_min = 3 * np.ones(1)
+    a_max = 2 * np.ones(1)
+    x = 4 * np.ones(1)
+    y = jnp.clip(x, min=a_min, max=a_max)
+    assert y == a_max, f"Expected {y} to equal {a_max} when a_min > a_max."
+    assert y == jnp.asarray(np.clip(x, a_min=a_min, a_max=a_max))
+
   def testHypotComplexInputError(self):
     rng = jtu.rand_default(self.rng())
     x = rng((5,), dtype=jnp.complex64)
@@ -1930,9 +1938,6 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     rng = jtu.rand_default(self.rng())
     mask_size = np.zeros(shape).size if axis is None else np.zeros(shape).shape[axis]
     mask = jtu.rand_int(self.rng(), low=0, high=2)(mask_size, bool)
-    if numpy_version == (1, 23, 0) and mask.shape == (1,):
-      # https://github.com/numpy/numpy/issues/21840
-      self.skipTest("test fails for numpy v1.23.0")
     args_maker = lambda: [rng(shape, dtype)]
     np_fun = lambda arg: np.delete(arg, mask, axis=axis)
     jnp_fun = lambda arg: jnp.delete(arg, mask, axis=axis)
@@ -2349,11 +2354,11 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     np_op = getattr(np, op)
     rng = jtu.rand_default(self.rng())
     np_fun = lambda arg: np_op(arg, axis=axis, dtype=out_dtype)
-    np_fun = jtu.ignore_warning(category=NumpyComplexWarning)(np_fun)
+    np_fun = jtu.ignore_warning(category=np.exceptions.ComplexWarning)(np_fun)
     np_fun = jtu.ignore_warning(category=RuntimeWarning,
                                 message="overflow encountered.*")(np_fun)
     jnp_fun = lambda arg: jnp_op(arg, axis=axis, dtype=out_dtype)
-    jnp_fun = jtu.ignore_warning(category=jnp.ComplexWarning)(jnp_fun)
+    jnp_fun = jtu.ignore_warning(category=np.exceptions.ComplexWarning)(jnp_fun)
 
     args_maker = lambda: [rng(shape, dtype)]
 
@@ -2377,11 +2382,11 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     np_op = getattr(np, op)
     rng = jtu.rand_some_nan(self.rng())
     np_fun = partial(np_op, axis=axis, dtype=out_dtype)
-    np_fun = jtu.ignore_warning(category=NumpyComplexWarning)(np_fun)
+    np_fun = jtu.ignore_warning(category=np.exceptions.ComplexWarning)(np_fun)
     np_fun = jtu.ignore_warning(category=RuntimeWarning,
                                 message="overflow encountered.*")(np_fun)
     jnp_fun = partial(jnp_op, axis=axis, dtype=out_dtype)
-    jnp_fun = jtu.ignore_warning(category=jnp.ComplexWarning)(jnp_fun)
+    jnp_fun = jtu.ignore_warning(category=np.exceptions.ComplexWarning)(jnp_fun)
 
     args_maker = lambda: [rng(shape, dtype)]
 
@@ -3957,6 +3962,22 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     self.assertEqual(np.isclose(6, 10, rtol=0.5), jnp.isclose(6, 10, rtol=0.5))
     key = jax.random.key(0)
     self.assertTrue(jnp.isclose(key, key))
+
+  @jtu.sample_product(
+    atol=[0.0, 1E-4, np.inf],
+    rtol=[0.0, 1E-4, np.inf],
+    equal_nan=[True, False]
+  )
+  def testIsCloseCornerCases(self, atol, rtol, equal_nan):
+    if jtu.numpy_version() < (2, 0, 0) and (np.isinf(atol) or np.isinf(rtol)):
+      self.skipTest("fails on older NumPy")
+    vals = np.array([-np.nan, -np.inf, -1.00001, -1.0, -0.00001, -0.0,
+                     0.0, 0.00001, 1.0, 1.00001, np.inf, np.nan])
+    x, y = np.meshgrid(vals, vals)
+    self.assertArraysEqual(
+      np.isclose(x, y, atol=atol, rtol=rtol, equal_nan=equal_nan),
+      jnp.isclose(x, y, atol=atol, rtol=rtol, equal_nan=equal_nan)
+    )
 
   @jtu.sample_product(
     x=[1, [1], [1, 1 + 1E-4], [1, np.nan]],

@@ -83,6 +83,7 @@ limitations under the License.
 #include "xla/python/nb_numpy.h"
 #include "xla/python/pjrt_ifrt/pjrt_array.h"
 #include "xla/python/pjrt_ifrt/pjrt_client.h"
+#include "xla/python/pjrt_ifrt/pjrt_executable.h"
 #include "xla/python/pjrt_ifrt/xla_compiler.h"
 #include "xla/python/pprof_profile_builder.h"
 #include "xla/python/types.h"
@@ -373,14 +374,9 @@ std::unique_ptr<ifrt::CompileOptions> MakeIfrtCompileOptions(
     ifrt_loaded_host_callbacks.push_back(tsl::FormRef(
         static_cast<ifrt::LoadedHostCallback*>(host_callback.data())));
   }
-#if JAX_IFRT_VERSION_NUMBER >= 6
   return std::make_unique<ifrt::XlaCompileOptions>(
       std::move(options), std::move(executable_devices),
       std::move(ifrt_loaded_host_callbacks));
-#else
-  return std::make_unique<ifrt::XlaCompileOptions>(
-      std::move(options), std::move(ifrt_loaded_host_callbacks));
-#endif
 }
 
 // Makes IFRT `DeserializeExecutableOptions` from XLA `CompileOptions` and
@@ -398,14 +394,9 @@ MakeIfrtDeserializeExecutableOptions(std::optional<CompileOptions> options,
     ifrt_loaded_host_callbacks.push_back(tsl::FormRef(
         static_cast<ifrt::LoadedHostCallback*>(host_callback.data())));
   }
-#if JAX_IFRT_VERSION_NUMBER >= 6
   return std::make_unique<ifrt::XlaDeserializeExecutableOptions>(
       std::move(options), std::move(executable_devices),
       std::move(ifrt_loaded_host_callbacks));
-#else
-  return std::make_unique<ifrt::XlaDeserializeExecutableOptions>(
-      std::move(options), std::move(ifrt_loaded_host_callbacks));
-#endif
 }
 
 }  // namespace
@@ -461,6 +452,29 @@ PyClient::CompileAndLoadIfrtProgram(
       std::move(traceback), std::move(fingerprint));
 }
 
+/* static */ absl::StatusOr<nb_class_ptr<PyExecutable>> PyClient::Compile(
+    nb_class_ptr<PyClient> client, std::string mlir_module,
+    ifrt::DeviceListRef executable_devices, CompileOptions options) {
+  ifrt::ExecutableRef executable_ref;
+  {
+    mlir::MLIRContext context;
+    nb::gil_scoped_release gil_release;
+    TF_ASSIGN_OR_RETURN(mlir::OwningOpRef<mlir::ModuleOp> module,
+                        ParseMlirModuleString(mlir_module, context));
+    TF_ASSIGN_OR_RETURN(
+        auto topology,
+        client->ifrt_client()->GetTopologyForDevices(executable_devices));
+    auto xla_options = std::make_unique<ifrt::XlaCompileOptions>(
+        options, std::move(executable_devices));
+    TF_ASSIGN_OR_RETURN(auto pjrt_executable,
+                        PjRtCompile(std::move(options), module.get(),
+                                    *topology->description()));
+    TF_ASSIGN_OR_RETURN(executable_ref, ifrt::PjRtExecutable::Create(
+                                            std::move(pjrt_executable)));
+  }
+  return make_nb_class<PyExecutable>(executable_ref);
+}
+
 /* static */ absl::StatusOr<nb_class_ptr<PyLoadedExecutable>>
 PyClient::CompileAndLoad(nb_class_ptr<PyClient> client, std::string mlir_module,
                          ifrt::DeviceListRef executable_devices,
@@ -469,11 +483,6 @@ PyClient::CompileAndLoad(nb_class_ptr<PyClient> client, std::string mlir_module,
   mlir::MLIRContext context;
   TF_ASSIGN_OR_RETURN(mlir::OwningOpRef<mlir::ModuleOp> module,
                       ParseMlirModuleString(mlir_module, context));
-  if (options.executable_build_options.use_shardy_partitioner()) {
-    // Since Shardy is located in the middle of the XLA pipeline, we need to
-    // export it before going to HLO while preserving Shardy ops and attrs.
-    TF_RETURN_IF_ERROR(ExportShardyForHloRoundTrip(*module));
-  }
   return CompileAndLoadIfrtProgram(
       client, std::make_unique<xla::ifrt::HloProgram>(module.get()),
       MakeIfrtCompileOptions(std::move(options), std::move(executable_devices),
@@ -488,11 +497,6 @@ PyClient::CompileAndLoad(nb_class_ptr<PyClient> client, std::string mlir_module,
   mlir::MLIRContext context;
   TF_ASSIGN_OR_RETURN(mlir::OwningOpRef<mlir::ModuleOp> module,
                       ParseMlirModuleString(mlir_module, context));
-  if (options.executable_build_options.use_shardy_partitioner()) {
-    // Since Shardy is located in the middle of the XLA pipeline, we need to
-    // export it before going to HLO while preserving Shardy ops and attrs.
-    TF_RETURN_IF_ERROR(ExportShardyForHloRoundTrip(*module));
-  }
 
   std::vector<tsl::RCReference<ifrt::LoadedHostCallback>>
       ifrt_loaded_host_callbacks;
@@ -504,14 +508,9 @@ PyClient::CompileAndLoad(nb_class_ptr<PyClient> client, std::string mlir_module,
         client->ifrt_client(), std::move(host_callback));
     ifrt_loaded_host_callbacks.push_back(callback);
   }
-#if JAX_IFRT_VERSION_NUMBER >= 6
   auto compile_options = std::make_unique<ifrt::XlaCompileOptions>(
       std::move(options), std::move(executable_devices),
       std::move(ifrt_loaded_host_callbacks));
-#else
-  auto compile_options = std::make_unique<ifrt::XlaCompileOptions>(
-      std::move(options), std::move(ifrt_loaded_host_callbacks));
-#endif
   return CompileAndLoadIfrtProgram(
       client, std::make_unique<xla::ifrt::HloProgram>(module.get()),
       std::move(compile_options));

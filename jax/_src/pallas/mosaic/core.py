@@ -23,7 +23,6 @@ import functools
 from typing import Any, ClassVar, Literal
 
 import jax
-from jax._src import config
 from jax._src import core as jax_core
 from jax._src import util
 from jax._src.pallas import core as pallas_core
@@ -48,16 +47,6 @@ _convert_block_spec_to_block_mapping = pallas_core._convert_block_spec_to_block_
 _out_shape_to_aval_mapping = pallas_core._out_shape_to_aval_mapping
 split_list = util.split_list
 
-_ENABLE_RUNTIME_ASSERT = config.bool_state(
-    "jax_pallas_enable_runtime_assert",
-    default=False,
-    help=(
-        "If set, enables runtime assertions in the kernel via checkify.check."
-        " Otherwise, runtime asserts will be ignored unless functionalized"
-        " using checkify.checkify."
-    ),
-)
-
 
 class KernelType(enum.Enum):
   TC = 0
@@ -77,7 +66,7 @@ DimensionSemantics = Literal["parallel", "arbitrary"] | GridDimensionSemantics
 
 
 @dataclasses.dataclass(frozen=True)
-class TPUCompilerParams(pallas_core.CompilerParams):
+class CompilerParams(pallas_core.CompilerParams):
   """Mosaic TPU compiler parameters.
 
   Attributes:
@@ -113,7 +102,7 @@ class TPUCompilerParams(pallas_core.CompilerParams):
   # Replace is a method, not a field.
   replace = dataclasses.replace
 
-class TPUMemorySpace(enum.Enum):
+class MemorySpace(enum.Enum):
   ANY = "any"  # TODO(b/368401328): Remove this and just use pl.ANY.
   VMEM = "vmem"
   SMEM = "smem"
@@ -146,7 +135,7 @@ class SemaphoreType(enum.Enum):
       dtype = pallas_core.BarrierSemaphore()
     else:
       dtype = pallas_core.Semaphore()
-    return pallas_core.MemoryRef(shape, dtype, TPUMemorySpace.SEMAPHORE)
+    return pallas_core.MemoryRef(shape, dtype, MemorySpace.SEMAPHORE)
 
   def get_array_aval(self) -> pallas_core.ShapedArrayWithMemorySpace:
     return self(()).get_array_aval()
@@ -177,7 +166,7 @@ class PrefetchScalarGridSpec(pallas_core.GridSpec):
 
   def _make_scalar_ref_aval(self, aval):
     return AbstractMemoryRef(jax_core.ShapedArray(aval.shape, aval.dtype),
-                             TPUMemorySpace.SMEM)
+                             MemorySpace.SMEM)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -221,11 +210,6 @@ def create_tensorcore_mesh(
   )
 
 
-def runtime_assert_enabled() -> bool:
-  """Returns whether runtime asserts are enabled."""
-  return _ENABLE_RUNTIME_ASSERT.value
-
-
 def _tensorcore_mesh_discharge_rule(
     in_avals,
     out_avals,
@@ -239,12 +223,12 @@ def _tensorcore_mesh_discharge_rule(
     name: str,
 ):
   assert isinstance(mesh, TensorCoreMesh)
-  if compiler_params and not isinstance(compiler_params, TPUCompilerParams):
+  if compiler_params and not isinstance(compiler_params, CompilerParams):
     raise ValueError(
-        "compiler_params must be a pltpu.TPUCompilerParams"
+        "compiler_params must be a pltpu.CompilerParams"
     )
   if not compiler_params:
-    compiler_params = TPUCompilerParams()
+    compiler_params = CompilerParams()
   if len(mesh.shape) > 1:
     raise NotImplementedError("Mesh must be 1D")
   if compiler_params.dimension_semantics is not None:

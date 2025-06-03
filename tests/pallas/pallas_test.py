@@ -692,6 +692,22 @@ class PallasCallTest(PallasBaseTest):
     self.assertEqual(f(x), 2.)
     self.assertEqual(trace_count, 1)
 
+  def test_pallas_call_under_disable_jit(self):
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
+    )
+    def add_one(x_ref, o_ref):
+      o_ref[...] = x_ref[...] + 1.
+
+    x = jnp.arange(8, dtype=jnp.float32)
+
+    result = add_one(x)
+    np.testing.assert_array_equal(result, x + 1.)
+
+    with jax.disable_jit():
+      result = add_one(x)
+      np.testing.assert_array_equal(result, x + 1.)
+
   @parameterized.parameters(
       ("float32", None),
       ("float32", jax.lax.Precision.DEFAULT),
@@ -1081,10 +1097,10 @@ class ApiErrorTest(PallasBaseTest):
                                    pl.BlockSpec((4,), lambda: 0)])
     with self.assertRaisesRegex(
         ValueError,
-        re.compile("Pytree for `in_specs` and inputs do not match. "
+        re.compile("Pytree for `in_specs` and `inputs` do not match. "
                    "There are 1 mismatches, including:"
                    ".* at \\[1\\], `in_specs` is a pytree leaf but "
-                   "inputs is a.*", re.DOTALL)):
+                   "`inputs` is a.*", re.DOTALL)):
       f(a, dict(a=a))
 
   def test_pallas_call_index_map_wrong_number_of_arguments(self):
@@ -1260,31 +1276,6 @@ class ApiErrorTest(PallasBaseTest):
         r" the ref?",
     ):
       dot_general_kernel(x, y)
-
-  def test_jax_disable_jit(self):
-    def add_vectors_kernel(x_ref, y_ref, o_ref):
-      x, y = x_ref[...], y_ref[...]
-      o_ref[...] = x + y
-
-    @jax.jit
-    def add_vectors(x: jax.Array, y: jax.Array) -> jax.Array:
-      return self.pallas_call(
-          add_vectors_kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype)
-      )(x, y)
-
-    # Prove kernel works fine without disable_jit.
-    add_vectors(jnp.arange(8), jnp.arange(8))
-
-    with self.assertRaisesRegex(
-        NotImplementedError, "pallas_call not supported with disable_jit."
-    ):
-      with jax.disable_jit():
-        add_vectors(jnp.arange(8.0), jnp.arange(8.0))
-
-    with jax.disable_jit():
-      # We instructed the user to do this, so this should not raise an error.
-      with jax.disable_jit(False):
-        add_vectors(jnp.arange(8.0), jnp.arange(8.0))
 
 
 class ApiErrorInterpretTest(ApiErrorTest):
@@ -2276,7 +2267,7 @@ class PallasCheckifyTest(PallasBaseTest):
       checkify.check(False, "second check failed")
     input_ = jnp.arange(4, dtype=jnp.int32)
     out_shape = jax.ShapeDtypeStruct(input_.shape, input_.dtype)
-    with pltpu.enable_runtime_assert(True):
+    with pl.enable_debug_checks(True):
       pallas_call = pl.pallas_call(kernel, out_shape=out_shape)
       pallas_call(input_)  # This should log "second check failed"
 
@@ -2286,11 +2277,10 @@ class PallasCheckifyTest(PallasBaseTest):
       self.skipTest("Runtime check only implemented on TPU.")
     def kernel(x_ref, y_ref):
       y_ref[...] = x_ref[...]
-      checkify.check(False, "failed check",
-                     debug=True)  # This check always fails.
+      pl.debug_check(False, "failed check")  # This check always fails.
     input_ = jnp.arange(4, dtype=jnp.int32)
     out_shape = jax.ShapeDtypeStruct(input_.shape, input_.dtype)
-    with pltpu.enable_runtime_assert(False):
+    with pl.enable_debug_checks(False):
       pallas_call = pl.pallas_call(kernel, out_shape=out_shape)
       result = pallas_call(input_)
     np.testing.assert_allclose(result, input_)

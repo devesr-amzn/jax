@@ -18,6 +18,8 @@ To work around https://github.com/jax-ml/jax/issues/25671 , this file
 contains only tests that do not use shard_map.
 """
 
+from collections.abc import Callable
+import dataclasses
 import functools
 
 from absl.testing import absltest
@@ -59,11 +61,18 @@ class CountStoreCallbacksContext(object):
     return self._num_stores
 
 
+@dataclasses.dataclass(frozen=True)
+class ProcessedGridPoint():
+  """Represents a grid point and the ID of the core that has processed it."""
+  grid_point: tuple[int, ...]
+  core_id: int
+
+
 class GridPointRecorderContext(object):
-  """Records grid points in the order in which they are traversed."""
+  """Records grid points in the order in which they are procsessed."""
 
   def __init__(self):
-    self._grid_points = []
+    self._grid_points: list[ProcessedGridPoint] = []
 
   def __enter__(self):
     return self
@@ -71,17 +80,23 @@ class GridPointRecorderContext(object):
   def __exit__(self, ty, value, traceback):
     ...
 
-  def get_recorder(self):
-    def _recorder(grid_point):
-      self._grid_points.append(grid_point)
+  def get_recorder(self) -> Callable[[tuple[np.int32, ...], np.int32], None]:
+    def _recorder(grid_point, core_id):
+      processed_grid_point = ProcessedGridPoint(
+          tuple(int(coord) for coord in grid_point), int(core_id)
+      )
+      self._grid_points.append(processed_grid_point)
 
     return _recorder
 
   @property
-  def grid_points(self):
+  def grid_points(self) -> list[ProcessedGridPoint]:
     return self._grid_points
 
 
+# TODO(jburnim): Figure out how to safely run different instance of TPU
+# interpret mode in parallel, and then remove this decorator.
+@jtu.thread_unsafe_test_class()
 class InterpretTest(jtu.JaxTestCase):
 
   def setUp(self):
@@ -109,7 +124,7 @@ class InterpretTest(jtu.JaxTestCase):
               (x.shape[0] // 2, y.shape[1] // 2),
               lambda i, j: (i, j),
           ),
-          interpret=mosaic_interpret.TPUInterpretParams(),
+          interpret=pltpu.InterpretParams(),
       )(x, y)
 
     k1, k2 = jax.random.split(jax.random.key(0))
@@ -140,7 +155,7 @@ class InterpretTest(jtu.JaxTestCase):
           dynamic_slice_kernel,
           grid_spec=grid_spec,
           out_shape=jax.ShapeDtypeStruct(shape=sizes, dtype=x.dtype),
-          interpret=mosaic_interpret.TPUInterpretParams(),
+          interpret=pltpu.InterpretParams(),
       )
       block_idx = jnp.array([starts[0] // sizes[0], starts[1] // sizes[1]])
       return kernel(block_idx, x)
@@ -174,7 +189,7 @@ class InterpretTest(jtu.JaxTestCase):
           ],
           out_specs=pl.BlockSpec(x.shape, lambda i: (0, 0)),
           input_output_aliases={1: 0},
-          interpret=mosaic_interpret.TPUInterpretParams(),
+          interpret=pltpu.InterpretParams(),
       )(s, x)
 
     s = jnp.array([1], dtype=jnp.int32)
@@ -209,7 +224,7 @@ class InterpretTest(jtu.JaxTestCase):
         ),
         scratch_shapes=(pltpu.SMEM((1,), jnp.int32),),
         input_output_aliases={0: 0},
-        interpret=mosaic_interpret.TPUInterpretParams(),
+        interpret=pltpu.InterpretParams(),
     )(x)
 
     expected = np.zeros((4, 4))
@@ -249,7 +264,7 @@ class InterpretTest(jtu.JaxTestCase):
             pltpu.VMEM(x.shape, x.dtype),
             pltpu.SemaphoreType.DMA,
         ],
-        interpret=mosaic_interpret.TPUInterpretParams(
+        interpret=pltpu.InterpretParams(
             detect_races=True, dma_execution_mode=dma_execution_mode
         ),
     )(x).block_until_ready()
@@ -264,7 +279,7 @@ class InterpretTest(jtu.JaxTestCase):
             pltpu.VMEM(x.shape, x.dtype),
             pltpu.SemaphoreType.DMA,
         ],
-        interpret=mosaic_interpret.TPUInterpretParams(
+        interpret=pltpu.InterpretParams(
             detect_races=True, dma_execution_mode=dma_execution_mode
         ),
     )(x).block_until_ready()
@@ -278,7 +293,7 @@ class InterpretTest(jtu.JaxTestCase):
       return pl.pallas_call(
           matmul_kernel,
           out_shape=jax.ShapeDtypeStruct((x.shape[0], y.shape[1]), x.dtype),
-          interpret=mosaic_interpret.TPUInterpretParams(
+          interpret=pltpu.InterpretParams(
               skip_floating_point_ops=True
           ),
       )(x, y)
@@ -310,7 +325,7 @@ class InterpretTest(jtu.JaxTestCase):
             pltpu.VMEM((8, 128), jnp.bfloat16),
             pltpu.VMEM((8, 128), jnp.int16),
         ],
-        interpret=mosaic_interpret.TPUInterpretParams(
+        interpret=pltpu.InterpretParams(
             uninitialized_memory=uninitialized_memory
         ),
     )()
@@ -340,7 +355,7 @@ class InterpretTest(jtu.JaxTestCase):
               pl.BlockSpec(memory_space=pltpu.SMEM),
           ],
           out_specs=pl.BlockSpec((8, 256), lambda i, j: (i, 0)),
-          interpret=mosaic_interpret.TPUInterpretParams(),
+          interpret=pltpu.InterpretParams(),
       )(x, s)
 
     with CountStoreCallbacksContext() as store_callbacks_counter:
@@ -356,59 +371,6 @@ class InterpretTest(jtu.JaxTestCase):
       s_ref[0] = s + 1
       o_ref[:] = jax.lax.full_like(o_ref, s)
 
-    def kernel_call_dimensions_arbitrary_parallel(s, grid_point_recorder):
-      return pl.pallas_call(
-          kernel,
-          out_shape=jax.ShapeDtypeStruct((32, 512), jnp.float32),
-          grid=(4, 4),
-          in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
-          out_specs=pl.BlockSpec((8, 128), lambda i, j: (i, j)),
-          interpret=mosaic_interpret.TPUInterpretParams(
-              random_seed=12345, grid_point_recorder=grid_point_recorder
-          ),
-          compiler_params=pltpu.TPUCompilerParams(
-              dimension_semantics=('arbitrary', 'parallel')
-          ),
-      )(s)
-
-    with GridPointRecorderContext() as grid_point_recorder:
-      result = jax.jit(
-          kernel_call_dimensions_arbitrary_parallel, static_argnums=1
-      )(
-          jnp.zeros((1,), jnp.int32),
-          grid_point_recorder.get_recorder(),
-      )
-      np.testing.assert_allclose(
-          result[::8, ::128],
-          [
-              [ 2.0,  3.0,  0.0,  1.0],
-              [ 6.0,  7.0,  4.0,  5.0],
-              [10.0, 11.0,  8.0,  9.0],
-              [14.0, 15.0, 12.0, 13.0],
-          ],
-      )
-      np.testing.assert_array_equal(
-          grid_point_recorder.grid_points,
-          [
-              [0, 2],
-              [0, 3],
-              [0, 0],
-              [0, 1],
-              [1, 2],
-              [1, 3],
-              [1, 0],
-              [1, 1],
-              [2, 2],
-              [2, 3],
-              [2, 0],
-              [2, 1],
-              [3, 2],
-              [3, 3],
-              [3, 0],
-              [3, 1],
-          ],
-      )
-
     def kernel_call_dimensions_parallel_arbitrary(s, grid_point_recorder):
       return pl.pallas_call(
           kernel,
@@ -416,10 +378,10 @@ class InterpretTest(jtu.JaxTestCase):
           grid=(4, 4),
           in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
           out_specs=pl.BlockSpec((8, 128), lambda i, j: (i, j)),
-          interpret=mosaic_interpret.TPUInterpretParams(
+          interpret=pltpu.InterpretParams(
               random_seed=12345, grid_point_recorder=grid_point_recorder
           ),
-          compiler_params=pltpu.TPUCompilerParams(
+          compiler_params=pltpu.CompilerParams(
               dimension_semantics=('parallel', 'arbitrary')
           ),
       )(s)
@@ -440,26 +402,49 @@ class InterpretTest(jtu.JaxTestCase):
               [ 4.0,  5.0,  6.0,  7.0],
           ],
       )
-      np.testing.assert_array_equal(
+      self.assertListEqual(
           grid_point_recorder.grid_points,
           [
-              [2, 0],
-              [2, 1],
-              [2, 2],
-              [2, 3],
-              [3, 0],
-              [3, 1],
-              [3, 2],
-              [3, 3],
-              [0, 0],
-              [0, 1],
-              [0, 2],
-              [0, 3],
-              [1, 0],
-              [1, 1],
-              [1, 2],
-              [1, 3],
+              ProcessedGridPoint((2, 0), 0),
+              ProcessedGridPoint((2, 1), 0),
+              ProcessedGridPoint((2, 2), 0),
+              ProcessedGridPoint((2, 3), 0),
+              ProcessedGridPoint((3, 0), 0),
+              ProcessedGridPoint((3, 1), 0),
+              ProcessedGridPoint((3, 2), 0),
+              ProcessedGridPoint((3, 3), 0),
+              ProcessedGridPoint((0, 0), 0),
+              ProcessedGridPoint((0, 1), 0),
+              ProcessedGridPoint((0, 2), 0),
+              ProcessedGridPoint((0, 3), 0),
+              ProcessedGridPoint((1, 0), 0),
+              ProcessedGridPoint((1, 1), 0),
+              ProcessedGridPoint((1, 2), 0),
+              ProcessedGridPoint((1, 3), 0),
           ],
+      )
+
+  def test_dimensions_arbitrary_parallel_raises(self):
+    def kernel_call(s):
+      def kernel(s_ref, o_ref):
+        s = s_ref[0]
+        o_ref[0] = s
+
+      return pl.pallas_call(
+          kernel,
+          out_shape=jax.ShapeDtypeStruct((32, 512), jnp.float32),
+          grid=(4, 4),
+          in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+          out_specs=pl.BlockSpec((8, 128), lambda i, j: (i, j)),
+          interpret=pltpu.InterpretParams(random_seed=12345),
+          compiler_params=pltpu.CompilerParams(
+              dimension_semantics=('arbitrary', 'parallel')
+          ),
+      )(s)
+
+    with self.assertRaises(ValueError):
+      jax.jit(kernel_call)(
+          jnp.zeros((1,), jnp.int32),
       )
 
   def test_dynamic_parallel_dimension_raises(self):
@@ -477,8 +462,8 @@ class InterpretTest(jtu.JaxTestCase):
           grid=(dim_size,),
           in_specs=[],
           out_specs=pl.BlockSpec((1,), lambda _: (0,)),
-          interpret=mosaic_interpret.TPUInterpretParams(),
-          compiler_params=pltpu.TPUCompilerParams(
+          interpret=pltpu.InterpretParams(),
+          compiler_params=pltpu.CompilerParams(
               dimension_semantics=('parallel',)
           ),
       )()
@@ -494,7 +479,7 @@ class InterpretTest(jtu.JaxTestCase):
       y = jnp.zeros_like(x)
       def inner(refs):
         x_ref, y_ref = refs
-        @pl.core_map(mesh, interpret=mosaic_interpret.TPUInterpretParams())
+        @pl.core_map(mesh, interpret=pltpu.InterpretParams())
         def _():
           num_cores = jax.lax.psum(1, "x")
           slc_size = 16 // num_cores
@@ -521,6 +506,321 @@ class InterpretTest(jtu.JaxTestCase):
     y = f(x)
     np.testing.assert_array_equal(y, x + 1)
 
+  def test_two_cores_along_parallel_dimension_with_race(self):
+    def kernel(x_ref, o_ref, vmem_ref):
+      vmem_ref[...] = x_ref[...]
+      o_ref[...] = x_ref[...] + vmem_ref[...]
+
+    x = jnp.ones((8, 128), jnp.float32)
+    y = pl.pallas_call(
+        kernel,
+        grid=(2,),
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)],
+        scratch_shapes=[
+            pltpu.VMEM(x.shape, x.dtype),
+        ],
+        interpret=pltpu.InterpretParams(
+            num_cores_per_device=2,
+            detect_races=True,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=('parallel',),
+        ),
+    )(x).block_until_ready()
+    self.assertTrue(mosaic_interpret.races.races_found)
+    np.testing.assert_allclose(y, 2.0 * x)
+
+  def test_two_cores_along_parallel_dimension_no_race(self):
+    def kernel(x_ref, o_ref, vmem_ref):
+      vmem_ref[...] = x_ref[...]
+      o_ref[...] = x_ref[...] + vmem_ref[...]
+
+    x = jnp.ones((16, 128), jnp.float32)
+    y = pl.pallas_call(
+        kernel,
+        grid=(2,),
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_specs=pl.BlockSpec(
+            (8, 128),
+            lambda i: (i, 0),
+        ),
+        in_specs=[
+            pl.BlockSpec(
+                (8, 128),
+                lambda i: (i, 0),
+            ),
+        ],
+        scratch_shapes=[
+            pltpu.VMEM((8, 128), x.dtype),
+        ],
+        interpret=pltpu.InterpretParams(
+            num_cores_per_device=2,
+            detect_races=True,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=('parallel',)
+        ),
+    )(x).block_until_ready()
+    self.assertFalse(mosaic_interpret.races.races_found)
+    np.testing.assert_allclose(y, 2.0 * x)
+
+  def test_parallel_dimension_and_multiple_cores(self):
+    def kernel(s_ref, o_ref):
+      s = s_ref[0]
+      s_ref[0] = s + 1
+      o_ref[:] = jax.lax.full_like(o_ref, s)
+
+    def kernel_call(s, num_cores_per_device, grid_point_recorder):
+      return pl.pallas_call(
+          kernel,
+          out_shape=jax.ShapeDtypeStruct((32, 512), jnp.float32),
+          grid=(4, 4),
+          in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+          out_specs=pl.BlockSpec((8, 128), lambda i, j: (i, j)),
+          interpret=pltpu.InterpretParams(
+              random_seed=12345,
+              num_cores_per_device=num_cores_per_device,
+              grid_point_recorder=grid_point_recorder,
+          ),
+          compiler_params=pltpu.CompilerParams(
+              dimension_semantics=('parallel', 'arbitrary')
+          ),
+      )(s)
+
+    with self.subTest('num_cores_per_device=1'):
+      with GridPointRecorderContext() as grid_point_recorder:
+        result = jax.jit(kernel_call, static_argnums=(1, 2))(
+            jnp.zeros((1,), jnp.int32), 1, grid_point_recorder.get_recorder()
+        )
+        np.testing.assert_allclose(
+            result[::8, ::128],
+            [
+                [8.0, 9.0, 10.0, 11.0],
+                [12.0, 13.0, 14.0, 15.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+            ],
+        )
+        self.assertListEqual(
+            grid_point_recorder.grid_points,
+            # parallel_subgrid_size = 4
+            # num_parallel_points_per_core = (4 + 1 - 1) // 1 = 4
+            # num_iterations_per_core = 4 * (16 // 4) = 16
+            [
+                ProcessedGridPoint((2, 0), 0),
+                ProcessedGridPoint((2, 1), 0),
+                ProcessedGridPoint((2, 2), 0),
+                ProcessedGridPoint((2, 3), 0),
+                ProcessedGridPoint((3, 0), 0),
+                ProcessedGridPoint((3, 1), 0),
+                ProcessedGridPoint((3, 2), 0),
+                ProcessedGridPoint((3, 3), 0),
+                ProcessedGridPoint((0, 0), 0),
+                ProcessedGridPoint((0, 1), 0),
+                ProcessedGridPoint((0, 2), 0),
+                ProcessedGridPoint((0, 3), 0),
+                ProcessedGridPoint((1, 0), 0),
+                ProcessedGridPoint((1, 1), 0),
+                ProcessedGridPoint((1, 2), 0),
+                ProcessedGridPoint((1, 3), 0),
+            ],
+        )
+
+    with self.subTest('num_cores_per_device=2'):
+      with GridPointRecorderContext() as grid_point_recorder:
+        result = jax.jit(kernel_call, static_argnums=(1, 2))(
+            jnp.zeros((1,), jnp.int32), 2, grid_point_recorder.get_recorder()
+        )
+        np.testing.assert_allclose(
+            result[::8, ::128],
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+            ],
+        )
+        self.assertListEqual(
+            grid_point_recorder.grid_points,
+            # parallel_subgrid_size = 4
+            # num_parallel_points_per_core = (4 + 2 - 1) // 2 = 2
+            # num_iterations_per_core = 2 * (16 // 4) = 8
+            [
+                ProcessedGridPoint((2, 0), 0),
+                ProcessedGridPoint((2, 1), 0),
+                ProcessedGridPoint((2, 2), 0),
+                ProcessedGridPoint((2, 3), 0),
+                ProcessedGridPoint((3, 0), 0),
+                ProcessedGridPoint((3, 1), 0),
+                ProcessedGridPoint((3, 2), 0),
+                ProcessedGridPoint((3, 3), 0),
+                ProcessedGridPoint((0, 0), 1),
+                ProcessedGridPoint((0, 1), 1),
+                ProcessedGridPoint((0, 2), 1),
+                ProcessedGridPoint((0, 3), 1),
+                ProcessedGridPoint((1, 0), 1),
+                ProcessedGridPoint((1, 1), 1),
+                ProcessedGridPoint((1, 2), 1),
+                ProcessedGridPoint((1, 3), 1),
+            ],
+        )
+
+    with self.subTest('num_cores_per_device=3'):
+      with GridPointRecorderContext() as grid_point_recorder:
+        result = jax.jit(kernel_call, static_argnums=(1, 2))(
+            jnp.zeros((1,), jnp.int32), 3, grid_point_recorder.get_recorder()
+        )
+        np.testing.assert_allclose(
+            result[::8, ::128],
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+            ],
+        )
+        self.assertListEqual(
+            grid_point_recorder.grid_points,
+            # parallel_subgrid_size = 4
+            # num_parallel_points_per_core = (4 + 3 - 1) // 3 = 2
+            # num_iterations_per_core = 2 * (16 // 4) = 8
+            [
+                ProcessedGridPoint((2, 0), 0),
+                ProcessedGridPoint((2, 1), 0),
+                ProcessedGridPoint((2, 2), 0),
+                ProcessedGridPoint((2, 3), 0),
+                ProcessedGridPoint((3, 0), 0),
+                ProcessedGridPoint((3, 1), 0),
+                ProcessedGridPoint((3, 2), 0),
+                ProcessedGridPoint((3, 3), 0),
+                ProcessedGridPoint((0, 0), 1),
+                ProcessedGridPoint((0, 1), 1),
+                ProcessedGridPoint((0, 2), 1),
+                ProcessedGridPoint((0, 3), 1),
+                ProcessedGridPoint((1, 0), 1),
+                ProcessedGridPoint((1, 1), 1),
+                ProcessedGridPoint((1, 2), 1),
+                ProcessedGridPoint((1, 3), 1),
+            ],
+        )
+
+    with self.subTest('num_cores_per_device=4'):
+      with GridPointRecorderContext() as grid_point_recorder:
+        result = jax.jit(kernel_call, static_argnums=(1, 2))(
+            jnp.zeros((1,), jnp.int32), 4, grid_point_recorder.get_recorder()
+        )
+        np.testing.assert_allclose(
+            result[::8, ::128],
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+            ],
+        )
+        self.assertListEqual(
+            grid_point_recorder.grid_points,
+            # parallel_subgrid_size = 4
+            # num_parallel_points_per_core = (4 + 4 - 1) // 4 = 1
+            # num_iterations_per_core = 1 * (16 // 4) = 4
+            [
+                ProcessedGridPoint((2, 0), 0),
+                ProcessedGridPoint((2, 1), 0),
+                ProcessedGridPoint((2, 2), 0),
+                ProcessedGridPoint((2, 3), 0),
+                ProcessedGridPoint((3, 0), 1),
+                ProcessedGridPoint((3, 1), 1),
+                ProcessedGridPoint((3, 2), 1),
+                ProcessedGridPoint((3, 3), 1),
+                ProcessedGridPoint((0, 0), 2),
+                ProcessedGridPoint((0, 1), 2),
+                ProcessedGridPoint((0, 2), 2),
+                ProcessedGridPoint((0, 3), 2),
+                ProcessedGridPoint((1, 0), 3),
+                ProcessedGridPoint((1, 1), 3),
+                ProcessedGridPoint((1, 2), 3),
+                ProcessedGridPoint((1, 3), 3),
+            ],
+        )
+
+    with self.subTest('num_cores_per_device=5'):
+      with GridPointRecorderContext() as grid_point_recorder:
+        result = jax.jit(kernel_call, static_argnums=(1, 2))(
+            jnp.zeros((1,), jnp.int32), 5, grid_point_recorder.get_recorder()
+        )
+        np.testing.assert_allclose(
+            result[::8, ::128],
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+            ],
+        )
+        self.assertListEqual(
+            grid_point_recorder.grid_points,
+            # parallel_subgrid_size = 4
+            # num_parallel_points_per_core = (4 + 5 - 1) // 5 = 1
+            # num_iterations_per_core = 1 * (16 // 4) = 4
+            [
+                ProcessedGridPoint((2, 0), 0),
+                ProcessedGridPoint((2, 1), 0),
+                ProcessedGridPoint((2, 2), 0),
+                ProcessedGridPoint((2, 3), 0),
+                ProcessedGridPoint((3, 0), 1),
+                ProcessedGridPoint((3, 1), 1),
+                ProcessedGridPoint((3, 2), 1),
+                ProcessedGridPoint((3, 3), 1),
+                ProcessedGridPoint((0, 0), 2),
+                ProcessedGridPoint((0, 1), 2),
+                ProcessedGridPoint((0, 2), 2),
+                ProcessedGridPoint((0, 3), 2),
+                ProcessedGridPoint((1, 0), 3),
+                ProcessedGridPoint((1, 1), 3),
+                ProcessedGridPoint((1, 2), 3),
+                ProcessedGridPoint((1, 3), 3),
+            ],
+        )
+
+    with self.subTest('num_cores_per_device=6'):
+      with GridPointRecorderContext() as grid_point_recorder:
+        result = jax.jit(kernel_call, static_argnums=(1, 2))(
+            jnp.zeros((1,), jnp.int32), 6, grid_point_recorder.get_recorder()
+        )
+        np.testing.assert_allclose(
+            result[::8, ::128],
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+            ],
+        )
+        self.assertListEqual(
+            grid_point_recorder.grid_points,
+            # parallel_subgrid_size = 4
+            # num_parallel_points_per_core = (4 + 6 - 1) // 6 = 1
+            # num_iterations_per_core = 1 * (16 // 4) = 4
+            [
+                ProcessedGridPoint((2, 0), 0),
+                ProcessedGridPoint((2, 1), 0),
+                ProcessedGridPoint((2, 2), 0),
+                ProcessedGridPoint((2, 3), 0),
+                ProcessedGridPoint((3, 0), 1),
+                ProcessedGridPoint((3, 1), 1),
+                ProcessedGridPoint((3, 2), 1),
+                ProcessedGridPoint((3, 3), 1),
+                ProcessedGridPoint((0, 0), 2),
+                ProcessedGridPoint((0, 1), 2),
+                ProcessedGridPoint((0, 2), 2),
+                ProcessedGridPoint((0, 3), 2),
+                ProcessedGridPoint((1, 0), 3),
+                ProcessedGridPoint((1, 1), 3),
+                ProcessedGridPoint((1, 2), 3),
+                ProcessedGridPoint((1, 3), 3),
+            ],
+        )
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

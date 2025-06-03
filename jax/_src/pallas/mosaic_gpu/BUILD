@@ -45,6 +45,7 @@ pytype_strict_library(
         ":core",
         ":lowering",
         "//jax",
+        "//jax:config",
         "//jax:core",
         "//jax:mlir",
         "//jax:mosaic_gpu",
@@ -59,6 +60,7 @@ pytype_strict_library(
     deps = [
         ":core",
         "//jax",
+        "//jax:api",
         "//jax:core",
         "//jax:mesh",
         "//jax:mlir",
@@ -122,4 +124,10 @@ pytype_strict_library(
         "//jax:util",
         "//jax/_src/pallas",
     ],
+)
+
+pytype_strict_library(
+    name = "helpers",
+    srcs = ["helpers.py"],
+    deps = ["//jax"],
 )

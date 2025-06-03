@@ -60,7 +60,6 @@ using ImplicitDim = VectorLayout::ImplicitDim;
 
 static constexpr int kLayoutLog = 10;
 
-
 bool is_fully_replicated(const Layout &layout) {
   static LayoutOffsets replicated_offsets = {std::nullopt, std::nullopt};
   return layout.has_value() && layout->offsets() == replicated_offsets;
@@ -152,6 +151,14 @@ class VectorLayoutInferer {
           return failure();
         }
       } else if (isa<arith::ExtFOp, arith::ExtSIOp>(any_op)) {
+        if (inferExt(&any_op).failed()) {
+          return failure();
+        }
+      } else if (auto op = dyn_cast<tpu::SIToFPOp>(any_op);
+                 op &&
+                 cast<VectorType>(op.getIn().getType())
+                         .getElementTypeBitWidth() <
+                     cast<VectorType>(op.getType()).getElementTypeBitWidth()) {
         if (inferExt(&any_op).failed()) {
           return failure();
         }
@@ -1520,7 +1527,30 @@ class VectorLayoutInferer {
                              native_tiling, ImplicitDim::kNone));
       return success();
     }
-    op.emitOpError("unsupported shape cast");
+
+    // Shape cast (..., m, n, k * target_shape_[1]) -> (..., m, n * k *
+    // target_shape_[1]) for 32-bit types. We allow multiple major or minor
+    // dimensions to be folded or unfolded.
+    if (kNativeBitwidth == bitwidth && res_shape.size() >= 2 &&
+        src_shape.size() >= 2 && src_shape.back() % native_tiling[1] == 0 &&
+        res_shape.back() % native_tiling[1] == 0 &&
+        (mlir::tpu::canFoldMinorDimsToSize(src_shape, res_shape.back()) ||
+         mlir::tpu::canFoldMinorDimsToSize(res_shape, src_shape.back()))) {
+      // TODO(jsreeram): Add support for picking space-efficient tilings for
+      // small 2nd minor dim shapes.
+      // Example 1: (4, 2, 1024) -> (4, 2048) If we infer src and tgt layout to
+      // be (1, 128), it is no-op because essentially we just shufflle the VREGs
+      // in VREG array.
+      // Example 2: (4, 256) -> (1, 1024) is actually sublane
+      // shuffle inside each vreg from [0, 1, 2, 3, 4,..7] to [0, 4, 1, 5, ...]
+      setLayout(op,
+                VectorLayout(layout.bitwidth(), {0, 0}, native_tiling,
+                             ImplicitDim::kNone),
+                VectorLayout(layout.bitwidth(), {0, 0}, native_tiling,
+                             ImplicitDim::kNone));
+      return success();
+    }
+    op.emitOpError("infer-vector-layout: unsupported shape cast");
     return failure();
   }
 
@@ -1652,17 +1682,27 @@ class VectorLayoutInferer {
     auto src_ty = op.getSourceVectorType();
     TPU_CHECK_OP(permutation.size() == src_ty.getRank(),
                  "Transpose permutation has incorrect rank");
-    for (auto dim : permutation.drop_back(2)) {
-      TPU_CHECK_OP(dim < src_ty.getRank() - 2,
-                   "Unsupported transpose permutation - minor dims into major");
-    }
-    for (auto dim : permutation.take_back(2)) {
-      TPU_CHECK_OP(dim >= src_ty.getRank() - 2,
-                   "Unsupported transpose permutation - major dims into minor");
+    bool untiled_tiled_swap = false;
+    // TODO(mvoz): Expand to more general cases. b/419268277
+    if (permutation.size() == 3 && permutation[0] == 1 && permutation[1] == 0) {
+      untiled_tiled_swap = true;
+    } else {
+      for (auto dim : permutation.drop_back(2)) {
+        TPU_CHECK_OP(dim < src_ty.getRank() - 2,
+                     "Unsupported transpose permutation - minor dims into "
+                     "major > 3 dimensions");
+      }
+      for (auto dim : permutation.take_back(2)) {
+        TPU_CHECK_OP(dim >= src_ty.getRank() - 2,
+                     "Unsupported transpose permutation - major dims into "
+                     "minor > 3 dimensions");
+      }
     }
     Layout required_layout = some_layout;
-    // Require native tiling if we're going to use the XLU.
-    if (permutation[permutation.size() - 1] == permutation.size() - 2) {
+    // Require native tiling if we're going to use the XLU, or doing a
+    // major/minor permute.
+    if (untiled_tiled_swap ||
+        permutation[permutation.size() - 1] == permutation.size() - 2) {
       auto native_tiling = nativeTiling(layout.bitwidth());
       required_layout = VectorLayout(layout.bitwidth(), LayoutOffsets{0, 0},
                                      native_tiling, ImplicitDim::kNone);
@@ -1912,12 +1952,11 @@ class VectorLayoutInferer {
   }
 
   bool allUsersRequireNativeTiling(Value x) {
-    for (OpOperand &operand : x.getUses()) {
-      if (isa<tpu::MatmulOp>(operand.getOwner())) {
+    for (Operation *user : getNontrivialTransitiveUsers(x)) {
+      if (isa<tpu::MatmulOp>(user)) {
         continue;
       }
-      if (auto reduce =
-              dyn_cast<vector::MultiDimReductionOp>(operand.getOwner())) {
+      if (auto reduce = dyn_cast<vector::MultiDimReductionOp>(user)) {
         bool reduces_tiled_dims = false;
         for (int64_t dim : reduce.getReductionDims()) {
           if (dim >= reduce.getSourceVectorType().getRank() - 2) {
@@ -1929,7 +1968,7 @@ class VectorLayoutInferer {
           continue;
         }
       }
-      if (auto transpose = dyn_cast<tpu::TransposeOp>(operand.getOwner())) {
+      if (auto transpose = dyn_cast<tpu::TransposeOp>(user)) {
         auto perm = transpose.getPermutation();
         auto rank = perm.size();
         // Only permutations that actually swap the last two dims need it.
@@ -1939,7 +1978,7 @@ class VectorLayoutInferer {
         }
         // Fall through.
       }
-      if (auto store = dyn_cast<vector::StoreOp>(operand.getOwner())) {
+      if (auto store = dyn_cast<vector::StoreOp>(user)) {
         auto maybe_tiling = verifyMemoryTiling(
             store, getMemRefLayout(store.getBase()).getTiles(),
             store.getMemRefType().getRank(),

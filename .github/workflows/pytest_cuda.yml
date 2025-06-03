@@ -17,39 +17,36 @@ on:
       runner:
         description: "Which runner should the workflow run on?"
         type: string
-        required: true
         default: "linux-x86-n2-16"
       python:
         description: "Which python version to test?"
         type: string
-        required: true
         default: "3.12"
-      cuda:
+      cuda-version:
         description: "Which CUDA version to test?"
         type: string
-        required: true
-        default: "12.3"
+        default: "12.8"
+      use-nvidia-pip-wheels:
+        description: "Whether to download CUDA packages from PyPI?"
+        type: boolean
+        default: false
       enable-x64:
         description: "Should x64 mode be enabled?"
         type: string
-        required: true
         default: "0"
       download-jax-only-from-gcs:
         description: "Whether to download only the jax wheel from GCS (e.g for testing a jax only release)"
-        required: false
         default: '0'
         type: string
       gcs_download_uri:
         description: "GCS location prefix from where the artifacts should be downloaded"
-        required: true
         default: 'gs://general-ml-ci-transient/jax-github-actions/jax/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}'
         type: string
       halt-for-connection:
         description: 'Should this workflow run wait for a remote connection?'
         type: string
-        required: false
         default: 'no'
-
+permissions: {}
 jobs:
   run-tests:
     defaults:
@@ -58,9 +55,14 @@ jobs:
         shell: bash
     runs-on: ${{ inputs.runner }}
     # Test the oldest and newest supported CUDA versions.
-    container:  ${{ (contains(inputs.cuda, '12.1') && 'us-central1-docker.pkg.dev/tensorflow-sigs/tensorflow/ml-build-cuda12.1-cudnn9.8:latest') ||
-                (contains(inputs.cuda, '12.8') && 'us-central1-docker.pkg.dev/tensorflow-sigs/tensorflow/ml-build-cuda12.8-cudnn9.8:latest') }}
-    name: "Pytest CUDA (${{ inputs.runner }}, CUDA ${{ inputs.cuda }}, Python ${{ inputs.python }}, x64=${{ inputs.enable-x64 }})"
+    # If testing the CUDA packages from PyPI, then use the ml-build image which does not have any
+    # CUDA pckages installed on the system.
+    container:  ${{ !inputs.use-nvidia-pip-wheels && (contains(inputs.cuda-version, '12.1') && 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda12.1-cudnn9.8:latest') ||
+                !inputs.use-nvidia-pip-wheels && (contains(inputs.cuda-version, '12.8') && 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda12.8-cudnn9.8:latest') ||
+                inputs.use-nvidia-pip-wheels && 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest'}}
+    name: "${{ (contains(inputs.runner, 'h100') && 'h100') ||
+        (contains(inputs.runner, 'b200') && 'b200') ||
+        (contains(inputs.runner, 'l4') && 'l4') }}, CUDA ${{ inputs.cuda-version }}, py ${{ inputs.python }}, x64=${{ inputs.enable-x64 }}"
 
     env:
       JAXCI_HERMETIC_PYTHON_VERSION: "${{ inputs.python }}"
@@ -69,6 +71,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Set env vars for use in artifact download URL
         run: |
           os=$(uname -s | awk '{print tolower($0)}')
@@ -93,20 +97,31 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p $(pwd)/dist
-          gsutil -m cp -r "${{ inputs.gcs_download_uri }}"/jax*py3*none*any.whl $(pwd)/dist/
+          gcloud storage cp -r "${{ inputs.gcs_download_uri }}"/jax*py3*none*any.whl $(pwd)/dist/
 
           # Do not download the jaxlib and CUDA plugin artifacts if we are testing a jax only
           # release.
           if [[ "${{ inputs.download-jax-only-from-gcs }}" == "1" ]]; then
             echo "JAX only release. Only downloading the jax wheel from the release bucket."
 
-            # Set the env var to install the CUDA plugin and PJRT packages from PyPI. jaxlib is
-            # required dependency of jax so that gets installed automatically.
-            echo "JAXCI_ADDITIONAL_WHEELS_INSTALL_FROM_PYPI=jax_cuda_pypi">> $GITHUB_ENV
+            if [[ "${{ inputs.use-nvidia-pip-wheels }}" == false ]]; then
+              # Install only the PJRT and JAX CUDA Plugin packages from PyPI. Nvidia CUDA packages
+              # are used from the system.
+              echo "JAXCI_JAX_PYPI_EXTRAS=cuda12-local">> $GITHUB_ENV
+            else
+             # Install the PJRT, JAX CUDA Plugin, and Nvidia CUDA packages from PyPI.
+              echo "JAXCI_JAX_PYPI_EXTRAS=cuda12">> $GITHUB_ENV
+            fi
           else
-            gsutil -m cp -r "${{ inputs.gcs_download_uri }}/jaxlib*${PYTHON_MAJOR_MINOR}*${OS}*${ARCH}*.whl" $(pwd)/dist/ &&
-            gsutil -m cp -r "${{ inputs.gcs_download_uri }}/jax*cuda*plugin*${PYTHON_MAJOR_MINOR}*${OS}*${ARCH}*.whl" $(pwd)/dist/ &&
-            gsutil -m cp -r "${{ inputs.gcs_download_uri }}/jax*cuda*pjrt*${OS}*${ARCH}*.whl" $(pwd)/dist/
+            gcloud storage cp -r "${{ inputs.gcs_download_uri }}/jaxlib*${PYTHON_MAJOR_MINOR}*${OS}*${ARCH}*.whl" $(pwd)/dist/ &&
+            gcloud storage cp -r "${{ inputs.gcs_download_uri }}/jax*cuda*plugin*${PYTHON_MAJOR_MINOR}*${OS}*${ARCH}*.whl" $(pwd)/dist/ &&
+            gcloud storage cp -r "${{ inputs.gcs_download_uri }}/jax*cuda*pjrt*${OS}*${ARCH}*.whl" $(pwd)/dist/
+
+             if [[ "${{ inputs.use-nvidia-pip-wheels }}" == true ]]; then
+              # Install the Nvidia CUDA packages from PyPI. The wheels downloaded in the previous
+              # step will be used for the PJRT and JAX CUDA Plugin packages.
+              echo "JAXCI_JAX_PYPI_EXTRAS=cuda12">> $GITHUB_ENV
+             fi
           fi
       - name: Skip the test run if the wheel artifacts were not downloaded successfully
         if: steps.download-wheel-artifacts.outcome == 'failure'
@@ -119,9 +134,9 @@ jobs:
         run: $JAXCI_PYTHON -m uv pip install -r build/test-requirements.txt
       # Halt for testing
       - name: Wait For Connection
-        uses: google-ml-infra/actions/ci_connection@main
+        uses: google-ml-infra/actions/ci_connection@7f5ca0c263a81ed09ea276524c1b9192f1304e3c
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
       - name: Run Pytest CUDA tests
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: ./ci/run_pytest_cuda.sh

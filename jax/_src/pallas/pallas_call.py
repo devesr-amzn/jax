@@ -77,16 +77,12 @@ pallas_call_p.multiple_results = True
 
 def _pallas_call_impl(*args, **params):
   # Call the lowering path
-  if config.disable_jit.value:
-    raise NotImplementedError(
-        "pallas_call not supported with disable_jit. Consider invoking under a"
-        " local context of `jax.disable_jit(False)`."
-    )
-
   @partial(jax.jit, inline=True)
   def _jit_run(*args):
     return pallas_call_p.bind(*args, **params)
-  return _jit_run(*args)
+
+  with config.disable_jit(False):
+    return _jit_run(*args)
 
 pallas_call_p.def_impl(_pallas_call_impl)
 
@@ -100,7 +96,7 @@ def _pallas_call_abstract_eval(
 ):
   del avals
 
-  if isinstance(interpret, mosaic_tpu_interpret.TPUInterpretParams):
+  if isinstance(interpret, mosaic_tpu_interpret.InterpretParams):
     # Report effects that will be introduced when running/lowering
     # mosaic_tpu_interpret.mosaic_tpu_interpret.interpret_pallas_call .
     effs = mosaic_tpu_interpret.get_interpret_effects()
@@ -1235,7 +1231,7 @@ _PALLAS_USE_MOSAIC_GPU = config.bool_state(
 
 _PALLAS_VERBOSE_ERRORS = config.bool_flag(
     "jax_pallas_verbose_errors",
-    default=config.bool_env("JAX_PALLAS_VERBOSE_ERRORS", True),
+    default=config.bool_env("JAX_PALLAS_VERBOSE_ERRORS", False),
     help=(
         "If True, print verbose error messages for Pallas kernels."
     ),
@@ -1265,7 +1261,7 @@ def _pallas_call_lowering(
   if params['jaxpr'].constvars:
     raise ValueError('Cannot lower a pallas_call with constants.')
   if interpret:
-    if isinstance(interpret, mosaic_tpu_interpret.TPUInterpretParams):
+    if isinstance(interpret, mosaic_tpu_interpret.InterpretParams):
       impl = partial(mosaic_tpu_interpret.interpret_pallas_call,
                      interpret_params=interpret,
                      **params)
@@ -1499,7 +1495,7 @@ def pallas_call(
     interpret: Any = False,
     name: str | None = None,
     compiler_params: (
-        Mapping[Backend, CompilerParams] | CompilerParams | None
+        Mapping[Backend, "CompilerParams"] | "CompilerParams" | None
     ) = None,
     cost_estimate: CostEstimate | None = None,
     backend: Backend | None = None,
@@ -1549,9 +1545,9 @@ def pallas_call(
       {file}:{line}`.
     compiler_params: Optional compiler parameters. The value should either be a
       backend-specific dataclass
-      (:class:`jax.experimental.pallas.tpu.TPUCompilerParams`,
-      :class:`jax.experimental.pallas.triton.TritonCompilerParams`,
-      :class:`jax.experimental.pallas.mosaic_gpu.GPUCompilerParams`) or a dict
+      (:class:`jax.experimental.pallas.tpu.CompilerParams`,
+      :class:`jax.experimental.pallas.triton.CompilerParams`,
+      :class:`jax.experimental.pallas.mosaic_gpu.CompilerParams`) or a dict
       mapping backend name to the corresponding platform-specific dataclass.
     backend: Optional string literal one of  ``"mosaic_tpu"``, ``"triton"`` or
       ``"mosaic_gpu"`` determining the backend to be used. None means let Pallas
@@ -1600,13 +1596,13 @@ def _normalize_compiler_params(
 ) -> Mapping[Backend, CompilerParams]:
   if compiler_params is None:
     return {}
-  if isinstance(compiler_params, pallas_core.CompilerParams):
+  if isinstance(compiler_params, CompilerParams):
     compiler_params = {compiler_params.BACKEND: compiler_params}
   assert isinstance(compiler_params, Mapping)
   for backend, params in compiler_params.items():
     if backend not in ["mosaic_tpu", "mosaic_gpu", "triton"]:
       raise ValueError(f"Unknown backend in compiler_params: {backend}")
-    if not isinstance(params, pallas_core.CompilerParams):
+    if not isinstance(params, CompilerParams):
       raise ValueError(
           f"Unexpected compiler_params for backend {backend}: {params}"
       )
@@ -1778,5 +1774,5 @@ try:
   from jax._src.pallas.mosaic import interpret as mosaic_tpu_interpret
 except ImportError:
   mosaic_tpu_interpret = types.SimpleNamespace(  # type: ignore
-      TPUInterpretParams=types.new_class('_NoInstances', (enum.Enum,)),
+      InterpretParams=types.new_class('_NoInstances', (enum.Enum,)),
   )

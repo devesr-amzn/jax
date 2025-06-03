@@ -20,13 +20,13 @@ import enum
 import itertools
 import math
 import operator
+import sys
 import re
 import unittest
 
 from absl.testing import absltest, parameterized
 import jax
 from jax._src import config
-from jax._src import lib as jaxlib
 from jax._src import test_util as jtu
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
@@ -228,14 +228,15 @@ class TestCase(parameterized.TestCase):
     super().setUp()
     self.prng = np.random.default_rng(1234)
     self.context = mlir.make_ir_context()
-    if mgpu_dialect is not None:
-      mgpu_dialect.register_dialect(self.context)
+    mgpu_dialect.register_dialect(self.context)
     self.enter_context(config.traceback_filtering("off"))
     self.enter_context(self.context)
     self.enter_context(ir.Location.unknown())
 
   @contextlib.contextmanager
   def capture_stdout(self):
+    if "pytest" in sys.modules:
+      self.skipTest("pytest interacts badly with GPU stdout capture")
     if mosaic_gpu_lib is None:
       raise ValueError("Running tests but missing Mosaic GPU extension")
     with jtu.capture_stdout() as stdout:
@@ -386,17 +387,19 @@ class MemRefTest(TestCase):
       ("add_1s", (5, 1, 2), (1, 1, 5, 1, 1, 2, 1, 1)),
       ("fold", (1, 5, 2, 1,), (1, 10, 1)),
       ("un", (1, 10, 1), (1, 5, 2, 1,)),
+      ("to_scalar", (1, 1, 1), ()),
+      ("from_scalar", (), (1, 1, 1)),
   )
   def test_reshape(self, inp_shape, out_shape):
     def kernel(ctx, inp, out, _):
       copy(memref_reshape(inp, out_shape), out)
 
-    x = np.arange(math.prod(inp_shape), dtype=jnp.float32).reshape(*inp_shape)
+    x = np.arange(math.prod(inp_shape), dtype=jnp.float32).reshape(inp_shape)
     out_ty = jax.ShapeDtypeStruct(out_shape, jnp.float32)
     y = mgpu.as_gpu_kernel(
         kernel, (1, 1, 1), (128, 1, 1), x, out_ty, ()
     )(x)
-    np.testing.assert_array_equal(y, x.reshape(*out_shape))
+    np.testing.assert_array_equal(y, x.reshape(out_shape))
 
   @parameterized.named_parameters([
       ("packed", (4, 4, 4), (16, 4, 1), 1, 2, False),
@@ -456,7 +459,7 @@ class MemRefTest(TestCase):
         " values read from the 32-bit input buffer to sometimes"
         " (nondeterministically) contain garbage.")
 
-    scalar = 42
+    scalar = dtype(42)
     expected = np.full((128, 128), scalar, dtype=dtype)
 
     def kernel(ctx, inp, out, _):
@@ -505,6 +508,40 @@ class WGMMALayoutTest(TestCase):
     np.testing.assert_array_equal(iota, expected)
 
   @parameterized.product(
+      dtype=[jnp.float8_e5m2fnuz, jnp.float8_e5m2, jnp.float8_e4m3b11fnuz,
+             jnp.float8_e4m3fn, jnp.float8_e4m3fnuz],
+      swizzle=(32, 64, 128),
+      num_col_tiles=(1, 2, 3),
+  )
+  def test_load_and_store_tiled_f8(self, dtype, swizzle, num_col_tiles):
+    # We use a different test than `test_store_tiled` because converting
+    # `iota` to `f8` type requires additional specialized logic that is not
+    # yet available.
+    col_tiling = swizzle
+    m = 128
+    n = col_tiling * num_col_tiles
+    tiling = (64, col_tiling)
+    def kernel(ctx, inp, out, smem):
+      del ctx
+      smem_inp, smem_out = smem
+      copy(inp, smem_inp, swizzle=swizzle)
+      arr = mgpu.FragmentedArray.load_tiled(smem_inp, swizzle=swizzle)
+      arr.store_tiled(smem_out, swizzle=swizzle)
+      copy(smem_out, out, swizzle=swizzle)
+    expected = (
+        jax.random.randint(
+            jax.random.key(42), (m * n,), -16, 15, dtype=jnp.int8
+        )
+        .reshape(m // tiling[0], tiling[0], n // tiling[1], tiling[1])
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    res = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), expected, expected, (expected,) * 2
+    )(expected)
+    np.testing.assert_array_equal(res, expected)
+
+  @parameterized.product(
       dtype=[jnp.float32, jnp.float16, jnp.int8],
       swizzle=(32, 64, 128),
       num_col_tiles=(1, 2, 3),
@@ -549,6 +586,53 @@ class WGMMALayoutTest(TestCase):
     y = x.astype(jax_dtype_to)
     f = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, y, (x, y))
     np.testing.assert_array_equal(f(x), y)
+
+  def test_f8_conversions(self):
+    jax_dtype_from, jax_dtype_to = jnp.float32, jnp.float8_e4m3fn
+    mlir_dtype_to = utils.dtype_to_ir_type(jax_dtype_to)
+    def kernel(ctx, inp, out, smem):
+      del ctx
+      smem_from, smem_to = smem
+      copy(inp, smem_from, swizzle=128)
+      t = mgpu.FragmentedArray.load_tiled(
+          smem_from,
+          swizzle=128,
+          is_signed=None,
+          layout=fa.WGMMA_LAYOUT,
+      )
+      t = t.astype(mlir_dtype_to, is_signed=utils.is_signed(jax_dtype_to))
+      t.store_tiled(smem_to, swizzle=128)
+      copy(smem_to, out, swizzle=128)
+
+    # These generative shenanigans are to ensure that we don't generate values
+    # that are too large for the target type. That is because the saturation
+    # behavior of the conversion is different between XLA and Mosaic GPU here
+    # (to use the NVIDIA internal, we allow Mosaic GPU to use the .satfinite
+    # modifier, which saturates to the largest finite value---while XLA would
+    # give us NaNs in this case).
+    max_finite_val = 0b111_1110
+
+    expected = jax.lax.bitcast_convert_type(
+        jax.random.randint(
+            jax.random.key(42),
+            (1, 1, 64, 128),
+            -max_finite_val,
+            max_finite_val + 1,
+            dtype=jnp.uint8,
+        ),
+        jax_dtype_to,
+    )
+    x = expected.astype(jax_dtype_from)
+
+    res = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        x,
+        expected,
+        (x, expected),
+    )(x)
+    np.testing.assert_array_equal(res, expected)
 
   @parameterized.product(
       jax_dtype_from_to=(
@@ -640,6 +724,19 @@ class WGMMALayoutTest(TestCase):
     np.testing.assert_array_equal(iota, expected)
 
 
+class I8Type:
+  """A type that represents a 8-bit signed integer.
+
+  This is a workaround to bypass the fact that we don't have a proper 8-bit
+  integer type class available in MLIR, and can't instantiate types without a
+  MLIR context.
+  """
+
+  @staticmethod
+  def get():  # pylint: disable=no-method-argument
+    return ir.IntegerType.get_signless(8)
+
+
 class WGMMATest(TestCase):
 
   def setUp(self):
@@ -650,7 +747,13 @@ class WGMMATest(TestCase):
   @parameterized.product(
       lhs_transpose=(False, True),
       rhs_transpose=(False, True),
-      in_mlir_dtype_cls=(ir.F16Type, ir.BF16Type, ir.F32Type),
+      in_mlir_dtype_cls=(
+          ir.F16Type,
+          ir.BF16Type,
+          ir.F32Type,
+          ir.Float8E5M2Type,
+          ir.Float8E4M3FNType,
+      ),
       m=(64, 128, 192),
       n=(64, 128, 192),
       k_steps=(1, 2),
@@ -659,7 +762,67 @@ class WGMMATest(TestCase):
       rhs_tiling_kind=("large", "small", "small+no_transpose"),
       lhs_tiling_kind=("large", "small", "small+no_transpose"),
   )
-  def test_wgmma_basic(
+  def test_wgmma_basic_float(
+      self,
+      lhs_transpose,
+      rhs_transpose,
+      in_mlir_dtype_cls,
+      m,
+      n,
+      k_steps,
+      swizzle,
+      jax_out_dtype,
+      rhs_tiling_kind,
+      lhs_tiling_kind,
+  ):
+    self._test_wgmma_basic(
+        m,
+        n,
+        k_steps,
+        in_mlir_dtype_cls,
+        lhs_transpose,
+        rhs_transpose,
+        swizzle,
+        jax_out_dtype,
+        rhs_tiling_kind,
+        lhs_tiling_kind,
+    )
+
+  @parameterized.product(
+      in_mlir_dtype_cls=(I8Type,),
+      m=(64, 128, 192),
+      n=(64, 128, 192),
+      k_steps=(1, 2),
+      swizzle=(32, 64, 128),
+      jax_out_dtype=(jnp.int32,),
+      rhs_tiling_kind=("large", "small", "small+no_transpose"),
+      lhs_tiling_kind=("large", "small"),
+  )
+  def test_wgmma_basic_int(
+      self,
+      in_mlir_dtype_cls,
+      m,
+      n,
+      k_steps,
+      swizzle,
+      jax_out_dtype,
+      rhs_tiling_kind,
+      lhs_tiling_kind,
+  ):
+    self._test_wgmma_basic(
+        m,
+        n,
+        k_steps,
+        in_mlir_dtype_cls,
+        lhs_transpose=False,
+        rhs_transpose=True,
+        swizzle=swizzle,
+        jax_out_dtype=jax_out_dtype,
+        rhs_tiling_kind=rhs_tiling_kind,
+        lhs_tiling_kind=lhs_tiling_kind,
+    )
+
+  def _test_wgmma_basic(
       self,
       m,
       n,
@@ -672,8 +835,12 @@ class WGMMATest(TestCase):
       rhs_tiling_kind,
       lhs_tiling_kind,
   ):
-    if jax_out_dtype == jnp.float16 and in_mlir_dtype_cls is not ir.F16Type:
-      self.skipTest("Only f16 input is supported for f16 output.")
+    if jax_out_dtype == jnp.int32 and in_mlir_dtype_cls != I8Type:
+      self.skipTest("s32 accumulator only supported with s8 inputs")
+    if jax_out_dtype != jnp.int32 and in_mlir_dtype_cls == I8Type:
+      self.skipTest("s8 inputs only supported with s32 accumulator")
+    if jax_out_dtype == jnp.float16 and in_mlir_dtype_cls in {ir.F32Type, ir.BF16Type}:
+      self.skipTest(f"{in_mlir_dtype_cls.get()} does not support f16 output.")
     if swizzle != 128 and lhs_transpose and lhs_tiling_kind == "large":
       self.skipTest("Transpose only supported in 128B swizzled WGMMA")
     if rhs_tiling_kind == "small+no_transpose" and not rhs_transpose:
@@ -683,10 +850,10 @@ class WGMMATest(TestCase):
 
     in_mlir_dtype = in_mlir_dtype_cls.get()
     out_mlir_dtype = utils.dtype_to_ir_type(jax_out_dtype)
+    if (lhs_transpose or not rhs_transpose) and bytewidth(in_mlir_dtype) != 2:
+      self.skipTest("Transpose only supported in 16-bit WGMMA")
     if ir.F32Type.isinstance(in_mlir_dtype):  # We actually use tf32 instead
       in_jax_dtype = jnp.float32
-      if lhs_transpose or not rhs_transpose:
-        self.skipTest("Transpose only supported in 16-bit WGMMA")
       exponent_bits, mantissa_bits = 8, 10  # Use tf32
     elif bytewidth(in_mlir_dtype) == 2:
       if n % 64 != 0:
@@ -699,10 +866,21 @@ class WGMMATest(TestCase):
         exponent_bits, mantissa_bits = 8, 7
       else:
         raise NotImplementedError(in_mlir_dtype)
+    elif in_mlir_dtype_cls == ir.Float8E5M2Type:
+      in_jax_dtype = jnp.float8_e5m2
+      exponent_bits, mantissa_bits = 5, 2
+    elif in_mlir_dtype_cls == ir.Float8E4M3FNType:
+      in_jax_dtype = jnp.float8_e4m3fn
+      exponent_bits, mantissa_bits = 4, 3
+    elif in_mlir_dtype_cls == I8Type:
+      in_jax_dtype = jnp.int8
+      exponent_bits = mantissa_bits = None
     else:
       raise NotImplementedError(in_mlir_dtype)
     nk_tile = swizzle // bytewidth(in_mlir_dtype)
     k = nk_tile * k_steps
+    if n % nk_tile:
+      self.skipTest("tiling does not divide N")
     assert m % 64 == 0 and n % nk_tile == 0
 
     small_rhs_tile = rhs_tiling_kind != "large"
@@ -736,7 +914,8 @@ class WGMMATest(TestCase):
       )
       for i in range(2):
         barriers[i].wait()
-      init_acc = mgpu.WGMMAAccumulator.zero(m=m, n=n, dtype=out_mlir_dtype)
+      is_signed = True if ir.IntegerType.isinstance(in_mlir_dtype) else None
+      init_acc = mgpu.WGMMAAccumulator.zero(m=m, n=n, dtype=out_mlir_dtype, is_signed=is_signed)
       if lhs_transpose:
         perm = (0, 1, 3, 2) if transpose_lhs_tiles else (1, 0, 3, 2)
         lhs_smem = memref_transpose(lhs_smem, perm)
@@ -753,9 +932,13 @@ class WGMMATest(TestCase):
       return jax.lax.reduce_precision(x, exponent_bits, mantissa_bits)
 
     x_shape = (k, m) if lhs_transpose else (m, k)
-    x = quantize(self.prng.uniform(-1, 1, x_shape)).astype(in_jax_dtype)
     y_shape = (n, k) if rhs_transpose else (k, n)
-    y = quantize(self.prng.uniform(-1, 1, y_shape)).astype(in_jax_dtype)
+    if in_mlir_dtype_cls == I8Type:
+      x = self.prng.integers(-128, 127, x_shape).astype(in_jax_dtype)
+      y = self.prng.integers(-128, 127, y_shape).astype(in_jax_dtype)
+    else:
+      x = quantize(self.prng.uniform(-1, 1, x_shape)).astype(in_jax_dtype)
+      y = quantize(self.prng.uniform(-1, 1, y_shape)).astype(in_jax_dtype)
     out_shape = jax.ShapeDtypeStruct((m, n), jax_out_dtype)
     if transpose_rhs_tiles:
       rhs_tiling_t = rhs_tiling[::-1] if rhs_transpose else rhs_tiling
@@ -778,6 +961,10 @@ class WGMMATest(TestCase):
     x32, y32 = x.astype(np.float32), y.astype(np.float32)
     ref = (x32.T if lhs_transpose else x32) @ (y32.T if rhs_transpose else y32)
     atol = 2e-2 if jax_out_dtype == jnp.float16 else 5e-6
+    if ir.IntegerType.isinstance(in_mlir_dtype) and ir.IntegerType.isinstance(out_mlir_dtype):
+      atol = 0
+    elif utils.bitwidth(in_mlir_dtype) == 8:
+      atol = 3e-2
     np.testing.assert_allclose(z, ref, atol=atol)
 
   # TODO(apaszke): Add support for f32
@@ -1292,11 +1479,12 @@ class TCGen05Test(TestCase):
     y_block_shape = (n_block_tile, k) if rhs_transpose else (k, n_block_tile)
     y = quantize(self.prng.uniform(-1, 1, y_shape)).astype(in_jax_dtype)
     out_shape = jax.ShapeDtypeStruct((m, n), out_jax_dtype)
+    tmem_layout = tcgen05.TMEM_COLLECTIVE_N512_LAYOUT if n == 512 else None
     scratch_shape = [
         jax.ShapeDtypeStruct(tile_shape(x_block_shape, tiling), in_jax_dtype),
         jax.ShapeDtypeStruct(tile_shape(y_block_shape, tiling), in_jax_dtype),
         mgpu.TMABarrier(3),
-        mgpu.TMEM((128, n), out_jax_dtype, collective=True),
+        mgpu.TMEM((128, n), out_jax_dtype, collective=True, layout=tmem_layout),
     ]
     z = mgpu.as_gpu_kernel(
         kernel, (2, 1, 1), (128, 1, 1), (x, y), out_shape, scratch_shape, cluster=(2, 1, 1)
@@ -1448,6 +1636,25 @@ class TMATest(TestCase):
     x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
     smem = (x, mgpu.TMABarrier())
     y = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, smem)(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_tma_with_1d_tiling(self):
+    swizzle = 128
+    dtype = jnp.float16
+    shape = (64, 128)
+    tiling = (1, swizzle // jnp.dtype(dtype).itemsize)
+    def kernel(ctx, dst, smem):
+      iota_tensor(*shape, dtype=dtype).store_tiled(smem, swizzle=swizzle)
+      ctx.async_copy(
+          src_ref=smem,
+          dst_ref=dst,
+          swizzle=swizzle,
+          gmem_transform=mgpu.TileTransform(tiling),
+      )
+      ctx.await_async_copy(0)
+    x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    smem = jax.ShapeDtypeStruct(utils.tile_shape(shape, tiling), dtype)
+    y = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), (), x, smem)()
     np.testing.assert_array_equal(y, x)
 
   @parameterized.named_parameters(
@@ -2325,6 +2532,21 @@ class FragmentedArrayTest(TestCase):
     f = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, None)
     np.testing.assert_array_equal(f(x), x * 3)
 
+  def test_optimization_barrier_with_single_value(self):
+    shape = (64, 64)
+    value = 5.0
+    dtype = jnp.float32
+    def kernel(ctx, out, smem):
+      del ctx, smem
+      mlir_type = utils.dtype_to_ir_type(dtype)
+      arr = mgpu.FragmentedArray.splat(c(value, mlir_type), shape)
+      arr = mgpu.optimization_barrier(arr)
+      arr.store_untiled(out)
+
+    out_shape = jax.ShapeDtypeStruct(shape, dtype)
+    f = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), (), out_shape, ())
+    np.testing.assert_array_equal(f(), jnp.full(shape, value, dtype=dtype))
+
   def test_convert_bool_to_u8(self):
     m, n = 128, 128
     def kernel(ctx, dst, _):
@@ -2989,10 +3211,6 @@ class MosaicGpuDialectTest(TestCase, jtu.JaxTestCase):
       ((64,), (128, 64), [1]),
   )
   def test_broadcast_in_dim(self, input_shape, output_shape, bcast_dims):
-    # TODO(dasenov): Remove this after the minimal jaxlib version is 0.6.1.
-    if jaxlib.version < (0, 6, 1):
-      self.skipTest("Test requires jaxlib version >= 0.6.1")
-
     element_value = 42.0
     def body(ctx, result_gmem_ref, smem):
       del ctx
@@ -3406,9 +3624,31 @@ class SerializationTest(absltest.TestCase):
       pipeline.run(module.operation)
 
 
+class ApiTest(TestCase):
+
+  def test_inout(self):
+    def kernel(ctx, src, inout, dst, smem):
+      val = memref.load(inout, [])
+      gpu.barrier()
+      new_val = arith.constant(ir.IntegerType.get_signless(32), 42)
+      memref.store(new_val, inout, [])
+      x = mgpu.FragmentedArray.load_strided(src, is_signed=True)
+      (x + val).store_untiled(dst)
+    x = jnp.arange(128, dtype=jnp.int32)
+    y = jnp.asarray(2.0, dtype=jnp.int32)
+    kernel = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), x, x, (), inout_shape=y,
+    )
+    xo, yo = kernel(x, y)
+    np.testing.assert_array_equal(xo, x + 2.0)
+    np.testing.assert_array_equal(yo, jnp.asarray(42, dtype=jnp.int32))
+
+
 if hp is not None:
   @hps.composite
-  def tiled_layouts(draw, initial_tile, vector_transfer: bool = False):
+  def tiled_layouts(
+      draw, initial_tile, vector_transfer: bool = False
+  ) -> fa.TiledLayout:
     assert all(t.bit_count() == 1 for t in initial_tile)
     assert math.prod(initial_tile) >= 128
     tiles = [initial_tile]
@@ -3469,35 +3709,45 @@ if hp is not None:
         vector_dim=vector_dim,
     )
 
+  @hps.composite
+  def shape_and_tiled_layout(
+      draw, vector_transfer: bool = False
+  ) -> tuple[tuple[int, ...], fa.TiledLayout]:
+    rank = draw(hps.integers(2, 3))
+    initial_tile = tuple(
+        draw(hps.sampled_from([1, 2, 4, 8, 16, 32, 64, 128]))
+        for _ in range(rank)
+    )
+    hp.assume(128 <= math.prod(initial_tile) < 128 * 32)
+    shape = tuple(t * draw(hps.integers(1, 5)) for t in initial_tile)
+    hp.assume(math.prod(shape) <= 128 * 128)
+    layout = draw(tiled_layouts(initial_tile, vector_transfer=vector_transfer))
+    return shape, layout
+
   class HypothesisTest(TestCase):
 
     def test_reduce(self):
       @hps.composite
       def strategy(draw):
-        rank = draw(hps.integers(2, 3))
-        initial_tile = tuple(
-            draw(hps.sampled_from([1, 2, 4, 8, 16, 32, 64, 128]))
-            for _ in range(rank)
-        )
-        hp.assume(128 <= math.prod(initial_tile) < 128 * 32)
-        shape = tuple(t * draw(hps.integers(1, 5)) for t in initial_tile)
-        hp.assume(math.prod(shape) <= 128 * 128)
-        layout = draw(tiled_layouts(initial_tile, vector_transfer=True))
+        shape, layout = draw(shape_and_tiled_layout(vector_transfer=True))
+        rank = len(shape)
         reduced_dims = draw(hps.sets(hps.integers(0, rank - 1), min_size=1))
-        return shape, layout, tuple(reduced_dims)
+        dtype = draw(hps.sampled_from([jnp.float32, jnp.bfloat16]))
+        return shape, layout, tuple(reduced_dims), dtype
 
       @hp.given(strategy())
       def run(args):
-        shape, layout, reduced_dims = args
+        shape, layout, reduced_dims, dtype = args
         out_shape = list(shape)
         for d in sorted(reduced_dims, reverse=True):
           del out_shape[d]
         def kernel(ctx, src, dst, scratch):
+          del ctx
           arr = fa.FragmentedArray.load_untiled(src, layout=layout, optimized=False)
           arr.reduce("max", reduced_dims, scratch).store_untiled(dst, optimized=False)
-        x = jax.random.normal(jax.random.key(1234), shape, jnp.float32)
-        out_type = jax.ShapeDtypeStruct(out_shape, jnp.float32)
-        scratch_type = jax.ShapeDtypeStruct((2048,), jnp.float32)
+        x = jax.random.normal(jax.random.key(1234), shape, dtype)
+        out_type = jax.ShapeDtypeStruct(out_shape, dtype)
+        scratch_type = jax.ShapeDtypeStruct((2048,), dtype)
         hp.assume(layout.vector_length <= 16)  # Otherwise we run out of scratch
         try:
           result = mgpu.as_gpu_kernel(
@@ -3507,6 +3757,51 @@ if hp is not None:
           hp.assume(False)
           return
         np.testing.assert_array_equal(result, x.max(reduced_dims))
+      run()
+
+    def test_slice(self):
+      i32 = ir.IntegerType.get_signless(32)
+      index = ir.IndexType.get()
+
+      @hps.composite
+      def strategy(draw):
+        shape, layout = draw(shape_and_tiled_layout(vector_transfer=True))
+        tiling = layout.base_tile_shape
+        tiled_shape = mgpu.tile_shape(shape, tiling)[:len(shape)]
+        def draw_slice(size, tile):
+          start = draw(hps.integers(0, size - 1))
+          length = draw(hps.integers(1, size - start))
+          return slice(start * tile, (start + length) * tile)
+        slices = tuple(map(draw_slice, tiled_shape, tiling))
+        return shape, layout, slices
+
+      basic_slices = (slice(128, 256), slice(16, 16 + 32))
+      @hp.given(strategy())
+      @hp.example(((256, 256), fa.WGMMA_LAYOUT, basic_slices))
+      @hp.example(((256, 256), tcgen05.LAYOUT, basic_slices))
+      @hp.example(((256, 256), tcgen05.TMEM_NATIVE_LAYOUT, basic_slices))
+      def run(args):
+        shape, layout, slices = args
+        def kernel(ctx, dst, _):
+          def linear_index(*idxs):
+            total = arith.constant(index, 0)
+            stride = 1
+            for i, size in zip(idxs[::-1], shape[::-1]):
+              total = arith.addi(total, arith.muli(i, c(stride, index)))
+              stride *= size
+            return arith.index_cast(i32, total)
+          x = mgpu.FragmentedArray.build(
+              shape, layout, linear_index, is_signed=True
+          )
+          x[slices].store_untiled(dst, optimized=False)
+
+        slice_shape = tuple(len(range(size)[s]) for s, size in zip(slices, shape))
+        out_shape = jax.ShapeDtypeStruct(shape=slice_shape, dtype=jnp.int32)
+        result = mgpu.as_gpu_kernel(
+            kernel, (1, 1, 1), (128, 1, 1), (), out_shape, ()
+        )()
+        iota = np.arange(np.prod(shape), dtype=jnp.int32).reshape(*shape)
+        np.testing.assert_array_equal(result, iota[slices])
       run()
 
 

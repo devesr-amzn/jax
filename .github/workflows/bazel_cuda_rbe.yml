@@ -23,12 +23,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   # Don't cancel in-progress jobs for main/release branches.
   cancel-in-progress: ${{ !contains(github.ref, 'release/') && github.ref != 'main' }}
-
+permissions: {}
 jobs:
   run_tests:
     if: github.event.repository.fork == false
     runs-on: ${{ matrix.runner }}
-    container: 'us-central1-docker.pkg.dev/tensorflow-sigs/tensorflow/ml-build:latest'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest'
     env:
       JAXCI_HERMETIC_PYTHON_VERSION: ${{ matrix.python }}
       JAXCI_ENABLE_X64: ${{ matrix.enable-x_64 }}
@@ -49,8 +49,10 @@ jobs:
 # End Presubmit Naming Check github-cuda-presubmits
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
       - name: Wait For Connection
-        uses: google-ml-infra/actions/ci_connection@main
+        uses: google-ml-infra/actions/ci_connection@7f5ca0c263a81ed09ea276524c1b9192f1304e3c
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
       - name: Run Bazel CUDA Tests with RBE

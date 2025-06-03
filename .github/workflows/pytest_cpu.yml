@@ -17,34 +17,28 @@ on:
       runner:
         description: "Which runner should the workflow run on?"
         type: string
-        required: true
         default: "linux-x86-n2-16"
       python:
         description: "Which python version should the artifact be built for?"
         type: string
-        required: true
         default: "3.12"
       enable-x64:
         description: "Should x64 mode be enabled?"
         type: string
-        required: true
         default: "0"
       download-jax-only-from-gcs:
         description: "Whether to download only the jax wheel from GCS (e.g for testing a jax only release)"
-        required: false
         default: '0'
         type: string
       gcs_download_uri:
         description: "GCS location prefix from where the artifacts should be downloaded"
-        required: true
         default: 'gs://general-ml-ci-transient/jax-github-actions/jax/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}'
         type: string
       halt-for-connection:
         description: 'Should this workflow run wait for a remote connection?'
         type: string
-        required: false
         default: 'no'
-
+permissions: {}
 jobs:
   run-tests:
     defaults:
@@ -52,11 +46,13 @@ jobs:
         # Explicitly set the shell to bash to override Windows's default (cmd)
         shell: bash
     runs-on: ${{ inputs.runner }}
-    container: ${{ (contains(inputs.runner, 'linux-x86') && 'us-central1-docker.pkg.dev/tensorflow-sigs/tensorflow/ml-build:latest') ||
-                   (contains(inputs.runner, 'linux-arm64') && 'us-central1-docker.pkg.dev/tensorflow-sigs/tensorflow/ml-build-arm64:latest') ||
+    container: ${{ (contains(inputs.runner, 'linux-x86') && 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest') ||
+                   (contains(inputs.runner, 'linux-arm64') && 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-arm64:latest') ||
                    (contains(inputs.runner, 'windows-x86') && null) }}
 
-    name: "Pytest CPU (${{ inputs.runner }}, Python ${{ inputs.python }}, x64=${{ inputs.enable-x64 }})"
+    name: "${{ (contains(inputs.runner, 'linux-x86') && 'linux x86') ||
+        (contains(inputs.runner, 'linux-arm64') && 'linux arm64') ||
+        (contains(inputs.runner, 'windows-x86') && 'windows x86') }}, py ${{ inputs.python }}, x64=${{ inputs.enable-x64 }}"
 
     env:
       JAXCI_HERMETIC_PYTHON_VERSION: "${{ inputs.python }}"
@@ -65,6 +61,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Set env vars for use in artifact download URL
         run: |
           os=$(uname -s | awk '{print tolower($0)}')
@@ -96,12 +94,12 @@ jobs:
         if: ${{ !contains(inputs.runner, 'windows-x86') }}
         run: |
           mkdir -p $(pwd)/dist
-          gsutil -m cp -r "${{ inputs.gcs_download_uri }}"/jax*py3*none*any.whl $(pwd)/dist/
+          gcloud storage cp -r "${{ inputs.gcs_download_uri }}"/jax*py3*none*any.whl $(pwd)/dist/
 
           if [[ "${{ inputs.download-jax-only-from-gcs }}" == "1" ]]; then
             echo "JAX only release. Only downloading the jax wheel from the release bucket."
           else
-            gsutil -m cp -r "${{ inputs.gcs_download_uri }}/jaxlib*${PYTHON_MAJOR_MINOR}*${OS}*${ARCH}*.whl" $(pwd)/dist/
+            gcloud storage cp -r "${{ inputs.gcs_download_uri }}/jaxlib*${PYTHON_MAJOR_MINOR}*${OS}*${ARCH}*.whl" $(pwd)/dist/
           fi
       - name: Download wheels from GCS (Windows runs)
         id: download-wheel-artifacts-w
@@ -113,14 +111,14 @@ jobs:
         shell: cmd
         run: |
           mkdir dist
-          @REM Use `call` so that we can run sequential gsutil commands on Windows
+          @REM Use `call` so that we can run sequential gcloud storage commands on Windows
           @REM See https://github.com/GoogleCloudPlatform/gsutil/issues/233#issuecomment-196150652
-          call gsutil -m cp -r "${{ inputs.gcs_download_uri }}"/jax*py3*none*any.whl dist/
+          call gcloud storage cp -r "${{ inputs.gcs_download_uri }}"/jax*py3*none*any.whl dist/
 
           if "${{ inputs.download-jax-only-from-gcs }}"=="1" (
             echo "JAX only release. Only downloading the jax wheel from the release bucket."
           ) else (
-            call gsutil -m cp -r "${{ inputs.gcs_download_uri }}/jaxlib*%PYTHON_MAJOR_MINOR%*%OS%*%ARCH%*.whl" dist/
+            call gcloud storage cp -r "${{ inputs.gcs_download_uri }}/jaxlib*%PYTHON_MAJOR_MINOR%*%OS%*%ARCH%*.whl" dist/
           )
       - name: Skip the test run if the wheel artifacts were not downloaded successfully
         if: steps.download-wheel-artifacts-nw.outcome == 'failure' || steps.download-wheel-artifacts-w.outcome == 'failure'
@@ -140,7 +138,7 @@ jobs:
           fi
       # Halt for testing
       - name: Wait For Connection
-        uses: google-ml-infra/actions/ci_connection@main
+        uses: google-ml-infra/actions/ci_connection@7f5ca0c263a81ed09ea276524c1b9192f1304e3c
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
       - name: Run Pytest CPU tests

@@ -29,8 +29,8 @@ from typing import Any, Protocol, cast
 import jax
 from jax import api_util
 from jax import lax
+from jax._src import checkify
 from jax._src import core as jax_core
-from jax._src import lib as jaxlib
 from jax._src import linear_util as lu
 from jax._src import mesh as mesh_lib
 from jax._src import pjit
@@ -41,6 +41,7 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith as arith_dialect
+from jax._src.lib.mlir.dialects import cf as cf_dialect
 from jax._src.lib.mlir.dialects import gpu as gpu_dialect
 from jax._src.lib.mlir.dialects import llvm as llvm_dialect
 from jax._src.lib.mlir.dialects import math as math_dialect
@@ -52,6 +53,7 @@ from jax._src.pallas import core as pallas_core
 from jax._src.pallas import pallas_call
 from jax._src.pallas import primitives
 from jax._src.pallas import utils as pallas_utils
+from jax._src.pallas import helpers as pallas_helpers
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.state import discharge
 from jax._src.state import indexing
@@ -104,6 +106,7 @@ class Resources:
   barrier_counts: collections.Counter[AnyBarrier] = dataclasses.field(
       default_factory=collections.Counter
   )
+  gmem_semaphores: int = 0
 
   def __post_init__(self):
     object.__setattr__(
@@ -131,6 +134,7 @@ class Resources:
         smem_scratch_bytes=self.smem_scratch_bytes + other.smem_scratch_bytes,
         tmem_scratch_cols=self.tmem_scratch_cols + other.tmem_scratch_cols,
         barrier_counts=self.barrier_counts + other.barrier_counts,
+        gmem_semaphores=self.gmem_semaphores + other.gmem_semaphores,
     )
 
   def __or__(self, other: Resources) -> Resources:
@@ -142,6 +146,7 @@ class Resources:
             self.tmem_scratch_cols, other.tmem_scratch_cols
         ),
         barrier_counts=self.barrier_counts | other.barrier_counts,
+        gmem_semaphores=max(self.gmem_semaphores, other.gmem_semaphores),
     )
 
 
@@ -171,11 +176,18 @@ def _estimate_resources(
   rs = Resources(smem_scratch_bytes=0)
   for eqn in jaxpr.eqns:
     # TODO(slebedev): Add support for other primitives, notably control flow.
-    rule = _resource_estimators.get(eqn.primitive)
-    if rule is None:
-      # Assume that unsupported primitives are neutral wrt resource usage.
+    if rule := _resource_estimators.get(eqn.primitive):
+      rs |= rule(ctx, *(invar.aval for invar in eqn.invars), **eqn.params)
       continue
-    rs |= rule(ctx, *(invar.aval for invar in eqn.invars), **eqn.params)
+    # Assume that unsupported primitives are neutral wrt resource usage,
+    # unless they have a jaxpr in their params.
+    if any(
+        isinstance(v, (jax_core.Jaxpr, jax_core.ClosedJaxpr))
+        for v in eqn.params.values()
+    ):
+      raise NotImplementedError(
+          f"Resource estimation does not support {eqn.primitive}"
+      )
 
   return rs
 
@@ -183,7 +195,7 @@ def _estimate_resources(
 @_register_resource_estimator(lax.cond_p)
 def _cond_resource_estimator(
     ctx: ResourceEstimatorContext, *args, branches
-) -> int:
+) -> Resources:
   del args  # Unused.
   return functools.reduce(
       lambda a, b: a | b,
@@ -194,7 +206,7 @@ def _cond_resource_estimator(
 @_register_resource_estimator(lax.scan_p)
 def _scan_resource_estimator(
     ctx: ResourceEstimatorContext, *args, jaxpr: jax_core.ClosedJaxpr, **params
-) -> int:
+) -> Resources:
   del args, params  # Unused.
   return _estimate_resources(ctx, jaxpr)
 
@@ -206,17 +218,52 @@ def _while_resource_estimator(
     cond_jaxpr: jax_core.ClosedJaxpr,
     body_jaxpr: jax_core.ClosedJaxpr,
     **params,
-) -> int:
+) -> Resources:
   del args, params  # Unused.
   return _estimate_resources(ctx, cond_jaxpr) | _estimate_resources(
       ctx, body_jaxpr
   )
 
 
+@_register_resource_estimator(pjit.pjit_p)
+def _pjit_resource_estimator(
+    ctx: ResourceEstimatorContext,
+    *args,
+    jaxpr: jax_core.ClosedJaxpr,
+    **params,
+) -> Resources:
+  del args, params  # Unused.
+  return _estimate_resources(ctx, jaxpr)
+
+
+@_register_resource_estimator(pallas_core.core_map_p)
+def _core_map_resource_estimator(
+    ctx: ResourceEstimatorContext,
+    *args,
+    jaxpr: jax_core.ClosedJaxpr,
+    **params,
+) -> Resources:
+  del args, params  # Unused.
+  return _estimate_resources(ctx, jaxpr)
+
+
+@_register_resource_estimator(discharge.run_state_p)
+def _run_state_resource_estimator(
+    ctx: ResourceEstimatorContext, *args, jaxpr: jax_core.Jaxpr, **params
+) -> Resources:
+  del args, params  # Unused.
+  return _estimate_resources(ctx, jaxpr)
+
+
 @_register_resource_estimator(primitives.run_scoped_p)
 def _run_scoped_resource_estimator(
-    ctx: ResourceEstimatorContext, *consts, jaxpr: jax_core.Jaxpr, collective_axes
-) -> int:
+    ctx: ResourceEstimatorContext,
+    *consts,
+    jaxpr: jax_core.Jaxpr,
+    collective_axes,
+) -> Resources:
+  del collective_axes  # Unused.
+
   # NOTE: This rule assumes that the allocation happens collectively, although
   # it can't be checked here due to limited context. We check this in the actual
   # lowering rule.
@@ -253,8 +300,7 @@ def _run_scoped_resource_estimator(
         packing = 4 // aval.dtype.itemsize
       else:
         packing = 1
-      layout = tcgen05._infer_tmem_layout(
-          aval.shape, collective=aval.collective, packing=packing)
+      layout = tcgen05._infer_tmem_layout(aval.shape, packing=packing)
       cols_used = layout.cols_in_shape(aval.shape)
       cols_used = tcgen05._alloc_ncols(cols_used, exact=False)
       rs += Resources(tmem_scratch_cols=cols_used)
@@ -265,6 +311,8 @@ def _run_scoped_resource_estimator(
     elif aval.memory_space == gpu_core.REGS:
       # Don't need to allocate anything.
       pass
+    elif aval.memory_space == gpu_core.GMEM and jnp.issubdtype(aval.dtype, pallas_core.semaphore):
+      rs += Resources(gmem_semaphores=math.prod(aval.shape))
     else:
       raise NotImplementedError(
           f"Unsupported memory space: {aval.memory_space}")
@@ -274,7 +322,7 @@ def _run_scoped_resource_estimator(
 @_register_resource_estimator(lax.reduce_sum_p)
 def _reduce_sum_resource_estimator(
     ctx: ResourceEstimatorContext, x_aval: jax_core.ShapedArray, *, axes
-) -> int:
+) -> Resources:
   del ctx, axes  # Unused.
   # We don't need shmem for some reductons, but it depends on the layout, so we
   # conservatively request some scratch space.
@@ -311,6 +359,8 @@ class ModuleContext:
   tmem_requested_cols: int
   tmem_used_cols: int
   tmem_base_ptr: ir.Value
+  gmem_used_semaphores: int
+  gmem_semaphore_base_ptr: ir.Value | None
   runtime_barriers: MutableMapping[AnyBarrier, MutableSequence[AnyBarrierRef]]
   name_stack: source_info_util.NameStack
   traceback_caches: mlir.TracebackCaches
@@ -318,6 +368,8 @@ class ModuleContext:
   lowering_semantics: mgpu.LoweringSemantics
   primitive_semantics: gpu_core.PrimitiveSemantics
   mesh: mesh_lib.Mesh | None
+  # See the documentation of unsafe_no_auto_barriers in CompilerParams.
+  auto_barriers: bool
   warp_axis_name: str | None = None
 
   @property
@@ -351,6 +403,21 @@ class ModuleContext:
     available.append(barrier)
 
   @contextlib.contextmanager
+  def reserve_semaphores(
+      self, shape: tuple[int, ...]
+  ):
+    allocated_sems = math.prod(shape)
+    ref = mgpu.memref_slice(
+        self.gmem_semaphore_base_ptr,
+        mgpu.ds(self.gmem_used_semaphores, allocated_sems),
+    )
+    ref = mgpu.memref_reshape(ref, shape)
+    self.gmem_used_semaphores += allocated_sems
+    yield ref
+    # TODO: In debug mode verify the values of all semaphores are again 0
+    self.gmem_used_semaphores -= allocated_sems
+
+  @contextlib.contextmanager
   def alloc_tmem(
       self,
       struct: jax.ShapeDtypeStruct,
@@ -365,8 +432,7 @@ class ModuleContext:
     else:
       packing = 1
     if layout is None:
-      layout = tcgen05._infer_tmem_layout(
-          struct.shape, collective, packing=packing)
+      layout = tcgen05._infer_tmem_layout(struct.shape, packing=packing)
     unpadded_cols_used = layout.cols_in_shape(struct.shape)
     cols_used = tcgen05._alloc_ncols(unpadded_cols_used, exact_cols)
 
@@ -566,7 +632,7 @@ def _block_spec_from_block_mapping(
     )
     return eval_index_map(*new_indices)
 
-  return gpu_core.GPUBlockSpec(
+  return gpu_core.BlockSpec(
       bm.block_shape,
       index_map,
       memory_space=bm.transformed_block_aval.memory_space,
@@ -579,7 +645,7 @@ def lower_pipelined_jaxpr_to_module(
     gpu_mesh: pallas_core.Mesh | None,
     jax_mesh: mesh_lib.Mesh | None,
     jaxpr: jax_core.Jaxpr,
-    params: gpu_core.GPUCompilerParams,
+    params: gpu_core.CompilerParams,
     cost_estimate: pallas_core.CostEstimate | None,
 ) -> LoweringResult:
   del cost_estimate  # Unused.
@@ -602,7 +668,7 @@ def lower_pipelined_jaxpr_to_module(
   )
 
   if gpu_mesh:
-    assert isinstance(gpu_mesh, gpu_core.GPUMesh)
+    assert isinstance(gpu_mesh, gpu_core.Mesh)
     block = (128 * (gpu_mesh.num_threads or 1), 1, 1)
     grid = gpu_mesh.grid
     thread_axis = (
@@ -639,42 +705,15 @@ def lower_pipelined_jaxpr_to_module(
     else:
       return gpu_core.SMEM(aval.shape, aval.dtype)
 
-  sem_placeholder = None
-  semaphore_ref_avals = []
-  scratch_avals = []
-  # Need to unzip semaphores
-  for v in jaxpr.invars[grid_mapping.slice_scratch_ops]:
-    aval = v.aval
-    if (isinstance(aval, pallas_core.AbstractMemoryRef) and
-        jnp.issubdtype(aval.dtype, pallas_core.semaphore_dtype)):
-      if aval.memory_space != gpu_core.GPUMemorySpace.GMEM:
-        raise ValueError(
-            "Only GMEM memory space is supported for semaphores in Mosaic GPU."
-        )
-      semaphore_ref_avals.append(aval)
-      scratch_avals.append(sem_placeholder)
-    else:
-      scratch_avals.append(aval)
-
   def pipeline_fn(*refs):
-    sem_refs = []
-    if semaphore_ref_avals:
-      refs, sem_refs = util.split_list(refs, [-len(semaphore_ref_avals)])
     primitives.run_scoped(
-        functools.partial(scoped_pipeline_fn, *refs, sem_refs=sem_refs),
-        scratch_refs=[
-            ref_for_aval(aval) if aval is not sem_placeholder else aval
-            for aval in scratch_avals
-        ],
+        functools.partial(scoped_pipeline_fn, *refs),
+        scratch_refs=[ref_for_aval(v.aval) for v in jaxpr.invars[grid_mapping.slice_scratch_ops]],
         collective_axes=thread_axis,  # scratch_refs are shared across threads
     )
     return ()  # ``wrap_init`` does not support functions returning None.
 
-  def scoped_pipeline_fn(*refs, sem_refs, scratch_refs):
-    sem_refs_it = iter(sem_refs)
-    scratch_refs = [
-        next(sem_refs_it) if r is sem_placeholder else r for r in scratch_refs
-    ]
+  def scoped_pipeline_fn(*refs, scratch_refs):
     def body_fn(indices, *refs):
       program_ids_template = util.merge_lists(
           which_parallel, indices, [None] * sum(which_parallel)
@@ -707,7 +746,7 @@ def lower_pipelined_jaxpr_to_module(
                 bm.array_shape_dtype.shape, bm.array_shape_dtype.dtype
             ).get_ref_aval()
             for bm in block_mappings
-        ] + semaphore_ref_avals,
+        ],
     )
     assert not new_consts
 
@@ -725,10 +764,6 @@ def lower_pipelined_jaxpr_to_module(
         gpu_mesh.cluster if gpu_mesh is not None else (),
         [bm.array_shape_dtype for bm in in_block_mappings],
         [bm.array_shape_dtype for bm in out_block_mappings],
-        [
-            jax.ShapeDtypeStruct(r.shape, np.dtype(np.int32))
-            for r in semaphore_ref_avals
-        ],
         new_jaxpr,
         params,
         new_consts,
@@ -743,9 +778,8 @@ def lower_jaxpr_to_module(
     cluster: Sequence[int],
     in_shapes: Sequence[jax.ShapeDtypeStruct],
     out_shapes: Sequence[jax.ShapeDtypeStruct],
-    gmem_scratch_shapes: Sequence[jax.ShapeDtypeStruct],
     jaxpr: jax_core.Jaxpr,
-    params: gpu_core.GPUCompilerParams,
+    params: gpu_core.CompilerParams,
     consts=(),
 ) -> LoweringResult:
   debug_info = jaxpr.debug_info
@@ -766,13 +800,31 @@ def lower_jaxpr_to_module(
     squashed_dims = grid[:-2]
     parallel_grid = (math.prod(grid[:-2]), *grid[-2:])
 
+  rs = _estimate_resources(
+      ResourceEstimatorContext(
+          axis_names=axis_names, lowering_semantics=lowering_semantics
+      ),
+      jaxpr,
+  )
+
   def body(launch_ctx: mgpu.LaunchContext, *buffers: ir.Value):
     *buffers_gmem, (runtime_smem, runtime_barriers, runtime_tmem) = buffers
-    if gmem_scratch_shapes:
-      in_buffers, _, out_scratch_buffers = util.split_list(
-          buffers_gmem, [len(in_shapes), len(gmem_scratch_shapes)]
+    gmem_semaphores = None
+    if rs.gmem_semaphores:
+      # Extract the semaphores local to the current block.
+      index = ir.IndexType.get()
+      block_idx = arith_dialect.index_castui(index, mgpu_utils.block_idx())
+      gmem_semaphores = mgpu.memref_slice(
+          buffers_gmem[-1],
+          mgpu.ds(
+              arith_dialect.muli(
+                  block_idx, arith_dialect.constant(index, rs.gmem_semaphores)
+              ),
+              rs.gmem_semaphores,
+          ),
       )
-      buffers_gmem = in_buffers + out_scratch_buffers
+      # The semaphore buffer is an aliased input/output, so we need to skip it twice.
+      buffers_gmem = buffers_gmem[:len(in_shapes)] + buffers_gmem[-len(out_shapes) - 1:-1]
 
     grouped_barriers = collections.defaultdict(list)
     for barrier, barrier_ref in zip(rs.barriers, runtime_barriers):
@@ -803,6 +855,8 @@ def lower_jaxpr_to_module(
         tmem_requested_cols=tmem_cols,
         tmem_used_cols=0,
         tmem_base_ptr=runtime_tmem.address if runtime_tmem else None,
+        gmem_used_semaphores=0,
+        gmem_semaphore_base_ptr=gmem_semaphores,
         runtime_barriers=grouped_barriers,
         name_stack=source_info_util.NameStack(),
         traceback_caches=mlir.TracebackCaches(),
@@ -810,19 +864,12 @@ def lower_jaxpr_to_module(
         lowering_semantics=lowering_semantics,
         primitive_semantics=gpu_core.PrimitiveSemantics.Warpgroup,
         mesh=jax_mesh,
+        auto_barriers=not params.unsafe_no_auto_barriers,
     )
     del runtime_smem, grouped_barriers, runtime_barriers
-
     _ = lower_jaxpr_to_mosaic_gpu(
         module_ctx, launch_ctx, jaxpr, buffers_gmem, consts
     )
-
-  rs = _estimate_resources(
-      ResourceEstimatorContext(
-          axis_names=axis_names, lowering_semantics=lowering_semantics
-      ),
-      jaxpr,
-  )
 
   scratch_buffers = [
       jax.ShapeDtypeStruct(shape=[rs.smem_scratch_bytes], dtype=np.int8),
@@ -842,14 +889,25 @@ def lower_jaxpr_to_module(
     # Each range is 2 events, each event is 4 bytes.
     prof_spec = mgpu_profiler.ProfilerSpec(params.profile_space * 2 * 4)
     prof_ctx = ProfilerContext(params.profile_dir, prof_spec)
+  mgpu_grid = tuple(map(operator.mul, parallel_grid, cluster))
+  semaphores_shape = ()
+  if rs.gmem_semaphores:
+    semaphores_shape = (
+        jax.ShapeDtypeStruct(
+            shape=(math.prod(mgpu_grid) * rs.gmem_semaphores,), dtype=np.int32
+        ),
+    )
+  # NOTE: new_out_shapes has out_shapes, then semaphores_shape and
+  # optionally the profiler buffer.
   module, new_out_shapes, _, launch_ctx = (
       mgpu_core._lower_as_gpu_kernel(
           body,
-          grid=tuple(map(operator.mul, parallel_grid, cluster)),
+          grid=mgpu_grid,
           cluster=cluster,
           block=block,
-          in_shapes=(*in_shapes, *gmem_scratch_shapes),
-          out_shape=(*out_shapes, *gmem_scratch_shapes),
+          in_shapes=(*in_shapes, *semaphores_shape),
+          out_shape=(*out_shapes, *semaphores_shape),
+          inout_shape=(),
           smem_scratch_shape=scratch_buffers,
           lowering_semantics=lowering_semantics,
           module_name=mlir.sanitize_name(debug_info.func_name),
@@ -871,11 +929,8 @@ def lower_jaxpr_to_module(
 
   launch_ctx.scratch.finalize_size()
 
-  if gmem_scratch_shapes:
-    new_out_shapes = new_out_shapes[:-len(gmem_scratch_shapes)]
-
   return LoweringResult(
-      module, parallel_grid, block, new_out_shapes, prof_ctx, tuple(gmem_scratch_shapes)
+      module, parallel_grid, block, new_out_shapes, prof_ctx, semaphores_shape
   )
 
 
@@ -1288,8 +1343,7 @@ def _get_lowering_rule(ctx: LoweringRuleContext, x_ref, *leaves, tree):
 
   if not isinstance(x_ref, ir.Value) and ir.MemRefType.isinstance(x_ref):
     raise TypeError(f"Can only load from references (got {x_ref}).")
-
-  x_aval = ctx.avals_in[0]
+  dtype = ctx.avals_out[0].dtype
 
   transforms = jax.tree.unflatten(tree, leaves)
   x_smem, transforms = _handle_transforms(
@@ -1298,23 +1352,26 @@ def _get_lowering_rule(ctx: LoweringRuleContext, x_ref, *leaves, tree):
 
   match transforms:
     case (gpu_core.UnswizzleRef(swizzle), gpu_core.UntileRef(tiling)):
-      if tiling != (
-          8,
-          (swizzle * 8) // pallas_utils.dtype_bitwidth(x_aval.dtype),
-      ):
-        raise NotImplementedError("Tiling does not fit swizzle")
+      if len(tiling) != 2:
+        raise NotImplementedError(f"Only 2D tiling is supported, got: {tiling}")
+      expected_minor_tiling = swizzle * 8 // pallas_utils.dtype_bitwidth(dtype)
+      if tiling[-1] != expected_minor_tiling:
+        raise NotImplementedError(
+            "Minor tiling dimension does not fit swizzle: "
+            f" expected {expected_minor_tiling}, got {tiling[-1]}"
+        )
       return mgpu.FragmentedArray.load_tiled(
-          x_smem, is_signed=mgpu_utils.is_signed(x_aval.dtype), swizzle=swizzle
+          x_smem, is_signed=mgpu_utils.is_signed(dtype), swizzle=swizzle
       )
     case ():
       # Handle scalar indexing.
       if not ctx.avals_out[0].shape:
-        is_signed = mgpu_utils.is_signed(x_aval.dtype)
+        is_signed = mgpu_utils.is_signed(dtype)
         val = memref_dialect.load(x_smem, [])
         return mgpu.FragmentedArray.splat(val, shape=(), is_signed=is_signed)
 
       return mgpu.FragmentedArray.load_strided(
-          x_smem, is_signed=mgpu_utils.is_signed(x_aval.dtype)
+          x_smem, is_signed=mgpu_utils.is_signed(dtype)
       )
     case _:
       raise NotImplementedError(f"Unsupported transforms: {transforms}")
@@ -1325,12 +1382,11 @@ def _get_lowering_rule_wg(ctx: LoweringRuleContext, x_smem, *leaves, tree):
   if not isinstance(x_smem, ir.Value) and ir.MemRefType.isinstance(x_smem):
     raise TypeError(f"Can only load from references (got {x_smem}).")
 
-  x_aval = ctx.avals_in[0]
-
   transforms = jax.tree.unflatten(tree, leaves)
   x_smem, transforms = _handle_transforms(
       ctx, x_smem, transforms, allow_peer_refs=True
   )
+  mlir_dtype = ir.MemRefType(x_smem.type).element_type
 
   if transforms:
     raise NotImplementedError(
@@ -1338,7 +1394,7 @@ def _get_lowering_rule_wg(ctx: LoweringRuleContext, x_smem, *leaves, tree):
     )
 
   shape = ctx.avals_out[0].shape
-  ty = ir.VectorType.get(shape, mgpu_utils.dtype_to_ir_type(x_aval.dtype))
+  ty = ir.VectorType.get(shape, mlir_dtype)
   if shape:
     zero_index = arith_dialect.constant(ir.IndexType.get(), 0)
     indices = [zero_index for _ in range(len(shape))]
@@ -1374,17 +1430,26 @@ def _swap_lowering_rule(
   transforms = jax.tree.unflatten(tree, leaves)
   transposed_value = value.layout == mgpu.WGMMA_TRANSPOSED_LAYOUT
   x_smem, transforms = _handle_transforms(
-      ctx, x_ref, transforms, handle_transposes=not transposed_value, allow_peer_refs=True
+      ctx, x_ref, transforms, handle_transposes=not transposed_value,
+      allow_peer_refs=True
   )
-  mgpu.warpgroup_barrier()  # Make sure reads have completed before we write.
+  if ctx.module_ctx.auto_barriers:
+    mgpu.warpgroup_barrier()  # Make sure reads have completed before we write.
   match transforms:
     case (
         gpu_core.UnswizzleRef(swizzle),
         gpu_core.UntileRef(tiling),
         *maybe_transpose,
     ):
-      if tiling != (8, swizzle // v_aval.dtype.itemsize):
-        raise NotImplementedError("Tiling does not fit swizzle")
+      if len(tiling) != 2:
+        raise NotImplementedError(f"Only 2D tiling is supported, got: {tiling}")
+      bw = pallas_utils.dtype_bitwidth(v_aval.dtype)
+      expected_minor_tiling = swizzle * 8 // bw
+      if tiling[-1] != expected_minor_tiling:
+        raise NotImplementedError(
+            "Minor tiling dimension does not fit swizzle: "
+            f" expected {expected_minor_tiling}, got {tiling[-1]}"
+        )
 
       if transposed_value != bool(maybe_transpose):
         raise ValueError(
@@ -1423,7 +1488,8 @@ def _swap_lowering_rule(
           value.store_untiled(x_smem)
     case _:
       raise NotImplementedError(f"Unsupported transforms: {transforms}")
-  mgpu.warpgroup_barrier()  # Make sure the writes have completed.
+  if ctx.module_ctx.auto_barriers:
+    mgpu.warpgroup_barrier()  # Make sure the writes have completed.
   return old_value
 
 
@@ -1437,16 +1503,15 @@ def _swap_lowering_rule_wg(
   if not ir.MemRefType.isinstance(x_smem.type):
     raise TypeError(f"Can only store to references (got {x_smem}).")
 
-  x_aval = ctx.avals_in[0]
-
   transforms = jax.tree.unflatten(tree, leaves)
-  x_smem, transforms = _handle_transforms(ctx, x_smem, transforms, allow_peer_refs=True)
+  x_smem, transforms = _handle_transforms(
+      ctx, x_smem, transforms, allow_peer_refs=True)
   if transforms:
     raise NotImplementedError(
         "Transforms are not yet implemented for warpgroup semantics"
     )
-
-  ty = ir.VectorType.get(shape, mgpu_utils.dtype_to_ir_type(x_aval.dtype))
+  x_mlir_dtype = ir.MemRefType(x_smem.type).element_type
+  ty = ir.VectorType.get(shape, x_mlir_dtype)
   if shape:
     zero_index = arith_dialect.constant(ir.IndexType.get(), 0)
     indices = [zero_index for _ in range(len(shape))]
@@ -1479,6 +1544,8 @@ def _slice_lowering_rule(
 
 
 @register_lowering_rule(lax.select_n_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.select_n_p, mgpu.LoweringSemantics.Lane,
+                        gpu_core.PrimitiveSemantics.Warp)
 @register_lowering_rule(lax.select_n_p, mgpu.LoweringSemantics.Warpgroup)
 def _select_n_lowering_rule(ctx: LoweringRuleContext, pred, *cases):
   if len(cases) != 2:
@@ -1487,6 +1554,10 @@ def _select_n_lowering_rule(ctx: LoweringRuleContext, pred, *cases):
         f" {len(cases)}"
     )
   pred_aval, *cases_avals = ctx.avals_in
+  if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+    if not all(aval.shape == () for aval in ctx.avals_in):
+      raise NotImplementedError(
+          "Can only select on scalars in warp-level lowering.")
   [out_aval] = ctx.avals_out
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
     pred = _ensure_fa(pred, pred_aval.dtype)
@@ -1560,11 +1631,6 @@ def _broadcast_in_dim_lowering_rule_wg(
         ir.VectorType.get(shape, mgpu_utils.dtype_to_ir_type(x_aval.dtype)),
         x,
     )
-
-  # TODO(dasenov): Remove this after the minimal jaxlib version is 0.6.1.
-  if jaxlib.version < (0, 6, 1):
-    raise NotImplementedError()
-
   mlir_type = mgpu_utils.dtype_to_ir_type(x_aval.dtype)
   result_ty = ir.VectorType.get(shape, mlir_type)
   return mgpu.dialect.broadcast_in_dim(result_ty, x, broadcast_dimensions)
@@ -1683,6 +1749,19 @@ def _convert_element_type_lowering_rule_wg(
 mosaic_lowering_rules[gpu_core.LANExWG_SEMANTICS].update({
     lax.neg_p: lambda ctx, x: -x,
     lax.not_p: lambda ctx, x: ~x,
+})
+
+def _unary_warp_lowering_rule(impl):
+  def _lowering_rule(ctx: LoweringRuleContext, x):
+    if not all(aval_in.shape == () for aval_in in ctx.avals_in):
+      raise NotImplementedError(
+          "Non-scalar arithmetic is not supported in warp-level lowering.")
+    return impl(x)
+  return _lowering_rule
+
+mosaic_lowering_rules[gpu_core.LANExWARP_SEMANTICS].update({
+    lax.neg_p: _unary_warp_lowering_rule(lambda x: -x),
+    lax.not_p: _unary_warp_lowering_rule(lambda x: ~x)
 })
 
 mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS].update({
@@ -1956,7 +2035,7 @@ def _reduce_sum_lowering_rule(ctx: LoweringRuleContext, x, *, axes):
       scratch_ty = jax.ShapeDtypeStruct(shape=(4,), dtype=x_aval.dtype)
       with ctx.module_ctx.scratch_view([scratch_ty]) as [scratch]:
         return x.reduce("add", axes, scratch)
-    case mgpu.WGMMA_LAYOUT:
+    case mgpu.TiledLayout():
       if axes != (x_aval.ndim - 1,):
         raise NotImplementedError
       if not jnp.issubdtype(x_aval.dtype, jnp.floating):
@@ -1970,7 +2049,7 @@ def _reduce_sum_lowering_rule(ctx: LoweringRuleContext, x, *, axes):
 def _reduce_max_lowering_rule(ctx: LoweringRuleContext, x, *, axes):
   [x_aval] = ctx.avals_in
   match x.layout:
-    case mgpu.WGMMA_LAYOUT:
+    case mgpu.TiledLayout():
       if axes != (x_aval.ndim - 1,):
         raise NotImplementedError
       if not jnp.issubdtype(x_aval.dtype, jnp.floating):
@@ -2049,7 +2128,7 @@ def _resolve_cluster_axis(axis_names: _AxisNames | None, axis_name: str):
   if not axis_names:
     raise LookupError(
         "No axis names are available. Make sure you are using `pl.core_map`"
-        " with a `plgpu.GPUMesh`."
+        " with a `plgpu.Mesh`."
     )
   if not axis_names or axis_name not in axis_names.cluster:
     raise LookupError(
@@ -2067,7 +2146,7 @@ def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
   if gpu_axis_names is None and not jax_axis_names:
     raise LookupError(
         "No axis names are available. Make sure you are using `pl.core_map`"
-        " with a `plgpu.GPUMesh` or an appropriate JAX device mesh."
+        " with a `plgpu.Mesh` or an appropriate JAX device mesh."
     )
   if axis_name not in itertools.chain((gpu_axis_names or ()), jax_axis_names):
     raise LookupError(
@@ -2150,6 +2229,8 @@ def _axis_index_warp_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
 
 
 @register_lowering_rule(primitives.debug_print_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(primitives.debug_print_p, mgpu.LoweringSemantics.Lane,
+                        gpu_core.PrimitiveSemantics.Warp)
 def _debug_print_lowering_rule(
     ctx: LoweringRuleContext,
     *args,
@@ -2158,6 +2239,9 @@ def _debug_print_lowering_rule(
 ):
   del has_placeholders  # Unused.
   primitives.check_debug_print_format(fmt, *args)
+  scope = mgpu.ThreadSubset.WARPGROUP
+  if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+    scope = mgpu.ThreadSubset.WARP
   if not any(aval.shape for aval in ctx.avals_in):
     mgpu.debug_print(
         fmt,
@@ -2165,6 +2249,7 @@ def _debug_print_lowering_rule(
             _ensure_ir_value(arg, aval.dtype)
             for arg, aval in zip(args, ctx.avals_in)
         ),
+        scope=scope
     )
   elif len(ctx.avals_in) == 1:
     [arg] = args
@@ -2280,6 +2365,12 @@ def _run_scoped_lowering_rule(
         )
         input_refs.append(input_ref)
         should_discharge.append(False)
+      elif aval.memory_space == gpu_core.GMEM and jnp.issubdtype(aval.dtype, pallas_core.semaphore):
+        input_ref = alloc_stack.enter_context(
+            ctx.module_ctx.reserve_semaphores(aval.shape)
+        )
+        input_refs.append(input_ref)
+        should_discharge.append(False)
       else:
         raise ValueError(f"Can't convert to ref: {aval}")
 
@@ -2373,11 +2464,11 @@ def _lower_jaxpr_to_for_loop(
     ctx: LoweringRuleContext,
     jaxpr: jax_core.Jaxpr,
     start: ir.Value,
-    length: ir.Value | int,
+    length: int | ir.Value,
     consts,
     *args,
     has_loop_index: bool,
-    unroll: bool = False,
+    unroll: int | None = None,
 ):
   _consts_avals, arg_avals = util.split_list(ctx.avals_in, [len(consts)])
   arg_avals = arg_avals[has_loop_index:]
@@ -2398,22 +2489,42 @@ def _lower_jaxpr_to_for_loop(
     return [v if a else _ensure(v, av) for a, v, av in zip(is_acc, vals, avals)]
 
   def loop(loop_index, body_args):
-    if has_loop_index:
-      loop_index = arith_dialect.addi(loop_index, start)
-      jaxpr_args = [*consts, loop_index, *body_args]
-    else:
-      jaxpr_args = [*consts, *body_args]
-    outs = lower_jaxpr_to_mosaic_gpu(
-        ctx.module_ctx, ctx.launch_ctx, jaxpr, jaxpr_args
-    )
+    outs = body_args
+    if unroll is not None:
+      loop_index = arith_dialect.muli(
+          loop_index, _ir_constant(unroll, start.type)
+      )
+    loop_index = arith_dialect.addi(loop_index, start)
+    for step in range(unroll or 1):
+      if has_loop_index:
+        loop_index = arith_dialect.addi(
+            loop_index, _ir_constant(step, start.type)
+        )
+        jaxpr_args = [*consts, loop_index, *outs]
+      else:
+        jaxpr_args = [*consts, *outs]
+      outs = lower_jaxpr_to_mosaic_gpu(
+          ctx.module_ctx, ctx.launch_ctx, jaxpr, jaxpr_args
+      )
     return as_values(outs, out_avals)
 
-  if unroll:
-    assert isinstance(length, int)
-    outs = as_values(args, arg_avals)
-    for i in range(length):
-      outs = loop(_ir_constant(i, start.type), outs)
-    return outs
+  if unroll is not None:
+    if not isinstance(length, int):
+      raise NotImplementedError(
+          "``length`` must be an integer when ``unroll` is specified, got"
+          f" {length}"
+      )
+    if length % unroll:
+      # TODO(slebedev): Emit an epilogue taking care of the remaining steps.
+      raise NotImplementedError(
+          f"``unroll`` must divide ``length``, got {unroll=} and {length=}"
+      )
+    if unroll == length:
+      # Special-case: the loop is fully unrolled.
+      return loop(_ir_constant(0, start.type), as_values(args, arg_avals))
+    return mgpu.fori(
+        _ir_constant(length // unroll, start.type), as_values(args, arg_avals)
+    )(loop).results
   else:
     if not isinstance(length, ir.Value):
       length = _ir_constant(length, start.type)
@@ -2422,6 +2533,8 @@ def _lower_jaxpr_to_for_loop(
 
 @register_lowering_rule(lax.scan_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(lax.scan_p, mgpu.LoweringSemantics.Warpgroup)
+@register_lowering_rule(lax.scan_p, mgpu.LoweringSemantics.Lane,
+                        gpu_core.PrimitiveSemantics.Warp)
 def _scan_lowering_rule(
     ctx: LoweringRuleContext,
     *args,
@@ -2435,11 +2548,7 @@ def _scan_lowering_rule(
     _split_transpose: bool,
 ):
   # Can only handle fori_loop-like scans.
-  if (
-      (num_extensive := len(args) - num_consts - num_carry)
-      or reverse
-      or not (unroll == 1 or unroll == length)
-  ):
+  if (num_extensive := len(args) - num_consts - num_carry) or reverse:
     raise NotImplementedError
   del linear, num_extensive, reverse
 
@@ -2468,7 +2577,7 @@ def _scan_lowering_rule(
       consts,
       *args,
       has_loop_index=has_loop_index,
-      unroll=unroll == length,
+      unroll=unroll,
   )
   if has_loop_index:
     # Need to return the final loop index value if the outer scan expects
@@ -2598,7 +2707,10 @@ def _while_lowering_rule(
 @register_lowering_rule(lax.cond_p,
   mgpu.LoweringSemantics.Lane, gpu_core.PrimitiveSemantics.Warp)
 @register_lowering_rule(lax.cond_p, mgpu.LoweringSemantics.Warpgroup)
-def _cond_lowering_rule(ctx: LoweringRuleContext, index, *args, branches):
+def _cond_lowering_rule(ctx: LoweringRuleContext, index, *args, branches,
+                        **params):
+  if params:
+    raise NotImplementedError("platform_dependent cond")
   index_aval, *_arg_avals = ctx.avals_in
 
   def _yielded_values(outs, avals):
@@ -2733,6 +2845,11 @@ def _core_map_lowering_rule(
           "Can only close over scalars and Refs when using core_map with "
           f"WarpMesh. Found array of shape {aval_in}."
         )
+    # We allow the warps to schedule async copies without synchronizing with
+    # other warps, so we need to add a barrier here to make sure all reads and
+    # writes have completed.
+    if ctx.module_ctx.auto_barriers:
+      mgpu.warpgroup_barrier()
     _ = lower_jaxpr_to_mosaic_gpu(
         module_ctx,
         ctx.launch_ctx,
@@ -2740,7 +2857,9 @@ def _core_map_lowering_rule(
         args=(),
         consts=args,
     )
-    mgpu.warpgroup_barrier()
+    if ctx.module_ctx.auto_barriers:
+      # TODO(apaszke,justinfu): Do we really need this barrier?
+      mgpu.warpgroup_barrier()
     return []
   raise ValueError(f"Unsupported mesh: {mesh}")
 
@@ -2983,13 +3102,14 @@ def _semaphore_signal_lowering_rule(
     )
   # TODO(apaszke): Narrow the scope from .sys to .gpu when the semaphore is local.
   val = _ir_constant(value, i32)
-  pred = ctx.module_ctx.single_wg_lane_predicate
-  llvm_dialect.inline_asm(
-    i32,
-    [sem_ptr, val, pred],
-    "@$3 atom.add.release.sys.global.u32 $0, [$1], $2;",
-    "=r,l,r,b",
-    has_side_effects=True,
+  # We only signal the semaphore from a single lane, which does not guarantee
+  # anything about the state of the other three warps in the warpgroup (they
+  # might still be e.g. reading memory that someone will overwrite once they
+  # receive a signal).
+  if ctx.module_ctx.auto_barriers:
+    mgpu.utils.warpgroup_barrier()
+  mgpu_utils.SemaphoreRef(sem_ptr).signal(
+      val, predicate=ctx.module_ctx.single_wg_lane_predicate
   )
   return ()
 
@@ -3002,29 +3122,34 @@ def _semaphore_wait_lowering_rule(ctx: LoweringRuleContext, *args, args_tree):
     raise NotImplementedError(
         f"Unhandled transforms for semaphore_wait: {transforms}"
     )
-
-  sem_ptr = mgpu.utils.memref_ptr(sem)
-  i32_ty = ir.IntegerType.get_signless(32)
-  ne_pred = arith_dialect.CmpIPredicate.ne
-  zero_const = mgpu.utils.c(0, i32_ty)
-  val = _ir_constant(value, i32_ty)
-
-  with mgpu.single_thread(scope=mgpu.ThreadSubset.WARPGROUP):
-    # Create the while loop for busy waiting
-    while_op = scf_dialect.WhileOp([i32_ty], [zero_const])
-    before_block = while_op.before.blocks.append(i32_ty)
-    with ir.InsertionPoint.at_block_begin(before_block):
-      old_val = llvm_dialect.inline_asm(
-        i32_ty,
-        [sem_ptr, val, zero_const],
-        "atom.acquire.sys.global.cas.b32 $0, [$1], $2, $3;",
-        "=r,l,r,r",
-        has_side_effects=True,
-      )
-      comparison = arith_dialect.cmpi(ne_pred, old_val, val)
-      scf_dialect.condition(comparison, before_block.arguments)
-    after_block = while_op.after.blocks.append(i32_ty)
-    with ir.InsertionPoint.at_block_begin(after_block):
-      scf_dialect.yield_(after_block.arguments)
-  mgpu_utils.warpgroup_barrier()
+  i32 = ir.IntegerType.get_signless(32)
+  val = _ir_constant(value, i32)
+  mgpu_utils.SemaphoreRef(mgpu.utils.memref_ptr(sem)).wait(val)
   return ()
+
+
+@register_lowering_rule(checkify.check_p, mgpu.LoweringSemantics.Lane)
+def _check_lowering_rule(ctx: LoweringRuleContext, *err_args, err_tree, debug):
+  del ctx  # Unused.
+
+  if not debug:
+    raise NotImplementedError(
+        "Non-debug checks are not supported by the Mosaic GPU backend."
+        " Functionalize them via `jax.experimental.checkify`."
+    )
+  if not pallas_helpers.debug_checks_enabled():
+    return []
+
+  error = jax.tree.unflatten(err_tree, err_args)
+  [pred] = error._pred.values()
+  [exception_tree] = error._metadata.values()
+  [payload] = error._payload.values()
+  exception = jax.tree.unflatten(exception_tree, payload)
+  assert isinstance(exception, checkify.FailedCheckError)
+
+  # check_p has an inverted predicate compared to assert, so we need to compute
+  # ``not pred`` here.
+  minus_one = _ir_constant(-1, mgpu_utils.dtype_to_ir_type(jnp.bool))
+  not_pred = arith_dialect.xori(pred.registers.item(), minus_one)
+  cf_dialect.assert_(not_pred, exception.fmt_string)
+  return []
