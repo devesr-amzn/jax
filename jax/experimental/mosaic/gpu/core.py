@@ -55,14 +55,19 @@ from . import utils
 
 # MLIR can't find libdevice unless we point it to the CUDA path
 # TODO(apaszke): Unify with jax._src.lib.cuda_path
-CUDA_ROOT = "/usr/local/cuda"
+cuda_root = "/usr/local/cuda"
+PYTHON_RUNFILES = os.environ.get("PYTHON_RUNFILES")
 if os.environ.get("CUDA_ROOT") is None:
-  os.environ["CUDA_ROOT"] = CUDA_ROOT
+  if PYTHON_RUNFILES:
+    cuda_nvcc_root = os.path.join(PYTHON_RUNFILES, "cuda_nvcc")
+    if os.path.exists(cuda_nvcc_root):
+      cuda_root = cuda_nvcc_root
+  os.environ["CUDA_ROOT"] = cuda_root
 else:
-  CUDA_ROOT = os.environ["CUDA_ROOT"]
+  cuda_root = os.environ["CUDA_ROOT"]
 
-PTXAS_PATH = os.path.join(CUDA_ROOT, "bin/ptxas")
-NVDISASM_PATH = os.path.join(CUDA_ROOT, "bin/nvdisasm")
+PTXAS_PATH = os.path.join(cuda_root, "bin/ptxas")
+NVDISASM_PATH = os.path.join(cuda_root, "bin/nvdisasm")
 
 # This tracks the latest Mosaic GPU IR version with a monthly delay.
 FWD_COMPAT_IR_VERSION = 1
@@ -316,6 +321,19 @@ class _TMEMAlloc:
     )
 
 
+def _slice_smem(
+    result: ir.Type,
+    smem_base: ir.Value,
+    offset: ir.Value,  # This should be an ir.IndexType.
+    lowering_semantics: LoweringSemantics,
+) -> ir.Value:
+  if lowering_semantics == LoweringSemantics.Warpgroup:
+    offset = arith.index_cast(ir.IntegerType.get_signless(32), offset)
+    return dialect.slice_smem(result, offset)
+  else:
+    return memref.view(result, smem_base, offset, [])
+
+
 def _construct_smem_reftree(
     cluster_shape: tuple[int, int, int],
     dynamic_smem: ir.Value,
@@ -325,8 +343,8 @@ def _construct_smem_reftree(
     dynamic_smem_offset: int = 0,
 ) -> Callable[[], RefTree]:
   index = ir.IndexType.get()
-  i8 = ir.IntegerType.get_signless(8)
   i32 = ir.IntegerType.get_signless(32)
+  i64 = ir.IntegerType.get_signless(64)
   smem = ir.Attribute.parse("#gpu.address_space<workgroup>")
   flat_ref_tys, smem_buffer_tree = jax.tree.flatten(
       smem_buffers, is_leaf=lambda x: isinstance(x, Union)
@@ -334,21 +352,23 @@ def _construct_smem_reftree(
   smem_refs = []
 
   for ref_ty in flat_ref_tys:
-    def get_barrier_ptr(num_barriers: int) -> ir.Value:
+    def barrier_memref(num_barriers: int) -> ir.Value:
       nonlocal dynamic_smem_offset
-      workgroup_nvptx_address_space = (
-          utils.gpu_address_space_to_nvptx(gpu.AddressSpace.Workgroup)
+      barrier_ty = ir.MemRefType.get(
+          (num_barriers,),
+          ir.Type.parse("!mosaic_gpu.barrier")
+          if lowering_semantics == LoweringSemantics.Warpgroup
+          else i64,
+          memory_space=smem,
       )
-      smem_base_ptr = utils.memref_ptr(
-          dynamic_smem, memory_space=workgroup_nvptx_address_space
-      )
-      smem_ptr_ty = ir.Type.parse(f"!llvm.ptr<{workgroup_nvptx_address_space}>")
-      barrier_base_ptr = llvm.getelementptr(
-          smem_ptr_ty, smem_base_ptr, [], [dynamic_smem_offset], i8,
-          llvm.GEPNoWrapFlags.none
-      )
+      barrier_memref = _slice_smem(
+            barrier_ty,
+            dynamic_smem,
+            c(dynamic_smem_offset, index),
+            lowering_semantics,
+        )
       dynamic_smem_offset += num_barriers * utils.MBARRIER_BYTES
-      return barrier_base_ptr
+      return barrier_memref
     match ref_ty:
       case Union(members):
         member_thunks = [
@@ -372,29 +392,24 @@ def _construct_smem_reftree(
         init_fn = utils.DialectBarrierRef.initialize if (
             lowering_semantics == LoweringSemantics.Warpgroup
         ) else utils.BarrierRef.initialize
-        ref = init_fn(
-            get_barrier_ptr(num_barriers), num_barriers, arrival_count=1
-        )
+        ref = init_fn(barrier_memref(num_barriers), arrival_count=1)
       case Barrier(arrival_count, num_barriers):
         init_fn = utils.DialectBarrierRef.initialize if (
             lowering_semantics == LoweringSemantics.Warpgroup
         ) else utils.BarrierRef.initialize
-        ref = init_fn(
-            get_barrier_ptr(num_barriers),
-            num_barriers,
-            arrival_count=arrival_count,
-        )
+        ref = init_fn(barrier_memref(num_barriers), arrival_count=arrival_count)
       case ClusterBarrier(collective_dims, num_barriers):
         ref = utils.CollectiveBarrierRef.initialize(
-            get_barrier_ptr(num_barriers),
-            num_barriers,
+            barrier_memref(num_barriers),
             collective_dims,
             cluster_shape,
         )
       case TMEM(shape, dtype, layout=layout, collective=collective, packing=packing):
-        addr_ref = memref.view(
+        addr_ref = _slice_smem(
             ir.MemRefType.get([], i32, memory_space=smem),
-            dynamic_smem, c(dynamic_smem_offset, index), [],
+            dynamic_smem,
+            c(dynamic_smem_offset, index),
+            lowering_semantics,
         )
         if layout is None:
           layout = tcgen05._infer_tmem_layout(
@@ -410,9 +425,11 @@ def _construct_smem_reftree(
         dynamic_smem_offset += 4  # i32 takes up 4 bytes
       case _:
         mlir_dtype = utils.dtype_to_ir_type(ref_ty.dtype)
-        tile_smem = memref.view(
+        tile_smem = _slice_smem(
             ir.MemRefType.get(ref_ty.shape, mlir_dtype, memory_space=smem),
-            dynamic_smem, c(dynamic_smem_offset, index), [],
+            dynamic_smem,
+            c(dynamic_smem_offset, index),
+            lowering_semantics,
         )
         dynamic_smem_offset += _count_buffer_bytes(ref_ty)
         ref = tile_smem
@@ -510,18 +527,19 @@ def _launch(
   smem = ir.Attribute.parse("#gpu.address_space<workgroup>")
   with ir.InsertionPoint(launch_op.body.blocks[0]):
     dynamic_smem = gpu.dynamic_shared_memory(
-        ir.MemRefType.get(
-            (ir.ShapedType.get_dynamic_size(),), i8, memory_space=smem
-        )
+        ir.MemRefType.get((utils.DYNAMIC,), i8, memory_space=smem)
     )
 
     if profiler_spec:
-      prof_smem = memref.view(
+      prof_smem = _slice_smem(
           ir.MemRefType.get(
               (profiler_spec.smem_i32_elements(block=block),),
-              i32, memory_space=smem,
+              i32,
+              memory_space=smem,
           ),
-          dynamic_smem, c(profiler_start, index), [],
+          dynamic_smem,
+          c(profiler_start, index),
+          lowering_semantics,
       )
       prof = profiler.OnDeviceProfiler(
           profiler_spec, prof_smem, maybe_prof_buffer

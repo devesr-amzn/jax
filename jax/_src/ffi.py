@@ -23,7 +23,6 @@ from typing import Any, overload
 
 import numpy as np
 
-import jax
 from jax._src import core
 from jax._src import dispatch
 from jax._src import effects
@@ -56,7 +55,7 @@ def register_ffi_target(
     name: the name of the target.
     fn: a ``PyCapsule`` object containing the function pointer, or a ``dict``
       where the keys are FFI stage names (e.g. `"execute"`) and the values are
-      ``PyCapsule`` objects continaing a pointer to the handler for that stage.
+      ``PyCapsule`` objects containing a pointer to the handler for that stage.
     platform: the target platform.
     api_version: the XLA custom call API version to use. Supported versions are:
       1 (default) for the typed FFI or 0 for the earlier "custom call" API.
@@ -369,7 +368,7 @@ def ffi_call(
 
   Like :func:`~jax.pure_callback`, the behavior of ``ffi_call`` under
   :func:`~jax.vmap` depends on the value of ``vmap_method``. See the
-  :func:`~jax.pure_callback` documenation for more details about the allowed
+  :func:`~jax.pure_callback` documentation for more details about the allowed
   values and examples of their behavior.
 
   The current default behavior is to use ``vmap_method="sequential"`` when
@@ -662,6 +661,9 @@ def ffi_batching_rule(
     result_avals: Sequence[core.ShapedArray],
     **kwargs: Any,
 ):
+  from jax._src.lax import control_flow  # pytype: disable=import-error
+  from jax._src.lax import lax  # pytype: disable=import-error
+
   axis_size, = {a.shape[d] for a, d in zip(args, dims)
                 if d is not batching.not_mapped}
   new_args = [arg if dim is batching.not_mapped else
@@ -696,7 +698,7 @@ def ffi_batching_rule(
   elif vmap_method == "expand_dims" or vmap_method == "broadcast_all":
     size = axis_size if vmap_method == "broadcast_all" else 1
     bcast_args = [
-        jax.lax.broadcast(x, (size,)) if d is batching.not_mapped else x
+        lax.broadcast(x, (size,)) if d is batching.not_mapped else x
         for x, d in zip(new_args, dims)]
     if kwargs.get("input_layouts") is not None:
       kwargs["input_layouts"] = tuple(
@@ -721,7 +723,7 @@ def ffi_batching_rule(
       )
     unroll = vmap_method == "sequential_unrolled"
     g = lambda _, x: ((), _batch_fun(x))
-    _, outvals = jax.lax.scan(g, (), batched_args, unroll=unroll)
+    _, outvals = control_flow.scan(g, (), batched_args, unroll=unroll)
   else:
     raise NotImplementedError(
         f"vmap is only supported for the {prim.name} primitive when vmap_method "

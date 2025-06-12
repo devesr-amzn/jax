@@ -362,13 +362,17 @@ class AbstractRefUnion(pallas_core.AbstractMemoryRef):
     del tracer, index, value  # Unused.
     raise ValueError("Ref unions can't be assigned to.")
 
+  def update_vma(self, vma):
+    return AbstractRefUnion(self.inner_aval.update_vma(vma), self.refs,
+                            self.memory_space)
+
 
 @dataclasses.dataclass(init=False, frozen=True)
 class RefUnion(GPUMemoryRef):
   """A sequence of trees of refs that are allowed to reuse the same memory.
 
   One should not make assumptions as to how each ref will map to the underlying
-  memory region, since arbitrary padding may be applied inbetween different
+  memory region, since arbitrary padding may be applied in between different
   refs.
 
   As such, ref unions are only safe to use when the groups of refs that we
@@ -459,7 +463,7 @@ class UntileRef(state_types.Transform):
       self, perm: tuple[int, ...]
   ) -> tuple[tuple[int, ...], state_types.Transform]:
     # The transpose in question is applied to the utiled ref so we
-    # need to translate it by duplicating and offseting the last part.
+    # need to translate it by duplicating and offsetting the last part.
     off = len(perm)
     new_suffix = [i + off for i in perm[-len(self.tiling) :]]
     if set(new_suffix) != set(range(off, off + len(self.tiling))):
@@ -808,6 +812,7 @@ class BlockSpec(pallas_core.BlockSpec):
       index_map_tree: tree_util.PyTreeDef,
       grid: pallas_core.GridMappingGrid,
       mapped_dims: tuple[int, ...],
+      debug: bool = False,
   ) -> pallas_core.BlockMapping:
     bm = super().to_block_mapping(
         origin,
@@ -816,6 +821,7 @@ class BlockSpec(pallas_core.BlockSpec):
         index_map_tree=index_map_tree,
         grid=grid,
         mapped_dims=mapped_dims,
+        debug=debug,
     )
     block_inner_aval = bm.block_aval.inner_aval
     for t in self.transforms:
@@ -871,7 +877,7 @@ class Barrier:
       barriers can be accessed by indexing into the barrier Ref.
     for_tensor_core: Whether this barrier is used for synchronizing with
       the tensor core. This should be set to True when waiting on Blackwell
-      (TC Gen 5) asynchoronous matmul instructions.
+      (TC Gen 5) asynchronous matmul instructions.
   """
   num_arrivals: int = 1
   num_barriers: int = 1
@@ -938,6 +944,9 @@ class WGMMAAbstractAccumulatorRef(AbstractMemoryRef):
 
   def update_weak_type(self, weak_type):
     return _as_accum(super().update_weak_type(weak_type))
+
+  def update_vma(self, vma):
+    return _as_accum(super().update_vma(vma))
 
   def update(self, inner_aval=None, memory_space=None):
     return _as_accum(super().update(inner_aval=None, memory_space=None))

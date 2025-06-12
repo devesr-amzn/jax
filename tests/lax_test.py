@@ -2645,6 +2645,11 @@ class LaxTest(jtu.JaxTestCase):
     self._CheckAgainstNumpy(op, reference_top_k, args_maker)
     self._CompileAndCheck(op, args_maker)
 
+  def testTopKOverflow(self):
+    x = jax.ShapeDtypeStruct((2 ** 31 + 1,), np.dtype('bfloat16'))
+    with self.assertRaisesRegex(ValueError, "top_k returns int32 indices, which will overflow"):
+      jax.eval_shape(lambda x: jax.lax.top_k(x, 100), x)
+
   @jtu.sample_product(
     [dict(lhs_shape=lhs_shape, rhs_shape=rhs_shape)
       for lhs_shape, rhs_shape in [((3, 2), (2, 4)),
@@ -4410,7 +4415,7 @@ class FunctionAccuracyTest(jtu.JaxTestCase):
     #
     # In addition, the 1/3 middle parts of regions q1, q2, q3, q4,
     # neg, pos are tested separately as these don't contain extremely
-    # small or extremelly large values and functions on these regions
+    # small or extremely large values and functions on these regions
     # ought not to possess any incorrectness issues.
 
     s0, s1 = size_re, size_im

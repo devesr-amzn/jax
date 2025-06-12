@@ -48,7 +48,6 @@ from jax._src.lib import gpu_linalg
 from jax._src.lib import gpu_solver
 from jax._src.lib import gpu_sparse
 from jax._src.lib import lapack
-from jax._src.lib import version as jaxlib_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import hlo
@@ -2148,7 +2147,7 @@ def _svd_gpu_sub_lowering(ctx, operand, *, full_matrices, compute_uv,
   # default QR algorithm, but users can (in principle) override this behavior
   # by passing `use_jacobi=True`.
   #
-  # TODO(danfm): Since this was originally implemented, hipSolver appers to
+  # TODO(danfm): Since this was originally implemented, hipSolver appears to
   # have added support for the Jacobi algorithm, so we should investigate
   # removing this condition.
   if algorithm is None or algorithm == SvdAlgorithm.DEFAULT:
@@ -2339,7 +2338,7 @@ def _triangular_solve_jvp_rule_a(
                             transpose_a=transpose_a, conjugate_a=conjugate_a,
                             unit_diagonal=unit_diagonal)
 
-  # triangular_solve is about the same cost as matrix multplication (~n^2 FLOPs
+  # triangular_solve is about the same cost as matrix multiplication (~n^2 FLOPs
   # for matrix/vector inputs). Order these operations in whichever order is
   # cheaper.
   if left_side:
@@ -2428,15 +2427,7 @@ def _triangular_solve_cpu_lower(
     conjugate_a = False
   if np.dtype(a_aval.dtype) in _cpu_lapack_types:
     target_name = lapack.prepare_lapack_call("trsm_ffi", a_aval.dtype)
-    # TODO(b/397715595): Remove forward_compat check no earlier than 2025-03-18.
-    if ctx.is_forward_compat() or jaxlib_version <= (0, 5, 1):
-      alpha = mlir.ir_constant(np.array(1, dtype=a_aval.dtype)),
-      alpha_aval = ShapedArray((), a_aval.dtype),
-      batch_partitionable = False
-    else:
-      alpha = ()
-      alpha_aval = ()
-      batch_partitionable = True
+    alpha, alpha_aval, batch_partitionable = (), (), True
     rule = _linalg_ffi_lowering(target_name,
                                 [a_aval, b_aval, *alpha_aval],
                                 operand_output_aliases={1: 0},
@@ -2776,8 +2767,8 @@ def _column_major_matrix_layout(dim: int) -> tuple[int, ...]:
 
 def _sdy_rule_for_aval(letters, num_batch_dims, aval):
   d = len(aval.shape) - num_batch_dims
-  preffix = "... " if num_batch_dims and d >= 0 else ""
-  return preffix + " ".join(next(letters) for _ in range(d))
+  prefix = "... " if num_batch_dims and d >= 0 else ""
+  return prefix + " ".join(next(letters) for _ in range(d))
 
 def _build_sdy_sharding_rule(num_batch_dims, avals_in, avals_out):
   letters = iter(string.ascii_letters)

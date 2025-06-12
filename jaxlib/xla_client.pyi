@@ -37,6 +37,7 @@ from jaxlib._jax import HostBufferSemantics as HostBufferSemantics
 from jaxlib._jax import ifrt_programs as ifrt_programs
 from jaxlib._jax import Layout as Layout
 from jaxlib._jax import LoadedExecutable as LoadedExecutable
+from jaxlib._jax import Executable as Executable
 from jaxlib._jax import Memory as Memory
 from jaxlib._jax import NamedSharding as NamedSharding
 from jaxlib._jax import OpSharding as OpSharding
@@ -63,6 +64,8 @@ def make_cpu_client(
     num_nodes: int = ...,
     collectives: _xla.CpuCollectives | None = ...,
     num_devices: int | None = ...,
+    get_local_topology_timeout_minutes: int | None = ...,
+    get_global_topology_timeout_minutes: int | None = ...,
 ) -> Client: ...
 def make_gpu_client(
     distributed_client: DistributedRuntimeClient | None = ...,

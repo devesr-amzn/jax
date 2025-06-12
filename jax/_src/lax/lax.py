@@ -266,8 +266,8 @@ def _merge_dyn_shape(
   assert next(dyn_shape_it, None) is None
   return shape
 
-def _dyn_shape_staging_rule(trace, prim, out_aval, *args, **params):
-  source_info = source_info_util.current()
+def _dyn_shape_staging_rule(trace, source_info, prim, out_aval, *args,
+                            **params):
   out_tracer = pe.DynamicJaxprTracer(trace, out_aval, source_info)
   eqn = pe.new_jaxpr_eqn([trace.getvar(x) for x in args],
                          [trace.makevar(out_tracer)],
@@ -935,7 +935,7 @@ def integer_pow(x: ArrayLike, y: int) -> Array:
     An array of the same shape and dtype as ``x`` containing the elementwise power.
 
   See also:
-    :func:`jax.lax.pow`: Elementwise pwoer where ``y`` is an array.
+    :func:`jax.lax.pow`: Elementwise power where ``y`` is an array.
 
   .. _stablehlo.multiply: https://openxla.org/stablehlo/spec#multiply
   """
@@ -1690,8 +1690,6 @@ def _convert_element_type(
       return to_edtype_p.bind(operand, edtype=new_dtype)
     return from_edtype_p.bind(operand, dtype=np.dtype(new_dtype))
 
-  new_dtype = type_cast(DTypeLike | None, new_dtype)
-
   old_weak_type = dtypes.is_weakly_typed(operand)
   if new_dtype is None:
     new_dtype = old_dtype
@@ -2102,7 +2100,7 @@ class DotAlgorithm(NamedTuple):
 
   The `StableHLO spec <https://openxla.org/stablehlo/spec#dot_general>`_ for
   the dot operation doesn't require that the precision types be the same as the
-  storage types for the inputs or outputs, but some plaforms may require that
+  storage types for the inputs or outputs, but some platforms may require that
   these types match. Furthermore, the return type of
   :func:`~jax.lax.dot_general` is always defined by the ``accumulation_type``
   parameter of the input algorithm, if specified.
@@ -3358,9 +3356,7 @@ def zeros_like_shaped_array(aval: ShapedArray) -> Array:
   else:
     scalar_zero = _convert_element_type(0, aval.dtype, aval.weak_type)
   out = broadcast(scalar_zero, aval.shape, out_sharding=aval.sharding)
-  out = core.pvary(out, tuple(aval.vma))
-  return out
-
+  return core.pvary(out, tuple(aval.vma))
 ad_util.aval_zeros_likers[ShapedArray] = zeros_like_shaped_array
 
 def zeros_like_abstract_ref(aval: state.AbstractRef) -> core.MutableArray:
@@ -3564,12 +3560,13 @@ def full_like(x: ArrayLike | DuckTypedArray,
         # This bypasses the check.
         and not isinstance(x, core.Tracer)
         and hasattr(x, 'sharding')
+        and x.sharding is not None
+        and x.sharding._is_concrete
         and getattr(x, '_committed', True)
         and not weak_type
         and fill_shape == np.shape(x)  # type: ignore[arg-type]
     )
     if use_x_sharding:
-      # TODO(yashkatariya): Use shard_alike in tracing_mode once it is supported.
       sharding = x.sharding  # type: ignore
   val = full(fill_shape, _convert_element_type(fill_value, dtype, weak_type),
              sharding=sharding)
@@ -4593,7 +4590,7 @@ def _add_unreduced(out_sharding, x, y):
         ' not allow this because there will be implicit communication. Please'
         f' reduce {lhs_str} via `reshard` before calling `add`.')
   else:
-    res_unreduced = None
+    res_unreduced = frozenset()
   return out_sharding.with_spec(out_sharding.spec.with_unreduced(res_unreduced))
 
 add_p: Primitive = naryop(_input_dtype, [_num, _num], 'add',
@@ -4950,6 +4947,9 @@ def _to_edtype_abstract_eval(x, *, edtype):
           not isinstance(x.dtype, dtypes.ExtendedDType))
   # For backward compatibility, if the edtype rules have a `convert_to` method,
   # use that rather than looking for an `allow_conversion: bool` attribute.
+  if not isinstance(x, (ShapedArray, core.DShapedArray)):
+    raise TypeError("can only convert to an extended dtype on an array type,"
+                    f"but got {type(x)}")
   if convert_to := getattr(edtype._rules, 'convert_to', None):
     allow_conversion = convert_to(x.dtype, edtype)
   else:
@@ -4959,6 +4959,7 @@ def _to_edtype_abstract_eval(x, *, edtype):
         f"Cannot convert_element_type from {dtype_to_string(x.dtype)} "
         f"to {dtype_to_string(edtype)}")
   rep_aval = core.physical_element_aval(edtype)
+  assert tuple(rep_aval.sharding.spec) == (None,) * rep_aval.ndim
   if x.dtype != rep_aval.dtype:
     raise ValueError(
         "can only convert to extended dtype from its representation dtype, "
@@ -4981,7 +4982,20 @@ def _to_edtype_abstract_eval(x, *, edtype):
         f" has a representation shape {rep_aval.shape} while the given "
         f"representation array has shape {x.shape}, so the shape suffix "
         f"does not match: given {shape_suffix} but required {rep_aval.shape}.")
-  return x.update(shape=shape_prefix, dtype=edtype)
+  if isinstance(x, ShapedArray):
+    spec_prefix, spec_suffix = x.sharding.spec[:n], x.sharding.spec[n:]
+    if tuple(spec_suffix) != (None,) * len(spec_suffix):
+      raise ValueError(
+          "can only convert to extended dtype from an array with trailing "
+          "axes that are not explicitly sharded, but tried to convert from "
+          f"{x.str_short(short_dtypes=True)} to an extended dtype with element "
+          f"shape {rep_aval.shape}")
+    return x.update(shape=shape_prefix, dtype=edtype,
+                    sharding=x.sharding.with_spec(spec_prefix))
+  elif isinstance(x, core.DShapedArray):
+    return x.update(shape=shape_prefix, dtype=edtype)
+  else:
+    assert False  # unreachable, see isinstance check above
 
 to_edtype_p = Primitive('to_edtype')
 to_edtype_p.def_impl(partial(dispatch.apply_primitive, to_edtype_p))
@@ -4998,6 +5012,9 @@ mlir.register_lowering(to_edtype_p, lambda _, x, **__: [x])
 def _from_edtype_abstract_eval(x, *, dtype):
   assert (isinstance(x.dtype, dtypes.ExtendedDType) and
           not isinstance(dtype, dtypes.ExtendedDType))
+  if not isinstance(x, (ShapedArray, core.DShapedArray)):
+    raise TypeError("can only convert from an extended dtype on an array type,"
+                    f"but got {type(x)}")
   if convert_from := getattr(x.dtype._rules, 'convert_from', None):
     allow_conversion = convert_from(x.dtype, dtype)
   else:
@@ -5007,16 +5024,22 @@ def _from_edtype_abstract_eval(x, *, dtype):
         f"Cannot convert_element_type from {dtype_to_string(x.dtype)} "
         f"to {dtype_to_string(dtype)}")
   rep_aval = core.physical_element_aval(x.dtype)
+  assert tuple(rep_aval.sharding.spec) == (None,) * rep_aval.ndim
   if rep_aval.dtype != dtype:
     raise ValueError(
         "can only convert from extended dtype to its representation dtype, "
         f"but tried to convert from {dtype_to_string(x.dtype)} to "
         f"{dtype_to_string(dtype)} which doesn't match the representation type "
         f"{dtype_to_string(rep_aval.dtype)}.")
-  if all(isinstance(d, int) for d in x.shape):
-    return core.ShapedArray(shape=(*x.shape, *rep_aval.shape), dtype=dtype)
+  if isinstance(x, ShapedArray):
+    return x.update(shape=(*x.shape, *rep_aval.shape), dtype=dtype)
+  elif isinstance(x, core.DShapedArray):
+    if all(isinstance(d, int) for d in x.shape):
+      return core.ShapedArray(shape=(*x.shape, *rep_aval.shape), dtype=dtype)
+    else:
+      raise NotImplementedError
   else:
-    raise NotImplementedError
+    assert False  # unreachable, see isinstance check above
 
 from_edtype_p = Primitive('from_edtype')
 from_edtype_p.def_impl(partial(dispatch.apply_primitive, from_edtype_p))
@@ -5227,7 +5250,7 @@ def _dot_general_sharding_rule(lhs, rhs, *, dimension_numbers, precision,
             ' out_sharding provided to dot_general mentions unreduced_axes.'
             f' Got {out_sharding=}, {lhs_contracting_spec=},'
             f' {rhs_contracting_spec=}')
-      if out_sharding.spec.unreduced != lhs_contracting_spec:
+      if out_sharding.spec.unreduced != frozenset(lhs_contracting_spec):
         raise core.ShardingTypeError(
             "out_sharding's unreduced axes should be equal to the contracting"
             f' specs. Got unreduced axes={out_sharding.spec.unreduced} and'
@@ -6493,14 +6516,15 @@ def _broadcast_in_dim_fwd_rule(eqn):
     return [None], eqn
 
 def _broadcast_in_dim_staging_rule(
-    trace, x, *dyn, shape, broadcast_dimensions, sharding):
+    trace, source_info, x, *dyn, shape, broadcast_dimensions, sharding):
   params = dict(shape=shape, broadcast_dimensions=broadcast_dimensions,
                 sharding=sharding)
   if not dyn:
-    return trace.default_process_primitive(broadcast_in_dim_p, (x,), params)
+    return trace.default_process_primitive(broadcast_in_dim_p, (x,), params,
+                                           source_info=source_info)
   aval = core.DShapedArray(_merge_dyn_shape(shape, dyn), x.dtype, x.weak_type)
-  return _dyn_shape_staging_rule(trace, broadcast_in_dim_p, aval, x, *dyn,
-                                 **params)
+  return _dyn_shape_staging_rule(trace, source_info, broadcast_in_dim_p, aval,
+                                 x, *dyn, **params)
 
 def _broadcast_in_dim_padding_rule(in_avals, out_avals, x, *dyn_shape,
                                    shape, broadcast_dimensions):
@@ -7214,12 +7238,14 @@ def _reshape_lower(ctx, x, *dyn_shape, new_sizes, dimensions, sharding):
   return [mlir.lower_with_sharding_in_types(ctx, out, aval_out)]
 
 def _reshape_staging_rule(
-    trace, x, *dyn, new_sizes, dimensions, sharding):
+    trace, source_info, x, *dyn, new_sizes, dimensions, sharding):
   params = dict(new_sizes=new_sizes, dimensions=dimensions, sharding=sharding)
   if not dyn:
-    return trace.default_process_primitive(reshape_p, (x,), params)
+    return trace.default_process_primitive(reshape_p, (x,), params,
+                                           source_info=source_info)
   av = core.DShapedArray(_merge_dyn_shape(new_sizes, dyn), x.dtype, x.weak_type)
-  return _dyn_shape_staging_rule(trace, reshape_p, av, x, *dyn, **params)
+  return _dyn_shape_staging_rule(trace, source_info, reshape_p, av, x, *dyn,
+                                 **params)
 
 reshape_p = standard_primitive(_reshape_shape_rule, _reshape_dtype_rule,
                                'reshape', sharding_rule=_reshape_sharding_rule,
@@ -7922,7 +7948,7 @@ def _sort_abstract_eval(*args, **kwargs):
 
 
 def _canonicalize_float_for_sort(x):
-  # In the sort comparator, we are going to use a comparision operator where -0
+  # In the sort comparator, we are going to use a comparison operator where -0
   # would be before 0, and -NaN and NaN appear at the beginning and end of the
   # ordering. In this scheme, -0 would be before 0, and -NaN and NaN appear at
   # the beginning and end of the ordering. This causes issues for stable
@@ -8067,6 +8093,15 @@ def _top_k_abstract_eval(operand, *, k):
   if shape[-1] < k:
     msg = "k argument to top_k must be no larger than minor dimension; {} vs {}"
     raise ValueError(msg.format(k, shape))
+  int32_max = dtypes.iinfo('int32').max
+  try:
+    too_large = (shape[-1] > int32_max + 1)
+  except core.InconclusiveDimensionOperation:
+    pass
+  else:
+    if too_large:
+      raise ValueError("top_k returns int32 indices, which will overflow for array dimensions "
+                       f"larger than the maximum int32 ({int32_max}). Got {operand.shape=}")
   shape[-1] = k
   return (operand.update(shape=shape, dtype=operand.dtype,
                          weak_type=operand.weak_type),
@@ -8163,7 +8198,7 @@ mlir.register_lowering(create_token_p, _create_token_lowering)
 def after_all(*operands):
   """Merges one or more XLA token values. Experimental.
 
-  Wraps the XLA AfterAll operator."""
+  Wraps the XLA after all operator."""
   operands = core.standard_insert_pvary(*operands)
   return after_all_p.bind(*operands)
 
@@ -8558,13 +8593,16 @@ iota_p.def_impl(partial(dispatch.apply_primitive, iota_p))
 iota_p.def_abstract_eval(_iota_abstract_eval)
 batching.ragged_prop_rules[iota_p] = batching.ragged_mask_no_op_rule
 
-def _iota_staging_rule(trace, *dyn_shape, dtype, shape, dimension, sharding):
+def _iota_staging_rule(trace, source_info, *dyn_shape, dtype, shape, dimension,
+                       sharding):
   params = dict(dtype=dtype, shape=shape, dimension=dimension,
                 sharding=sharding)
   if not dyn_shape:
-    return trace.default_process_primitive(iota_p, (), params)
+    return trace.default_process_primitive(iota_p, (), params,
+                                           source_info=source_info)
   aval = core.DShapedArray(_merge_dyn_shape(shape, dyn_shape), dtype, False)
-  return _dyn_shape_staging_rule(trace, iota_p, aval, *dyn_shape, **params)
+  return _dyn_shape_staging_rule(trace, source_info, iota_p, aval, *dyn_shape,
+                                 **params)
 pe.custom_staging_rules[iota_p] = _iota_staging_rule
 
 def _iota_typecheck_rule(_, *dyn_shape, dtype, shape, dimension, sharding):

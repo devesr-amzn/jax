@@ -486,6 +486,8 @@ def _schur(a: Array, output: str) -> tuple[Array, Array]:
 def schur(a: ArrayLike, output: str = 'real') -> tuple[Array, Array]:
   """Compute the Schur decomposition
 
+  Only implemented on CPU.
+
   JAX implementation of :func:`scipy.linalg.schur`.
 
   The Schur form `T` of a matrix `A` satisfies:
@@ -1832,6 +1834,9 @@ def _sqrtm(A: ArrayLike) -> Array:
 def sqrtm(A: ArrayLike, blocksize: int = 1) -> Array:
   """Compute the matrix square root
 
+  This function is implemented using :func:`scipy.linalg.schur`, which is only
+  supported on CPU.
+
   JAX implementation of :func:`scipy.linalg.sqrtm`.
 
   Args:
@@ -2189,7 +2194,7 @@ def pascal(n: int, kind: str | None = None) -> Array:
 
   JAX implementation of :func:`scipy.linalg.pascal`.
 
-  The elements of the Pascal matrix approximate the binomial coefficents. This
+  The elements of the Pascal matrix approximate the binomial coefficients. This
   implementation is not exact as JAX does not support exact factorials.
 
   Args:

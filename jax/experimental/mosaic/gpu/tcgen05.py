@@ -35,14 +35,10 @@ from .launch_context import LaunchContext
 
 TMEM_ROWS = 128
 TCGEN05_SMEM_DESCRIPTOR_BIT = 1 << 46
-# Like WGMMA_LAYOUT, only each warp holds a 32xN strip instead of 16xN.
-# The name is so short, because it's meant to be used qualified (tcgen05.LAYOUT)
-LAYOUT = fa.TiledLayout(
-    fa.Tiling(((128, 8), (32, 8), (8, 8), (1, 2))),
-    warp_dim=-8,
-    lane_dims=(-4, -3),
-    vector_dim=-1,
-)
+LAYOUT = fa.TCGEN05_LAYOUT
+ROW_LAYOUT = fa.TCGEN05_ROW_LAYOUT
+COL_LAYOUT = fa.TCGEN05_COL_LAYOUT
+
 # A layout resembling the logical organization of TMEM. The 128 rows in a tile
 # are assigned to 128 lanes in the warpgroup. Useful when the result needs to be
 # processed in registers and then stored back into TMEM. Should not be used if
@@ -458,7 +454,7 @@ def _tmem_access_helper(shape, num):
   num_regs *= num
   if num_regs > 255:
     raise ValueError(
-        f"TMEM transation too big : {shape=} and {num=} involve"
+        f"TMEM translation too big : {shape=} and {num=} involve"
         f" {num_regs} registers per-thread, which exceeds the limit of 255"
     )
   regs_vector = ",".join(f"${i}" for i in range(num_regs))
@@ -667,7 +663,8 @@ class TMEMRef:
       raise NotImplementedError("TMEM cannot be sliced along rows")
     if slice_shape[1] % 8:
       raise NotImplementedError(
-          "TMEM column slice length must be a multiple of 8"
+          "TMEM column slice length must be a multiple of 8. "
+          f"Got {slice_shape[1]}."
       )
     col_idx = base_idx[1]
     if not isinstance(col_idx, ir.Value):

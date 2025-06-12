@@ -131,7 +131,7 @@ class DebugInfoTest(jtu.JaxTestCase):
     mode. The debug infos in the nested Jaxprs are first converted to
     strings using `_debug_info_to_string` and then
     compared against `expected_jaxpr_debug_infos`. During this conversion,
-    we strip occurences of this test file name and a line number
+    we strip occurrences of this test file name and a line number
     (e.g., .*/debug_info_test.py:56)
     An element of `expected_jaxpr_debug_infos` can be a string, in which case
     it is compared by equality, or a `re.Pattern` (the result of `re.compile`)
@@ -965,8 +965,7 @@ class DebugInfoTest(jtu.JaxTestCase):
     else:
       expected_jaxpr_debug_infos = [
           "traced_for=jit, fun=<lambda>, arg_names=x,y,res_ct, result_paths=result[0],result[1]",
-          # TODO(necula): result_paths
-          "traced_for=jit, fun=my_g, arg_names=u,v, result_paths=",
+          "traced_for=jit, fun=my_g, arg_names=u,v, result_paths=result['c']",
             # TODO(necula): arg_names
           "traced_for=jit, fun=my_g, arg_names=,,u,v, result_paths=result['c'],result['d']",
       ]
@@ -1403,7 +1402,7 @@ class DebugInfoTest(jtu.JaxTestCase):
     else:
       expected_jaxpr_debug_infos = [
           "traced_for=jit, fun=the_grad, arg_names=c,as_, result_paths=result[0],result[1]",
-          "traced_for=jit, fun=my_f, arg_names=x,as_, result_paths=,,",
+          "traced_for=jit, fun=my_f, arg_names=x,as_, result_paths=result[0],result[1]",
           "traced_for=for_loop, fun=f, arg_names=,,, result_paths=,",
           "traced_for=for_loop, fun=f, arg_names=i,refs[0],refs[1],refs[2], result_paths=",
           "traced_for=jit, fun=my_f, arg_names=,,x,as_, result_paths=result[0],result[1]",

@@ -53,6 +53,7 @@ pytype_strict_library(
     data = [":ffi_headers"],
     deps = [
         ":_jax",
+        ":_pretty_printer",
         ":cpu_feature_guard",
         ":jax",
         ":jaxlib_files",
@@ -150,6 +151,7 @@ pywrap_library(
     },
     deps = [
         ":_jax",
+        ":_pretty_printer",
         ":utils",
         ":weakref_lru_cache",
         "//jaxlib/mlir/_mlir_libs:_chlo",
@@ -245,6 +247,19 @@ nanobind_extension(
     module_name = "cpu_feature_guard",
     deps = [
         "@xla//third_party/python_runtime:headers",
+    ],
+)
+
+nanobind_pywrap_extension(
+    name = "_pretty_printer",
+    srcs = ["_pretty_printer.cc"],
+    deps = [
+        ":nb_class_ptr",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
+        "@nanobind",
     ],
 )
 
@@ -351,6 +366,7 @@ nanobind_pywrap_extension(
         "@xla//xla/pjrt:pjrt_layout",
         "@xla//xla/pjrt:status_casters",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
+        "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
         "@xla//xla/pjrt/distributed",
         "@xla//xla/pjrt/distributed:client",
         "@xla//xla/pjrt/distributed:key_value_store_interface",
@@ -815,6 +831,7 @@ cc_library(
 cc_library(
     name = "py_client",
     srcs = [
+        "partition_spec.cc",
         "py_array.cc",
         "py_client.cc",
         "py_compile_only_client.cc",
@@ -828,6 +845,7 @@ cc_library(
         "to_ifrt_sharding.cc",
     ],
     hdrs = [
+        "partition_spec.h",
         "py_array.h",
         "py_client.h",
         "py_compile_only_client.h",

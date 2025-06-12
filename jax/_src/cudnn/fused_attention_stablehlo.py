@@ -357,7 +357,7 @@ def check_is_flash_attention(
         H_max = 256 if cudnn_version >= 90500 and is_on_hopper else 128
         if not (H <= H_max and H % 8 == 0):
           raise NotImplementedError(
-              f"The head dim must be <= {H_max} and a mutiple of 8, "
+              f"The head dim must be <= {H_max} and a multiple of 8, "
               f"but got {H}."
           )
 
@@ -1078,16 +1078,21 @@ batching.primitive_batchers[
     _dot_product_attention_bwd_p_wrapper
 ] = _dot_product_attention_bwd_batcher
 
+def not_implemented_sharding_rule(*args, **kwargs):
+  return NotImplementedError("Sharding rule not implemented.")
+
 _dot_product_attention_fwd_lower.def_partition(
   infer_sharding_from_operands=_dot_product_attention_fwd_infer_sharding_from_operands,
-  partition=_dot_product_attention_fwd_partition)
+  partition=_dot_product_attention_fwd_partition,
+  sharding_rule=not_implemented_sharding_rule)
 
 mlir.register_lowering(_dot_product_attention_fwd_p_wrapper,
                         mlir.lower_fun(_dot_product_attention_fwd_lower, multiple_results=True))
 
 _dot_product_attention_bwd_lower.def_partition(
   infer_sharding_from_operands=_dot_product_attention_bwd_infer_sharding_from_operands,
-  partition=_dot_product_attention_bwd_partition)
+  partition=_dot_product_attention_bwd_partition,
+  sharding_rule=not_implemented_sharding_rule)
 
 mlir.register_lowering(_dot_product_attention_bwd_p_wrapper,
                         mlir.lower_fun(_dot_product_attention_bwd_lower, multiple_results=True))
@@ -1844,7 +1849,7 @@ def dot_product_attention(
         # should be broadcast to same shape
         bias = bias + mask
 
-    # check if input shape and data type is compatiable
+    # check if input shape and data type is compatible
     check_layout(query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets, layout)
     has_bias = bias is not None
     has_dbias = has_bias and \

@@ -3971,6 +3971,8 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
   def testIsCloseCornerCases(self, atol, rtol, equal_nan):
     if jtu.numpy_version() < (2, 0, 0) and (np.isinf(atol) or np.isinf(rtol)):
       self.skipTest("fails on older NumPy")
+    if jtu.numpy_version() >= (2, 3, 0) and (np.isinf(atol) or np.isinf(rtol)):
+      self.skipTest("NumPy 2.3.0 now throws warnings for inf atol/rtol")
     vals = np.array([-np.nan, -np.inf, -1.00001, -1.0, -0.00001, -0.0,
                      0.0, 0.00001, 1.0, 1.00001, np.inf, np.nan])
     x, y = np.meshgrid(vals, vals)
@@ -6214,7 +6216,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     ],
     dtype=float_dtypes + int_dtypes,
   )
-  @jtu.skip_on_devices("tpu")  # TODO(jakevdp): fix and reenable this test.
+  @jtu.skip_on_devices("tpu")  # TODO(jakevdp): fix and re-enable this test.
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
   def test_trapezoid(self, yshape, xshape, dtype, dx, axis):
     rng = jtu.rand_default(self.rng())

@@ -82,7 +82,6 @@ _py_deps = {
     "absl/testing": ["@pypi//absl_py"],
     "absl/flags": ["@pypi//absl_py"],
     "cloudpickle": get_optional_dep("@pypi//cloudpickle"),
-    "colorama": get_optional_dep("@pypi//colorama"),
     "epath": get_optional_dep("@pypi//etils"),  # etils.epath
     "filelock": get_optional_dep("@pypi//filelock"),
     "flatbuffers": ["@pypi//flatbuffers"],
@@ -173,7 +172,7 @@ def if_building_jaxlib(
     })
 
 def _cpu_test_deps():
-    """Returns the test depencies needed for a CPU-only JAX test."""
+    """Returns the test dependencies needed for a CPU-only JAX test."""
     return select({
         "//jax:config_build_jaxlib_true": [],
         "//jax:config_build_jaxlib_false": ["@pypi//jaxlib"],

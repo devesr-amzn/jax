@@ -272,7 +272,10 @@ jax_multiplatform_test(
         "gpu_h100x2",
     ],
     # TODO(dfm): Remove after removal of jex.ffi imports.
-    deps = ["//jax:extend"] + py_deps([
+    deps = [
+        "//jax:extend",
+        "//jax:ffi",
+    ] + py_deps([
         "absl/testing",
         "numpy",
     ]),
@@ -1605,6 +1608,7 @@ jax_multiplatform_test(
     deps = [
         "//jax:cache_key",
         "//jax:compiler",
+        "//jax:custom_partitioning",
     ] + py_deps("absl/testing"),
 )
 
@@ -2039,10 +2043,9 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "export_back_compat_test",
     srcs = ["export_back_compat_test.py"],
-    # TODO(b/415285434): enable once we have backwards compatibility support with GSPMD checkpoints.
-    # enable_configs = [
-    #     "tpu_v3_x4_shardy",
-    # ],
+    enable_configs = [
+        "tpu_v3_x4_shardy",
+    ],
     tags = [],
     deps = [
         "//jax:internal_export_back_compat_test_data",
