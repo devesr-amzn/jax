@@ -350,8 +350,13 @@ class JaxprEqnContext:
   __slots__ = ['compute_type', 'threefry_partitionable', 'xla_metadata',
                'cur_abstract_mesh']
 
+  compute_type: str | None
+  threefry_partitionable: bool
+  xla_metadata: dict[str, Any] | None
+  cur_abstract_mesh: mesh_lib.AbstractMesh
+
   def __init__(self, compute_type: str | None, threefry_partitionable: bool,
-               xla_metadata=None):
+               xla_metadata: dict[str, Any] | None = None):
     self.compute_type = compute_type
     self.threefry_partitionable = threefry_partitionable
     self.cur_abstract_mesh = mesh_lib.get_abstract_mesh()
@@ -368,6 +373,21 @@ class JaxprEqnContext:
         f"cur_abstract_mesh={self.cur_abstract_mesh}, "
         f"xla_metadata={self.xla_metadata})"
     )
+
+  def __hash__(self):
+    return hash((
+        self.compute_type,
+        self.threefry_partitionable,
+        self.cur_abstract_mesh,
+        None if self.xla_metadata is None
+        else tuple(sorted(self.xla_metadata.items())),
+    ))
+
+  def __eq__(self, other):
+    return (self.compute_type == other.compute_type and
+            self.threefry_partitionable == other.threefry_partitionable and
+            self.cur_abstract_mesh == other.cur_abstract_mesh and
+            self.xla_metadata == other.xla_metadata)
 
 
 class JaxprEqn:
@@ -675,7 +695,7 @@ class Trace(Generic[TracerType]):
     return not self._invalidated
 
   def __repr__(self):
-    return '{}'.format(self.__class__.__name__)
+    return f'{self.__class__.__name__}'
 
   def process_call(self, call_primitive, f, tracers, params):
     msg = (f"{type(self)} must override process_call to handle call-like "
@@ -840,7 +860,6 @@ class Tracer(typing.Array, metaclass=StrictABCMeta):
     # Raising a ConcretizationTypeError would make sense, but for backward compatibility
     # we raise an AttributeError so that hasattr() and getattr() work as expected.
     raise AttributeError(
-        self,
         f"The 'sharding' attribute is not available on {self._error_repr()}."
         f"{self._origin_msg()}")
 
@@ -856,7 +875,7 @@ class Tracer(typing.Array, metaclass=StrictABCMeta):
     # This attribute is part of the jax.Array API, but only defined on concrete arrays.
     # Raising a ConcretizationTypeError would make sense, but for backward compatibility
     # we raise an AttributeError so that hasattr() and getattr() work as expected.
-    raise AttributeError(self,
+    raise AttributeError(
       f"The 'device' attribute is not available on {self._error_repr()}."
       f"{self._origin_msg()}")
 
@@ -928,7 +947,6 @@ class Tracer(typing.Array, metaclass=StrictABCMeta):
 
     if name == 'sharding':
       raise AttributeError(
-        self,
         f"The 'sharding' attribute is not available on {self._error_repr()}."
         f"{self._origin_msg()}")
 
@@ -980,14 +998,14 @@ class Tracer(typing.Array, metaclass=StrictABCMeta):
   @property
   def block_until_ready(self):
     # Raise AttributeError for backward compatibility with hasattr() and getattr() checks.
-    raise AttributeError(self,
+    raise AttributeError(
       f"The 'block_until_ready' method is not available on {self._error_repr()}."
       f"{self._origin_msg()}")
 
   @property
   def copy_to_host_async(self):
     # Raise AttributeError for backward compatibility with hasattr() and getattr() checks.
-    raise AttributeError(self,
+    raise AttributeError(
       f"The 'copy_to_host_async' method is not available on {self._error_repr()}."
       f"{self._origin_msg()}")
 
@@ -1938,10 +1956,10 @@ def get_cur_mesh_sharding(spec=None):
 def _make_lengths_same(sharding, ndim):
   pspec = sharding.spec
   if ndim > len(pspec):
-    return sharding.with_spec(pspec._normalized_spec_for_aval(ndim))
+    return sharding.update(spec=pspec._normalized_spec_for_aval(ndim))
   if ndim < len(pspec):
     assert all(s is None for s in pspec[ndim:]), (ndim, pspec)
-    return sharding.with_spec(P(*pspec[:ndim], unreduced=pspec.unreduced))
+    return sharding.update(spec=P(*pspec[:ndim], unreduced=pspec.unreduced))
   assert False, "unreachable"
 
 # TODO(yashkatariya): Only works with User/Auto. Generalize it to work with
@@ -1957,7 +1975,9 @@ def modify_spec_for_auto_manual(spec, mesh) -> P:
                       else None)
   new_unreduced = {u for u in spec.unreduced
                    if mesh._name_to_type[u] == AxisType.Explicit}
-  return P(*new_spec, unreduced=new_unreduced)
+  new_reduced = {u for u in spec.reduced
+                 if mesh._name_to_type[u] == AxisType.Explicit}
+  return P(*new_spec, unreduced=new_unreduced, reduced=new_reduced)
 
 def _maybe_modify_sharding(sharding, ndim):
   if len(sharding.spec) == 0 or all(s is None for s in sharding.spec):
@@ -1965,7 +1985,7 @@ def _maybe_modify_sharding(sharding, ndim):
   elif sharding.mesh._are_all_axes_explicit:
     out = sharding
   else:
-    out = sharding.with_spec(modify_spec_for_auto_manual(
+    out = sharding.update(spec=modify_spec_for_auto_manual(
         sharding.spec, sharding.mesh))
   if len(out.spec) != ndim:
     out = _make_lengths_same(out, ndim)
@@ -2017,7 +2037,7 @@ def str_short_aval(shape, dtype, mesh, spec, vma,
   dt_str = dt_str.replace('void', 'float0')
   shapestr = _get_shape_sharding_str(shape, spec)
   mesh_axes = f'({mesh._axis_types_dict})' if mesh_axis_types else ''
-  vma_ur = _vma_ur_str(vma, spec.unreduced)
+  vma_ur = _vma_ur_str(vma, spec.unreduced, spec.reduced)
   return f'{dt_str}[{shapestr}]{vma_ur}{mesh_axes}'
 
 @cache(max_size=4096, trace_context_in_key=False)
@@ -2034,6 +2054,14 @@ def get_vma(vma, mesh):
           f" be of type `Manual`. Got axis: {i} of type {mesh._name_to_type[i]}")
   assert isinstance(vma, frozenset)
   return vma
+
+
+class SingleSideCollectiveEffect(effects.Effect):
+  __str__ = lambda _: "one-sided communication"
+
+
+single_side_collective_effect = SingleSideCollectiveEffect()
+effects.control_flow_allowed_effects.add_type(SingleSideCollectiveEffect)
 
 class ShapedArray(UnshapedArray):
   __slots__ = ['shape', 'sharding', 'vma']  # inherits slots from parent
@@ -2131,15 +2159,16 @@ def _get_shape_sharding_str(shape, spec):
 def _create_str(x, prefix):
   x_str = f"{','.join(i for i in x)}"
   x_str = x_str if len(x) == 1 else f"({x_str})"
-  return f"{prefix}:{x_str}"
+  return f"{prefix}:{x_str}, "
 
-def _vma_ur_str(vma, unreduced):
-  if not vma and not unreduced:
+def _vma_ur_str(vma, unreduced, reduced):
+  if not vma and not unreduced and not reduced:
     return ''
   vma_str = _create_str(vma, 'V') if vma else ''
   ur_str = _create_str(unreduced, 'U') if unreduced else ''
-  sep = ', ' if vma and unreduced else ''
-  return f"{{{vma_str}{sep}{ur_str}}}"
+  red_str = _create_str(reduced, 'R') if reduced else ''
+  m_str = f"{vma_str}{ur_str}{red_str}".rstrip(', ')
+  return f"{{{m_str}}}"
 
 def primal_dtype_to_tangent_dtype(primal_dtype):
   if isinstance(primal_dtype, dtypes.ExtendedDType):
@@ -2149,10 +2178,11 @@ def primal_dtype_to_tangent_dtype(primal_dtype):
   else:
     return primal_dtype
 
+def primal_spec_to_cotangent_spec(spec):
+  return P(*spec, unreduced=spec.reduced, reduced=spec.unreduced)
+
 def primal_sharding_to_cotangent_sharding(sharding):
-  new_spec = P(*sharding.spec, unreduced=sharding.spec.reduced,
-               reduced=sharding.spec.unreduced)
-  return sharding.with_spec(new_spec)
+  return sharding.update(spec=primal_spec_to_cotangent_spec(sharding.spec))
 
 def pvary(x, axis_name):
   if not axis_name:
@@ -2169,6 +2199,8 @@ pvary_p.def_impl(lambda *args, axes, axis_index_groups: args)
 def _pvary_abstract_eval(*args, axes, axis_index_groups):
   if not config._check_vma.value:
     return args
+  if any(a.sharding.spec.unreduced for a in args):
+    raise NotImplementedError('unreduced rule for pvary is not implemented.')
   assert isinstance(axes, tuple)
   arg_vma = [a.vma for a in args]
   # If there is intersection between arg_vma and axes, error
@@ -2193,8 +2225,12 @@ def standard_insert_pvary(*args):
   in_vma = [frozenset() if (aval := get_aval(a)) is abstract_token
             else aval.vma for a in args]  # pytype: disable=attribute-error
   out_vma = frozenset.union(*in_vma)
-  return [pvary(arg, tuple(n for n in out_vma if n not in src))
-          if out_vma - src else arg for arg, src in zip(args, in_vma)]
+  return [
+      pvary(arg, tuple(n for n in out_vma if n not in src))
+      if isinstance(get_aval(arg), ShapedArray) and out_vma - src
+      else arg
+      for arg, src in zip(args, in_vma)
+  ]
 
 def standard_vma_rule(prim_name, *avals, **kwargs) -> frozenset[AxisName]:
   if not config._check_vma.value:
@@ -2202,7 +2238,7 @@ def standard_vma_rule(prim_name, *avals, **kwargs) -> frozenset[AxisName]:
   avals = tuple(a for a in avals if a is not abstract_token)
   if not avals:
     return frozenset()
-  vma, *vmas = [a.vma for a in avals]
+  vma, *vmas = (a.vma for a in avals)
   if not all(vma == vma_ for vma_ in vmas):
     raise ValueError(
         f'Primitive {prim_name} requires varying manual axes '
@@ -2271,7 +2307,8 @@ class DShapedArray(UnshapedArray):
             and self.weak_type == other.weak_type)
 
   def __hash__(self):
-    return hash((self.shape, self.dtype, self.weak_type))
+    # We don't hash the contents of the shape because it may contain tracers.
+    return hash((len(self.shape), self.dtype, self.weak_type))
 
   def to_tangent_aval(self):
     return DShapedArray(self.shape, primal_dtype_to_tangent_dtype(self.dtype),
@@ -2773,7 +2810,7 @@ def _map_shaped_array(
   # assert axis is None or aval.shape[axis] == size
   if axis is None:
     return aval
-  sharding = aval.sharding.with_spec(tuple_delete(aval.sharding.spec, axis))
+  sharding = aval.sharding.update(spec=tuple_delete(aval.sharding.spec, axis))
   return ShapedArray(tuple_delete(aval.shape, axis), aval.dtype,
                      weak_type=aval.weak_type, sharding=sharding, vma=aval.vma)
 
@@ -2782,7 +2819,7 @@ def _unmap_shaped_array(
     ) -> ShapedArray:
   if axis is None: return aval
   elif type(axis) is int:
-    sharding = aval.sharding.with_spec(tuple_insert(
+    sharding = aval.sharding.update(spec=tuple_insert(
         aval.sharding.spec, axis, explicit_mesh_axis))
     return ShapedArray(tuple_insert(aval.shape, axis, size), aval.dtype,
                        weak_type=aval.weak_type, sharding=sharding,

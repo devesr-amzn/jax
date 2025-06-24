@@ -113,6 +113,10 @@ class CompilerParams(pallas_core.CompilerParams):
   lowering_semantics: mgpu.core.LoweringSemantics = mgpu.core.LoweringSemantics.Lane
 
   def __post_init__(self):
+    if self.dimension_semantics is not None:
+      object.__setattr__(
+          self, "dimension_semantics", tuple(self.dimension_semantics)
+      )
     if bool(self.profile_space) ^ bool(self.profile_dir):
       raise ValueError(
           "Either both profile_space and profile_dir must be set, or neither."
@@ -124,7 +128,7 @@ class MemorySpace(enum.Enum):
   GMEM = "gmem"
   #: Shared memory.
   SMEM = "smem"
-  #: Tensor memory.
+  #: Tensor memory. New addition to Blackwell. Not available on Hopper.
   TMEM = "tmem"
   #: Registers.
   REGS = "regs"
@@ -210,30 +214,6 @@ def kernel(
     )
     return outs[0] if unwrap_out else outs
   return wrapper
-
-
-def _is_known_divisible(value, divisor, fuel=10) -> bool:
-  """Returns True if the value is statically known to be divisible by the divisor."""
-  if divisor == 1:
-    return True
-  if fuel < 0:
-    return False
-  if not isinstance(value.owner, ir.Operation):
-    return False
-  def_op = value.owner.opview
-  match def_op:
-    case arith_dialect.IndexCastOp():
-      return _is_known_divisible(value.owner.operands[0], divisor, fuel - 1)
-    case arith_dialect.ConstantOp():
-      return ir.IntegerAttr(def_op.value).value % divisor == 0
-    case arith_dialect.MulIOp():
-      return (_is_known_divisible(value.owner.operands[0], divisor, fuel // 2) or
-              _is_known_divisible(value.owner.operands[1], divisor, (fuel + 1)// 2))
-    case arith_dialect.SelectOp():
-      return (_is_known_divisible(value.owner.operands[1], divisor, fuel // 2) and
-              _is_known_divisible(value.owner.operands[2], divisor, (fuel + 1)// 2))
-
-  return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -362,9 +342,9 @@ class AbstractRefUnion(pallas_core.AbstractMemoryRef):
     del tracer, index, value  # Unused.
     raise ValueError("Ref unions can't be assigned to.")
 
-  def update_vma(self, vma):
-    return AbstractRefUnion(self.inner_aval.update_vma(vma), self.refs,
-                            self.memory_space)
+  def update(self, inner_aval=None, memory_space=None):
+    ref = super().update(inner_aval, memory_space)
+    return AbstractRefUnion(ref.inner_aval, self.refs, self.memory_space)
 
 
 @dataclasses.dataclass(init=False, frozen=True)
@@ -503,7 +483,7 @@ class UntileRef(state_types.Transform):
               f" tiling ({tile})"
           )
         if isinstance(idx.base, ir.Value):
-          if not _is_known_divisible(idx.base, tile):
+          if not mgpu_utils.is_known_divisible(idx.base, tile):
             raise ValueError(
                 "Dynamic slice base index (which is a dynamic value) cannot be"
                 f" statically proven to be divisible by the tiling ({tile})"
@@ -942,14 +922,12 @@ class WGMMAAbstractAccumulatorRef(AbstractMemoryRef):
   def __repr__(self) -> str:
     return f'Accumulator{{{self.inner_aval.str_short()}}}'
 
-  def update_weak_type(self, weak_type):
-    return _as_accum(super().update_weak_type(weak_type))
-
-  def update_vma(self, vma):
-    return _as_accum(super().update_vma(vma))
-
   def update(self, inner_aval=None, memory_space=None):
-    return _as_accum(super().update(inner_aval=None, memory_space=None))
+    ref = super().update(inner_aval, memory_space)
+    return WGMMAAbstractAccumulatorRef(
+        inner_aval=ref.inner_aval,
+        memory_space=ref.memory_space,
+    )
 
   def _getitem(self, tracer, idx):
     from jax._src.pallas.mosaic_gpu.primitives import wgmma_accumulator_deref  # pytype: disable=import-error
@@ -961,12 +939,6 @@ class WGMMAAbstractAccumulatorRef(AbstractMemoryRef):
     return arr
 
 
-def _as_accum(ref) -> WGMMAAbstractAccumulatorRef:
-  return WGMMAAbstractAccumulatorRef(
-      inner_aval=ref.inner_aval,
-      memory_space=ref.memory_space,  # pytype: disable=attribute-error
-  )
-
 class AbstractTMEMRef(AbstractMemoryRef):
   __slots__ = ["inner_aval", "memory_space", "packed", "collective"]
 
@@ -977,6 +949,12 @@ class AbstractTMEMRef(AbstractMemoryRef):
 
   def __repr__(self) -> str:
     return f'TMEM({self.inner_aval.str_short()},packed={self.packed})'
+
+  def update(self, inner_aval=None, memory_space=None):
+    ref = super().update(inner_aval, memory_space)
+    return AbstractTMEMRef(
+        ref.inner_aval, ref.memory_space, self.packed, self.collective
+    )
 
 
 _WARPGROUP_AXIS_NAME = object()
@@ -1012,6 +990,10 @@ class Mesh:
           "Requested too many CUDA threads per block. Each Mosaic thread"
           " corresponds to 128 CUDA threads."
       )
+    object.__setattr__(self, "grid", tuple(self.grid))
+    object.__setattr__(self, "grid_names", tuple(self.grid_names))
+    object.__setattr__(self, "cluster", tuple(self.cluster))
+    object.__setattr__(self, "cluster_names", tuple(self.cluster_names))
 
   @property
   def backend(self) -> str:

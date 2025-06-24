@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -20,6 +22,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributeInterfaces.h"
 #include "mlir/IR/Diagnostics.h"
@@ -74,6 +77,32 @@ class TpuOpsVerificationTest : public ::testing::Test {
     return diag.ConsumeStatus();
   }
 
+  Type i32() { return builder_.getI32Type(); }
+
+  MemRefType GetMemRefType(
+      ArrayRef<int64_t> shape, Type element_type,
+      std::optional<MemorySpace> memory_space = std::nullopt) {
+    return MemRefType::get(
+        shape, element_type, nullptr,
+        memory_space.has_value()
+            ? MemorySpaceAttr::get(builder_.getContext(), *memory_space)
+            : Attribute());
+  }
+
+  Value AllocaI32(ArrayRef<int64_t> shape,
+                  std::optional<MemorySpace> memory_space = std::nullopt) {
+    return Create<memref::AllocaOp>(GetMemRefType(shape, i32(), memory_space))
+        .getMemref();
+  }
+
+  Value ConstantI32Vector(ArrayRef<int64_t> shape, ArrayRef<int32_t> values) {
+    return Create<arith::ConstantOp>(
+               /*result=*/VectorType::get(shape, i32()),
+               /*value=*/dyn_cast<TypedAttr>(
+                   builder().getDenseI32ArrayAttr(values)))
+        .getResult();
+  }
+
   ImplicitLocOpBuilder& builder() { return builder_; }
 
  private:
@@ -84,11 +113,10 @@ class TpuOpsVerificationTest : public ::testing::Test {
 
 TEST_F(TpuOpsVerificationTest, VectorLoadVerificationWorks) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
-  auto memref =
-      Create<memref::AllocaOp>(MemRefType::get({8}, builder().getI32Type()));
+  Value memref = AllocaI32({8});
   auto vl = Create<VectorLoadOp>(
-      /*result=*/VectorType::get({8}, builder().getI32Type()),
-      /*base=*/memref.getMemref(),
+      /*result=*/VectorType::get({8}, i32()),
+      /*base=*/memref,
       /*indices=*/ValueRange{c0},
       /*strides=*/builder().getDenseI32ArrayAttr({}),
       /*mask=*/nullptr);
@@ -99,11 +127,10 @@ TEST_F(TpuOpsVerificationTest, VectorLoadVerificationWorks) {
 TEST_F(TpuOpsVerificationTest,
        VectorLoadRankOfStridesDoesNotMatchBaseMemrefRank) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
-  auto memref =
-      Create<memref::AllocaOp>(MemRefType::get({8}, builder().getI32Type()));
+  Value memref = AllocaI32({8});
   auto vl = Create<VectorLoadOp>(
-      /*result=*/VectorType::get({8}, builder().getI32Type()),
-      /*base=*/memref.getMemref(),
+      /*result=*/VectorType::get({8}, i32()),
+      /*base=*/memref,
       /*indices=*/ValueRange{c0},
       /*strides=*/builder().getDenseI32ArrayAttr({1, 1, 1, 1}),
       /*mask=*/nullptr);
@@ -112,11 +139,10 @@ TEST_F(TpuOpsVerificationTest,
 
 TEST_F(TpuOpsVerificationTest, VectorLoadStridesFeatureNotImplemented) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
-  auto memref =
-      Create<memref::AllocaOp>(MemRefType::get({8}, builder().getI32Type()));
+  Value memref = AllocaI32({8});
   auto vl = Create<VectorLoadOp>(
-      /*result=*/VectorType::get({8}, builder().getI32Type()),
-      /*base=*/memref.getMemref(),
+      /*result=*/VectorType::get({8}, i32()),
+      /*base=*/memref,
       /*indices=*/ValueRange{c0},
       /*strides=*/builder().getDenseI32ArrayAttr({1}),
       /*mask=*/nullptr);
@@ -128,11 +154,10 @@ TEST_F(TpuOpsVerificationTest, VectorLoadStridesFeatureNotImplemented) {
 
 TEST_F(TpuOpsVerificationTest, VectorLoadBaseAndResultTypesDoNotMatch) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
-  auto memref =
-      Create<memref::AllocaOp>(MemRefType::get({8}, builder().getI32Type()));
+  Value memref = AllocaI32({8});
   auto vl = Create<VectorLoadOp>(
       /*result=*/VectorType::get({8}, builder().getF32Type()),
-      /*base=*/memref.getMemref(),
+      /*base=*/memref,
       /*indices=*/ValueRange{c0},
       /*strides=*/builder().getDenseI32ArrayAttr({}),
       /*mask=*/nullptr);
@@ -146,11 +171,10 @@ TEST_F(TpuOpsVerificationTest, VectorLoadBaseAndResultTypesDoNotMatch) {
 TEST_F(TpuOpsVerificationTest,
        VectorLoadRankOfIndicesDoesNotMatchBaseMemrefRank) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
-  auto memref =
-      Create<memref::AllocaOp>(MemRefType::get({8}, builder().getI32Type()));
+  Value memref = AllocaI32({8});
   auto vl = Create<VectorLoadOp>(
-      /*result=*/VectorType::get({8}, builder().getI32Type()),
-      /*base=*/memref.getMemref(),
+      /*result=*/VectorType::get({8}, i32()),
+      /*base=*/memref,
       /*indices=*/ValueRange{c0, c0, c0},
       /*strides=*/builder().getDenseI32ArrayAttr({}),
       /*mask=*/nullptr);
@@ -160,18 +184,15 @@ TEST_F(TpuOpsVerificationTest,
 
 TEST_F(TpuOpsVerificationTest, VectorLoadValidMaskSucceeds) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
-  auto memref = Create<memref::AllocaOp>(
-      MemRefType::get({8, 128}, builder().getI32Type()));
-  auto mask = Create<arith::ConstantOp>(
-      /*result=*/VectorType::get({8, 1}, builder().getI32Type()),
-      /*value=*/dyn_cast<TypedAttr>(
-          builder().getDenseI32ArrayAttr({1, 1, 1, 1, 1, 1, 1, 1})));
+  Value memref = AllocaI32({8, 128});
+  Value mask = ConstantI32Vector(/*shape=*/{8, 1},
+                                 /*values=*/{1, 1, 1, 1, 1, 1, 1, 1});
   auto vl = Create<VectorLoadOp>(
-      /*result=*/VectorType::get({8, 128}, builder().getI32Type()),
-      /*base=*/memref.getMemref(),
+      /*result=*/VectorType::get({8, 128}, i32()),
+      /*base=*/memref,
       /*indices=*/ValueRange{c0, c0},
       /*strides=*/builder().getDenseI32ArrayAttr({}),
-      /*mask=*/mask.getResult());
+      /*mask=*/mask);
 
   ASSERT_OK(VerifyOp(vl));
 }
@@ -180,16 +201,14 @@ TEST_F(TpuOpsVerificationTest, VectorLoadMaskInvalidResultBitWidth) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
   auto memref = Create<memref::AllocaOp>(
       MemRefType::get({8, 128}, builder().getI64Type()));
-  auto mask = Create<arith::ConstantOp>(
-      /*result=*/VectorType::get({8, 1}, builder().getI32Type()),
-      /*value=*/dyn_cast<TypedAttr>(
-          builder().getDenseI32ArrayAttr({1, 1, 1, 1, 1, 1, 1, 1})));
+  Value mask = ConstantI32Vector(/*shape=*/{8, 1},
+                                 /*values=*/{1, 1, 1, 1, 1, 1, 1, 1});
   auto vl = Create<VectorLoadOp>(
       /*result=*/VectorType::get({8, 128}, builder().getI64Type()),
       /*base=*/memref.getMemref(),
       /*indices=*/ValueRange{c0, c0},
       /*strides=*/builder().getDenseI32ArrayAttr({}),
-      /*mask=*/mask.getResult());
+      /*mask=*/mask);
 
   ASSERT_THAT(
       VerifyOp(vl),
@@ -201,17 +220,15 @@ TEST_F(TpuOpsVerificationTest, VectorLoadMaskInvalidResultBitWidth) {
 TEST_F(TpuOpsVerificationTest,
        VectorLoadMaskNotBroadcastableToResultShapeInvalidMinor) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
-  auto memref = Create<memref::AllocaOp>(
-      MemRefType::get({8, 128}, builder().getI32Type()));
-  auto mask = Create<arith::ConstantOp>(
-      /*result=*/VectorType::get({8, 2}, builder().getI32Type()),
-      /*value=*/dyn_cast<TypedAttr>(builder().getDenseI32ArrayAttr({1})));
+  Value memref = AllocaI32({8, 128});
+  Value mask = ConstantI32Vector(/*shape=*/{8, 2},
+                                 /*values=*/{1});
   auto vl = Create<VectorLoadOp>(
-      /*result=*/VectorType::get({8, 128}, builder().getI32Type()),
-      /*base=*/memref.getMemref(),
+      /*result=*/VectorType::get({8, 128}, i32()),
+      /*base=*/memref,
       /*indices=*/ValueRange{c0, c0},
       /*strides=*/builder().getDenseI32ArrayAttr({}),
-      /*mask=*/mask.getResult());
+      /*mask=*/mask);
 
   ASSERT_THAT(
       VerifyOp(vl),
@@ -223,17 +240,15 @@ TEST_F(TpuOpsVerificationTest,
 TEST_F(TpuOpsVerificationTest,
        VectorLoadMaskNotBroadcastableToResultShapeInvalidMajor) {
   auto c0 = Create<arith::ConstantIndexOp>(0);
-  auto memref = Create<memref::AllocaOp>(
-      MemRefType::get({8, 128}, builder().getI32Type()));
-  auto mask = Create<arith::ConstantOp>(
-      /*result=*/VectorType::get({5, 1}, builder().getI32Type()),
-      /*value=*/dyn_cast<TypedAttr>(builder().getDenseI32ArrayAttr({1})));
+  Value memref = AllocaI32({8, 128});
+  Value mask = ConstantI32Vector(/*shape=*/{5, 1},
+                                 /*values=*/{1});
   auto vl = Create<VectorLoadOp>(
-      /*result=*/VectorType::get({8, 128}, builder().getI32Type()),
-      /*base=*/memref.getMemref(),
+      /*result=*/VectorType::get({8, 128}, i32()),
+      /*base=*/memref,
       /*indices=*/ValueRange{c0, c0},
       /*strides=*/builder().getDenseI32ArrayAttr({}),
-      /*mask=*/mask.getResult());
+      /*mask=*/mask);
 
   ASSERT_THAT(
       VerifyOp(vl),

@@ -23,11 +23,13 @@ import math
 import os
 import pathlib
 import time
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Generic, TypeVar
+from collections.abc import Callable
 import weakref
 
 import itertools
 import jax
+from jax._src import lib
 from jax._src import sharding_impls
 from jax._src.interpreters import mlir
 from jax._src.lib import mosaic_gpu_dialect as dialect
@@ -54,20 +56,9 @@ from . import transform_inference
 from . import utils
 
 # MLIR can't find libdevice unless we point it to the CUDA path
-# TODO(apaszke): Unify with jax._src.lib.cuda_path
-cuda_root = "/usr/local/cuda"
+cuda_root = lib.cuda_path or "/usr/local/cuda"
+os.environ["CUDA_ROOT"] = cuda_root
 PYTHON_RUNFILES = os.environ.get("PYTHON_RUNFILES")
-if os.environ.get("CUDA_ROOT") is None:
-  if PYTHON_RUNFILES:
-    cuda_nvcc_root = os.path.join(PYTHON_RUNFILES, "cuda_nvcc")
-    if os.path.exists(cuda_nvcc_root):
-      cuda_root = cuda_nvcc_root
-  os.environ["CUDA_ROOT"] = cuda_root
-else:
-  cuda_root = os.environ["CUDA_ROOT"]
-
-PTXAS_PATH = os.path.join(cuda_root, "bin/ptxas")
-NVDISASM_PATH = os.path.join(cuda_root, "bin/nvdisasm")
 
 # This tracks the latest Mosaic GPU IR version with a monthly delay.
 FWD_COMPAT_IR_VERSION = 1
@@ -94,7 +85,21 @@ if RUNTIME_PATH and RUNTIME_PATH.exists():
 try:
   from nvidia import nvshmem
 except ImportError:
-  pass
+  # Try to find the nvshmem library in Bazel runfiles.
+  if PYTHON_RUNFILES:
+    libdevice_path = os.path.join(
+        PYTHON_RUNFILES, "nvidia_nvshmem", "lib", "libnvshmem_device.bc"
+    )
+    if os.path.exists(libdevice_path):
+      os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"] = libdevice_path
+    for root, _, files in os.walk(os.path.join(os.getcwd(), "_solib_local")):
+      if "libnvshmem_host.so.3" in files:
+        os.environ["MOSAIC_GPU_NVSHMEM_SO_PATH"] = os.path.join(
+            root, "libnvshmem_host.so.3"
+        )
+        break
+  else:
+    pass
 else:
   if os.environ.get("MOSAIC_GPU_NVSHMEM_BC_PATH") is None:
     os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"] = os.path.join(
@@ -413,9 +418,9 @@ def _construct_smem_reftree(
         )
         if layout is None:
           layout = tcgen05._infer_tmem_layout(
-              shape, 1 if packing is None else packing
+              shape, collective, 1 if packing is None else packing
           )
-        num_cols = layout.cols_in_shape(shape)
+        num_cols = layout.cols_in_shape(shape, utils.dtype_to_ir_type(dtype))
         tmem_allocs.append(_TMEMAlloc(addr_ref, num_cols, collective))
         def ref(addr_ref=addr_ref, shape=shape, dtype=dtype, layout=layout):
           addr = memref.load(addr_ref, [])
@@ -726,6 +731,10 @@ def as_gpu_kernel(
   elif not isinstance(inout_shape, tuple):
     inout_shape = (inout_shape,)
 
+  inout_shape = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
+                             inout_shape)
+  out_shape = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
+                           out_shape)
   module, out_shape, unwrap_output_tuple, launch_ctx = (
       _lower_as_gpu_kernel(
           body, grid, cluster, block, in_shape, out_shape, inout_shape,

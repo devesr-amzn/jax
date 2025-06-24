@@ -19,6 +19,7 @@ from collections.abc import Callable, Collection, Hashable, Sequence
 import contextlib
 import dataclasses
 import functools
+import operator
 import string
 from typing import Any, TypeVar
 
@@ -47,7 +48,7 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.lax import control_flow
 from jax._src.lax import lax as lax_internal
-from jax._src.lax.control_flow import for_loop, BranchesPlatforms
+from jax._src.lax.control_flow import BranchesPlatforms, for_loop
 from jax._src.lib import version as jaxlib_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith
@@ -58,10 +59,10 @@ from jax._src.lib.mlir.dialects import memref
 from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 from jax._src.pallas import core as pallas_core
+from jax._src.pallas import helpers as pallas_helpers
 from jax._src.pallas import pallas_call
 from jax._src.pallas import primitives
 from jax._src.pallas import utils as pallas_utils
-from jax._src.pallas import helpers as pallas_helpers
 from jax._src.pallas.mosaic import core as tpu_core
 from jax._src.pallas.mosaic import error_handling
 from jax._src.pallas.mosaic import primitives as tpu_primitives
@@ -1345,6 +1346,27 @@ def _indexer_to_start_size_stride(
   )
 
 
+def _compute_squeezed_dims(source_shape: Sequence[int], target_shape: Sequence[int]) -> Sequence[bool]:
+  # This function only exists to align the ``tpu.memref_squeeze`` layout
+  # inference logic between Python and MLIR.
+  result = []
+  source_index = len(source_shape) - 1
+  target_index = len(target_shape) - 1
+  while source_index >= 0 or target_index >= 0:
+    target_dim = target_shape[target_index] if target_index >= 0 else -1
+    assert source_index >= 0
+    if source_shape[source_index] == target_dim:
+      result.append(False)
+      source_index -= 1
+      target_index -= 1
+    else:
+      assert source_shape[source_index] == 1
+      result.append(True)
+      source_index -= 1
+  result.reverse()
+  return result
+
+
 def _slice_memref(
     ref: ir.Value,
     indexer: NDIndexer,
@@ -1352,7 +1374,6 @@ def _slice_memref(
     ref_block_shape: tuple[int | pallas_core.Squeezed, ...],
 ) -> tuple[ir.Value, tuple[int | pallas_core.Squeezed, ...]]:
   assert ref_block_shape is not None
-  target_shape = indexer.get_indexer_shape()
   starts, sizes, strides, squeeze_dims, ref_block_shape = (
       _indexer_to_start_size_stride(
           indexer,
@@ -1362,26 +1383,69 @@ def _slice_memref(
   )
   if not all((s is None or s == 1) for s in strides):
     raise NotImplementedError("Strided slices of references are unsupported.")
-  dynamic_sizes = tuple(s for s in sizes if isinstance(s, ir.Value))
+
   ir_dynamic_size = ir.ShapedType.get_dynamic_size()
-  static_sizes = tuple(s if not isinstance(s, ir.Value)
-                       else ir_dynamic_size for s in sizes)
-  target_ref_ty = ir.MemRefType.get(
-      static_sizes,
-      _dtype_to_ir_type(ref_dtype),
-      memory_space=ref.type.memory_space,
-  )
-  out = tpu.memref_slice(target_ref_ty, ref, starts, dynamic_sizes)
-  if any(squeeze_dims):
-    # We need to squeeze out some dimensions
-    static_sizes = tuple(s if not isinstance(s, ir.Value)
-                         else ir_dynamic_size for s in target_shape)
-    squeezed_ref_ty = ir.MemRefType.get(
-        static_sizes,
-        _dtype_to_ir_type(ref_dtype),
-        memory_space=ref.type.memory_space,
+  static_starts = []
+  for s in starts:
+    if not isinstance(s, ir.Value):
+      static_starts.append(s)
+    elif (v := _fold_and_get_constant_value(s)) is not None:
+      static_starts.append(v)
+    else:
+      static_starts.append(ir_dynamic_size)
+
+  static_sizes = []
+  dynamic_sizes = []
+  for s in sizes:
+    if not isinstance(s, ir.Value):
+      static_sizes.append(s)
+    elif (v := _fold_and_get_constant_value(s)) is not None:
+      static_sizes.append(v)
+    else:
+      static_sizes.append(ir_dynamic_size)
+      dynamic_sizes.append(s)
+
+  ref_ty = ir.MemRefType(ref.type)
+  ref_strides, ref_offset = ref_ty.get_strides_and_offset()
+  if ref_offset == ir_dynamic_size or ir_dynamic_size in static_starts:
+    target_offset = ir_dynamic_size
+  else:
+    target_offset = sum(
+        map(operator.mul, static_starts, ref_strides), ref_offset
     )
-    out = tpu.memref_squeeze(squeezed_ref_ty, out)
+  out_layout = (
+      ir.StridedLayoutAttr.get(target_offset, ref_strides)
+      if not is_cloud_tpu_older_than(2025, 6, 20)
+      else None
+  )
+  out_ty = ir.MemRefType.get(
+      static_sizes, ref_ty.element_type, out_layout, ref_ty.memory_space
+  )
+  out = tpu.memref_slice(out_ty, ref, starts, dynamic_sizes)
+  if any(squeeze_dims):
+    # We need to squeeze out some dimensions.
+    ref_ty = out_ty
+    del out_ty
+    ref_strides, ref_offset = ref_ty.get_strides_and_offset()
+    target_sizes = [dim for i, dim in enumerate(ref_ty.shape) if not squeeze_dims[i]]
+    del squeeze_dims
+    # We re-infer the squeezed dimensions to align with the tpu.memref_squeeze
+    # verification logic in MLIR in ambiguous cases, e.g. when squeezing
+    # from [1, 1, 128] to [1, 128].
+    squeeze_dims = _compute_squeezed_dims(ref_ty.shape, target_sizes)
+    target_strides = [s for i, s in enumerate(ref_strides) if not squeeze_dims[i]]
+    out_layout = (
+        ir.StridedLayoutAttr.get(ref_offset, target_strides)
+        if not is_cloud_tpu_older_than(2025, 6, 20)
+        else None
+    )
+    out_ty = ir.MemRefType.get(
+        target_sizes,
+        ref_ty.element_type,
+        out_layout,
+        ref_ty.memory_space,
+    )
+    out = tpu.memref_squeeze(out_ty, out)
   return out, ref_block_shape
 
 
@@ -2378,7 +2442,11 @@ def _gather_lowering_rule(
         operand_batching_dims=(1,),
         start_indices_batching_dims=(1,),
     ):
-      return tpu.dynamic_gather(x, recovered_indices, 0)
+      if jaxlib_version < (0, 6, 3):
+        # TODO: b/423649694 - Remove on 2025-07-18
+        return tpu.dynamic_gather(x, recovered_indices, 0)
+      else:
+        return tpu.dynamic_gather(x, recovered_indices, [0])
     if dimension_numbers == lax.GatherDimensionNumbers(
         offset_dims=(),
         collapsed_slice_dims=(1,),
@@ -2386,7 +2454,11 @@ def _gather_lowering_rule(
         operand_batching_dims=(0,),
         start_indices_batching_dims=(0,),
     ):
-      return tpu.dynamic_gather(x, recovered_indices, 1)
+      if jaxlib_version < (0, 6, 3):
+        # TODO: b/423649694 - Remove on 2025-07-18
+        return tpu.dynamic_gather(x, recovered_indices, 1)
+      else:
+        return tpu.dynamic_gather(x, recovered_indices, [1])
   raise NotImplementedError("Unsupported gather")
 
 

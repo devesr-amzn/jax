@@ -36,6 +36,7 @@ from jax._src import dispatch
 from jax._src import effects
 from jax._src import mesh as mesh_lib
 from jax._src import sharding_impls
+from jax._src import shard_map
 from jax._src import tree_util
 from jax._src import util
 from jax._src.interpreters import ad
@@ -474,7 +475,7 @@ def _inspect_sharding_lowering_rule(ctx: mlir.LoweringRuleContext, value, *,
   def _hlo_sharding_callback(hlo_sharding: xc.HloSharding):
     if mesh.empty:
       return callback(
-          sharding_impls._op_sharding_to_pos_sharding(hlo_sharding, devices))
+          sharding_impls.GSPMDSharding(devices, hlo_sharding))
     pspec = (P() if hlo_sharding.is_manual() else
              parse_flatten_op_sharding(hlo_sharding, mesh)[0])
     return callback(NamedSharding(mesh, pspec))
@@ -721,3 +722,22 @@ def visualize_array_sharding(arr, **kwargs):
   def _visualize(sharding):
     return visualize_sharding(arr.shape, sharding, **kwargs)
   inspect_array_sharding(arr, callback=_visualize)
+
+
+# TODO(mattjj): working around an apparent XLA or PjRt bug, remove eventually
+def _debug_callback_eager_rule(
+    mesh,
+    *args,
+    callback: Callable[..., Any],
+    effect: DebugEffect,
+    partitioned: bool,
+):
+  del effect
+  with core.eval_context():
+    all_blocks = zip(*map(list, args))
+  for (idx, device), blocks in zip(np.ndenumerate(mesh.devices), all_blocks):
+    callback(*blocks)
+  return []
+
+
+shard_map.eager_rules[debug_callback_p] = _debug_callback_eager_rule

@@ -78,6 +78,14 @@ _deprecations = {
         ),
         None,
     ),
+    # Finalized for JAX v0.7.0
+    "heap_profile": (
+        (
+            "jax.lib.xla_client.heap_profile was deprecated in JAX v0.6.0 and"
+            " removed in JAX v0.7.0"
+        ),
+        None,
+    ),
     # Added April 4 2025.
     "get_topology_for_devices": (
         (
@@ -85,13 +93,6 @@ _deprecations = {
             " v0.6.0 and will be removed in JAX v0.7.0"
         ),
         _xc.get_topology_for_devices,
-    ),
-    "heap_profile": (
-        (
-            "jax.lib.xla_client.heap_profile was deprecated in JAX v0.6.0 and"
-            " will be removed in JAX v0.7.0"
-        ),
-        _heap_profile,
     ),
     "mlir_api_version": (
         (
@@ -155,7 +156,6 @@ import typing as _typing
 
 if _typing.TYPE_CHECKING:
   get_topology_for_devices = _xc.get_topology_for_devices
-  heap_profile = _heap_profile
   mlir_api_version = 58
   Client = _xc.Client
   CompileOptions = _xc.CompileOptions

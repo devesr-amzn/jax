@@ -33,15 +33,20 @@ from typing import NamedTuple
 import numpy as np
 
 import jax
-import jax._src.numpy.lax_numpy as jnp
+from jax._src import core
+from jax._src import dtypes
+from jax._src import numpy as jnp
 import jax._src.numpy.linalg as jnp_linalg
+from jax._src.interpreters import mlir
 from jax._src.numpy import tensor_contractions
 from jax._src.numpy import reductions
 from jax._src.numpy import ufuncs
 from jax import lax
-from jax._src.lax import qdwh
+from jax._src.lax import control_flow
+from jax._src.lax import lax as lax_internal
 from jax._src.lax import linalg as lax_linalg
-from jax._src.lax.stack import Stack
+from jax._src.tpu.linalg import qdwh
+from jax._src.tpu.linalg.stack import Stack
 
 
 # QDWH-eigh is a recursive algorithm where the structure of the recursion
@@ -152,7 +157,7 @@ def _projector_subspace(P, H, n, rank, maxiter=2, swap=False):
   X = _mask(X, (n, rank))
 
   H_norm = jnp_linalg.norm(H)
-  thresh = 10.0 * float(jnp.finfo(X.dtype).eps) * H_norm
+  thresh = 10.0 * float(dtypes.finfo(X.dtype).eps) * H_norm
 
   # First iteration skips the matmul.
   def body_f_after_matmul(X):
@@ -443,7 +448,7 @@ def _eigh_work(H, n, termination_size, subset_by_index):
     # handle matrices with clusters of eigenvalues, including rank deficient
     # matrices. See Nakatsukasa and Higham section 5.2.
     norm = jnp_linalg.norm(H)
-    eps = jnp.asarray(jnp.finfo(H.dtype).eps, dtype=norm.dtype)
+    eps = jnp.asarray(dtypes.finfo(H.dtype).eps, dtype=norm.dtype)
     off_diag_norm = jnp_linalg.norm(
         H - jnp.diag(jnp.diag(ufuncs.real(H)).astype(H.dtype)))
     nearly_diagonal = off_diag_norm <= 5 * eps * norm
@@ -490,7 +495,7 @@ def _eigh_work(H, n, termination_size, subset_by_index):
   def loop_body(state):
     agenda, blocks, eigenvectors = state
     (offset, b), agenda = agenda.pop()
-    which = jnp.where(buckets < b, jnp.iinfo(np.int32).max, buckets)
+    which = jnp.where(buckets < b, dtypes.iinfo(np.int32).max, buckets)
     choice = jnp.argmin(which)
     return lax.switch(choice, branches, offset, b, agenda, blocks, eigenvectors)
 
@@ -573,3 +578,63 @@ def eigh(
     eig_vecs = eig_vecs[:, sort_idxs]
 
   return eig_vals, eig_vecs
+
+
+def _T(x: jax.Array) -> jax.Array:
+  return lax.transpose(x, (*range(x.ndim - 2), x.ndim - 1, x.ndim - 2))
+
+
+def _eigh_tpu_impl(x, *, lower, sort_eigenvalues, subset_by_index):
+  *_, m, n = x.shape
+  assert m == n, (m, n)
+
+  termination_size = 256
+  if not core.is_constant_dim(m):
+    # TODO: maybe we can relax the check below for shape polymorphism?
+    raise NotImplementedError(
+        "Shape polymorphism for native lowering for eigh is implemented "
+        f"only for the batch dimensions: {x.shape}")
+  if m <= termination_size and (
+      subset_by_index is None or subset_by_index == (0, n)
+  ):
+    eig_vals, eig_vecs = lax_linalg.eigh_jacobi(x, lower=lower,
+                                                sort_eigenvalues=sort_eigenvalues)
+    return eig_vecs, eig_vals
+
+  def eigh_qdwh(x):
+    if len(x.shape) > 2:
+      return control_flow.map(eigh_qdwh, x)
+
+    # We should only look at elements from the lower/upper triangle. Reflects
+    # that triangle into the other triangle to form a Hermitian matrix.
+    if lower:
+      mask = lax_internal._tri(bool, (n, n), 0)
+    else:
+      mask = lax.bitwise_not(lax_internal._tri(bool, (n, n), -1))
+    if dtypes.issubdtype(x.dtype, np.complexfloating):
+      re = lax.select(mask, lax.real(x), _T(lax.real(x)))
+      if lower:
+        im_mask = lax_internal._tri(bool, (n, n), -1)
+      else:
+        im_mask = lax.bitwise_not(lax_internal._tri(bool, (n, n), 0))
+      im = lax.imag(x)
+      im = lax.select(im_mask, im, lax.full_like(im, 0))
+      im = lax.select(mask, im, -_T(im))
+      x = lax.complex(re, im)
+    else:
+      x = lax.select(mask, x, _T(x))
+
+    return eigh(
+        x,
+        sort_eigenvalues=sort_eigenvalues,
+        termination_size=termination_size,
+        subset_by_index=subset_by_index,
+    )
+
+  eig_vals, eig_vecs = eigh_qdwh(x)
+  return eig_vecs, eig_vals
+
+
+mlir.register_lowering(
+    lax_linalg.eigh_p, mlir.lower_fun(_eigh_tpu_impl, multiple_results=True),
+    platform='tpu')

@@ -138,7 +138,7 @@ def any_axis_types_match(axis_types, ty: AxisType) -> bool:
   return any(t == ty for t in axis_types)
 
 
-class _BaseMesh:
+class BaseMesh:
   axis_names: tuple[MeshAxisName, ...]
   shape_tuple: tuple[tuple[str, int], ...]
   _axis_types: tuple[AxisType, ...]
@@ -214,10 +214,13 @@ class _BaseMesh:
     return dict(safe_zip(self.axis_names, self._axis_types))
 
 
+def _unpicke_mesh(devices, axis_names, axis_types):
+  return Mesh(devices, axis_names, axis_types)
+
 _mesh_object_dict = {}  # type: ignore
 
 
-class Mesh(_BaseMesh, contextlib.ContextDecorator):
+class Mesh(BaseMesh, contextlib.ContextDecorator):
   """Declare the hardware resources available in the scope of this manager.
 
   See the Distributed arrays and automatic parallelization tutorial
@@ -230,6 +233,8 @@ class Mesh(_BaseMesh, contextlib.ContextDecorator):
     axis_names: A sequence of resource axis names to be assigned to the
       dimensions of the ``devices`` argument. Its length should match the
       rank of ``devices``.
+    axis_types: and optional tuple of :class:`jax.sharding.AxisType` entries corresponding to
+      the ``axis_names``. See `Explicit Sharding`_ for more information.
 
   Examples:
 
@@ -244,13 +249,15 @@ class Mesh(_BaseMesh, contextlib.ContextDecorator):
     >>> arr = jax.device_put(inp, NamedSharding(mesh, P('x', 'y')))
     >>> out = jax.jit(lambda x: x * 2)(arr)
     >>> assert out.sharding == NamedSharding(mesh, P('x', 'y'))
+
+  .. _Explicit Sharding:  https://docs.jax.dev/en/latest/notebooks/explicit-sharding.html
   """
 
   devices: np.ndarray
   axis_names: tuple[MeshAxisName, ...]
 
   def __new__(cls, devices: np.ndarray | Sequence[xc.Device],
-              axis_names: str | Sequence[MeshAxisName], *,
+              axis_names: str | Sequence[MeshAxisName],
               axis_types: tuple[AxisType, ...] | None = None):
     if not isinstance(devices, np.ndarray):
       devices = np.array(devices)
@@ -284,8 +291,7 @@ class Mesh(_BaseMesh, contextlib.ContextDecorator):
     return self
 
   def __reduce__(self):
-    return (type(self), (self.devices, self.axis_names),
-            {'axis_types': self._axis_types})
+    return (_unpicke_mesh, (self.devices, self.axis_names, self._axis_types))
 
   def __eq__(self, other):
     # This is a performance optimization. Comparing thousands of devices
@@ -360,8 +366,6 @@ class Mesh(_BaseMesh, contextlib.ContextDecorator):
   def empty(self):
     return self.size == 0
 
-  # TODO(emilyaf): Remove this when the `enable_empty_arrays` flag is
-  # removed.
   @functools.cached_property
   def is_multi_process(self):
     return self.devices.size != len(self.local_devices)
@@ -431,7 +435,7 @@ class _ThreadResourcesLocalState(threading.local):
 thread_resources = _ThreadResourcesLocalState()
 
 
-class AbstractMesh(_BaseMesh):
+class AbstractMesh(BaseMesh):
   """AbstractMesh contains only axis names and axis sizes.
 
   It does not contain concrete devices compared to `jax.sharding.Mesh`. You
@@ -440,10 +444,20 @@ class AbstractMesh(_BaseMesh):
   your mesh shape and axis names stay the same but the devices change.
   See the description of https://github.com/jax-ml/jax/pull/23022 for more
   details.
+
+  Args:
+    axis_sizes: A tuple of integers specifying the size of each resource axis.
+    axis_names: A tuple of resource axis names to be assigned to the
+      dimensions of the ``devices`` argument. Its length should match the
+      rank of ``devices``.
+    axis_types: and optional tuple of :class:`jax.sharding.AxisType` entries corresponding to
+      the ``axis_names``. See `Explicit Sharding`_ for more information.
+
+  .. _Explicit Sharding:  https://docs.jax.dev/en/latest/notebooks/explicit-sharding.html
   """
 
   def __init__(self, axis_sizes: tuple[int, ...], axis_names: tuple[str, ...],
-               *, axis_types: AxisType | tuple[AxisType, ...] | None = None):
+               axis_types: AxisType | tuple[AxisType, ...] | None = None):
     self.axis_sizes = axis_sizes
     self.axis_names = axis_names
     self._size = math.prod(self.axis_sizes) if self.axis_sizes else 0
@@ -558,7 +572,7 @@ class UseAbstractMeshContextManager:
 
 use_abstract_mesh = UseAbstractMeshContextManager
 
-def get_abstract_mesh():
+def get_abstract_mesh() -> AbstractMesh:
   val = jax_config.abstract_mesh_context_manager.value
   return empty_abstract_mesh if val is None else val
 

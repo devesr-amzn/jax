@@ -21,7 +21,8 @@ import dataclasses
 import enum
 import functools
 import threading
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Protocol
+from collections.abc import Callable, Sequence
 
 import jax
 from jax import lax
@@ -841,6 +842,7 @@ register_binop_rule(lax.xor_p)
 register_binop_rule(lax.and_p)
 register_binop_rule(lax.shift_right_logical_p)
 register_binop_rule(ad_util.add_any_p)
+register_binop_rule(lax.pow_p)
 
 
 @register_eval_rule(lax.select_n_p)
@@ -1364,9 +1366,13 @@ def _broadcast_in_dim_usage_rule(ctx, used_out: set[Usage], **params):
 
 @register_eval_rule(lax.broadcast_in_dim_p)
 def _broadcast_in_dim_eval_rule(
-    eval_ctx: KernelEvalContext, x, broadcast_dimensions, **params
+    eval_ctx: KernelEvalContext, x, broadcast_dimensions, shape, **params
 ):
   del params  # Unused.
+  in_shape = eval_ctx.avals_in[0].shape  # pytype: disable=attribute-error
+  if in_shape == shape:
+    # Dummy broadcast
+    return x
   shape = tuple(map(_block_size, eval_ctx.out_block_specs[0].block_shape))
   dims = tuple(
       d - sum(s is None for s in shape[:d])
@@ -1827,6 +1833,71 @@ def _custom_jvp_call_pull_block_spec_rule(
   return in_block_specs
 
 
+@register_usage_rule(custom_derivatives.custom_vjp_call_p)
+def _custom_vjp_call_usage_rule(
+    ctx, used_out: list[set[Usage]], *, call_jaxpr: core.ClosedJaxpr, **_
+):
+  del ctx
+  read_usage_env = compute_usage(call_jaxpr.jaxpr, used_out)
+  in_usages = util.safe_map(read_usage_env, call_jaxpr.jaxpr.invars)
+  return in_usages
+
+
+@register_eval_rule(custom_derivatives.custom_vjp_call_p)
+def _custom_vjp_call_eval_rule(
+    ctx: KernelEvalContext, *args, call_jaxpr: core.ClosedJaxpr, **kwargs
+):
+  jaxpr, consts = call_jaxpr.jaxpr, call_jaxpr.consts
+  if consts:
+    raise NotImplementedError('custom_vjp_call with consts not supported yet')
+  out_tree = tree_util.tree_structure(tuple(jaxpr.outvars))
+  in_tree = tree_util.tree_structure((tuple(jaxpr.invars), {}))
+
+  def read_usage_env(_: core.Var):
+    return {Usage.REGULAR}
+
+  _, env, _ = _pull_block_spec(
+      jaxpr,
+      ctx.out_block_specs,
+      scalar_prefetch_handler=ctx.scalar_prefetch_handler,
+      grid=ctx.grid,
+      read_usage_env=read_usage_env,
+  )
+  kernel_fn = make_kernel_function(
+      jaxpr,
+      (),
+      in_tree,
+      out_tree,
+      read_usage_env,
+      ctx.in_block_specs,
+      env,
+      ctx.scalar_prefetch_handler,
+      ctx.grid,
+  )
+  return kernel_fn(ctx.get_program_ids(), ctx.scalar_prefetch, *args)
+
+
+@register_pull_block_spec_rule(custom_derivatives.custom_vjp_call_p)
+def _custom_vjp_call_pull_block_spec_rule(
+    ctx: PullRuleContext, out_block_specs, *, call_jaxpr, **kwargs
+):
+  jaxpr, consts = call_jaxpr.jaxpr, call_jaxpr.consts
+  if consts:
+    raise NotImplementedError('custom_vjp_call with consts not supported yet')
+
+  def read_usage_env(_: core.Var):
+    return {Usage.REGULAR}
+
+  in_block_specs, _, _ = _pull_block_spec(
+      jaxpr,
+      out_block_specs,
+      scalar_prefetch_handler=ctx.scalar_prefetch_handler,
+      grid=ctx.grid,
+      read_usage_env=read_usage_env,
+  )
+  return in_block_specs
+
+
 def push_block_spec(
     f: Callable,
     *in_spec_args,
@@ -1968,6 +2039,7 @@ register_binop_push_rule(lax.lt_p)
 register_binop_push_rule(lax.eq_p)
 register_binop_push_rule(lax.gt_p)
 register_binop_push_rule(lax.and_p)
+register_binop_push_rule(lax.pow_p)
 register_binop_push_rule(ad_util.add_any_p)
 
 
@@ -2038,6 +2110,21 @@ def _custom_jvp_call_push_rule(
     ctx, *block_specs, call_jaxpr: core.ClosedJaxpr, **_
 ):
   assert not call_jaxpr.consts
+  return _push_block_spec_jaxpr(call_jaxpr.jaxpr, *block_specs)
+
+
+@register_push_block_spec_rule(custom_derivatives.custom_vjp_call_p)
+def _custom_vjp_call_push_rule(
+    ctx,
+    *block_specs,
+    call_jaxpr: core.ClosedJaxpr,
+    num_consts,
+    fwd_jaxpr_thunk,
+    bwd,
+    out_trees,
+    symbolic_zeros,
+):
+  del ctx, num_consts, fwd_jaxpr_thunk, bwd, out_trees, symbolic_zeros
   return _push_block_spec_jaxpr(call_jaxpr.jaxpr, *block_specs)
 
 

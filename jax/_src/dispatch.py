@@ -45,7 +45,7 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.interpreters import xla
 from jax._src.api_util import InternalFloatingPointError
-from jax._src.layout import DeviceLocalLayout, Format
+from jax._src.layout import Layout, Format
 from jax._src.lib import xla_client as xc
 from jax._src.mesh import AbstractMesh, Mesh
 from jax._src.monitoring import record_scalar, record_event_duration_secs, record_event_time_span
@@ -385,8 +385,11 @@ def _is_supported_cross_host_transfer(ndim, src_sharding, dst_sharding):
   backend = xla_bridge.get_backend()
   # There is experimental support for cross-host device transfers on TFRT TPU
   # backends only.
-  if (xla_bridge.process_count() == 1 or backend.platform != "tpu" or
-      not backend.platform_version.startswith("TFRT TPU")):
+  # TODO: https://github.com/jax-ml/jax/issues/26645 - Allow backends to be
+  # queried for their cross-host transfer support.
+  if (xla_bridge.process_count() == 1 or backend.platform not in {"gpu", "tpu"}
+      or (backend.platform == "gpu" and not backend.platform_version.startswith("cuda"))
+      or (backend.platform == "tpu" and not backend.platform_version.startswith("TFRT TPU"))):
     return False
   if (src_sharding._internal_device_list.device_kind !=
       dst_sharding._internal_device_list.device_kind):
@@ -535,16 +538,16 @@ def _device_put_impl(
 
   if isinstance(device, Format):
     l = device
-    dll = l.device_local_layout
-    x_dll = x.format.device_local_layout if hasattr(x, 'format') else None
+    dll = l.layout
+    x_dll = x.format.layout if hasattr(x, 'format') else None
     if dll is None and l.sharding is None:
       return _device_put_sharding_impl(x, aval, l.sharding, copy)
     if (not isinstance(l.sharding, Sharding) or
-        not isinstance(dll, (DeviceLocalLayout, type(None)))):
+        not isinstance(dll, (Layout, type(None)))):
       raise ValueError(
-          "sharding and device_local_layout in `Layout` instance should be"
+          "sharding and layout in `Layout` instance should be"
           f" concrete. Got layout: {l} for input {aval.str_short()}")
-    if (getattr(x, 'layout', None) == l and getattr(x, '_committed', False) and
+    if (getattr(x, 'format', None) == l and getattr(x, '_committed', False) and
         copy == CopySemantics.ALIAS):
       return x
     if x_dll is None and dll is None:
@@ -614,7 +617,7 @@ def _device_put_transpose(cts, *_, devices, srcs, copy_semantics):
         assert cp == CopySemantics.COPY
         new_copy_semantics.append(CopySemantics.COPY)
     ys = device_put_p.bind(*args, devices=srcs, srcs=devices,
-                           copy_semantics=new_copy_semantics)
+                           copy_semantics=tuple(new_copy_semantics))
     for i, y in zip(indices, ys):
       results[i] = y
   return results

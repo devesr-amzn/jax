@@ -16,6 +16,23 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
 
 ## Unreleased
 
+* Breaking changes:
+  * {func}`jax.jit` now requires `fun` to be passed by position, and additional
+    arguments to be passed by keyword. Doing otherwise will result in an error
+    starting in v0.7.x. This raised a DeprecationWarning in v0.6.x.
+  * The minimum Python version is now 3.11. 3.11 will remain the minimum
+    supported version until July 2026.
+  * Layout API renames:
+    * `Layout`, `.layout`, `.input_layouts` and `.output_layouts` have been
+      renamed to `Format`, `.format`, `.input_formats` and `.output_formats`
+    * `DeviceLocalLayout`, `.device_local_layout` have been renamed to `Layout`
+      and `.layout`
+* Deprecations:
+  * {obj}`jax.dlpack.SUPPORTED_DTYPES` is deprecated; please use the new
+    {func}`jax.dlpack.is_supported_dtype` function.
+
+## JAX 0.6.2 (June 17, 2025)
+
 * New features:
   * Added {func}`jax.tree.broadcast` which implements a pytree prefix broadcasting helper.
 

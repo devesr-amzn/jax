@@ -306,15 +306,19 @@ def _run_scoped_resource_estimator(
     elif aval.memory_space == gpu_core.TMEM:
       if len(aval.shape) != 2:
         raise ValueError(f"TMEM allocations must be 2D. Got {aval.shape}")
-      if aval.shape[0] % tcgen05.TMEM_ROWS != 0:
+      if aval.shape[0] not in (64, 128):
         raise ValueError(
-            f"TMEM shape[0] must be a multiple of 128. Got {aval.shape[0]}.")
+            f"TMEM shape[0] must be 64 or 128. Got {aval.shape[0]}.")
       if aval.packed:
         packing = 4 // aval.dtype.itemsize
       else:
         packing = 1
-      layout = tcgen05._infer_tmem_layout(aval.shape, packing=packing)
-      cols_used = layout.cols_in_shape(aval.shape)
+      layout = tcgen05._infer_tmem_layout(
+          aval.shape, aval.collective, packing=packing
+      )
+      cols_used = layout.cols_in_shape(
+          aval.shape, mgpu_utils.dtype_to_ir_type(aval.dtype)
+      )
       cols_used = tcgen05._alloc_ncols(cols_used, exact=False)
       if aval.collective:
         rs += Resources(tmem_collective_scratch_cols=cols_used)
@@ -451,8 +455,11 @@ class ModuleContext:
     else:
       packing = 1
     if layout is None:
-      layout = tcgen05._infer_tmem_layout(struct.shape, packing=packing)
-    unpadded_cols_used = layout.cols_in_shape(struct.shape)
+      layout = tcgen05._infer_tmem_layout(
+          struct.shape, collective, packing=packing
+      )
+    mlir_dtype = mgpu_utils.dtype_to_ir_type(struct.dtype)
+    unpadded_cols_used = layout.cols_in_shape(struct.shape, mlir_dtype)
     cols_used = tcgen05._alloc_ncols(unpadded_cols_used, exact_cols)
     if collective:
       off = arith_dialect.addi(
@@ -466,7 +473,7 @@ class ModuleContext:
     tmem_ref = tcgen05.TMEMRef(
         address=off,
         shape=struct.shape,
-        dtype=mgpu_utils.dtype_to_ir_type(struct.dtype),
+        dtype=mlir_dtype,
         layout=layout)
     if collective:
       self.tmem_collective_used_cols += cols_used
@@ -947,12 +954,12 @@ def lower_jaxpr_to_module(
     # Each range is 2 events, each event is 4 bytes.
     prof_spec = mgpu_profiler.ProfilerSpec(params.profile_space * 2 * 4)
     prof_ctx = ProfilerContext(params.profile_dir, prof_spec)
-  mgpu_grid = tuple(map(operator.mul, parallel_grid, cluster))
+  cuda_grid = tuple(map(operator.mul, parallel_grid, cluster))
   semaphores_shape = ()
   if rs.gmem_semaphores:
     semaphores_shape = (
         jax.ShapeDtypeStruct(
-            shape=(math.prod(mgpu_grid) * rs.gmem_semaphores,), dtype=np.int32
+            shape=(math.prod(cuda_grid) * rs.gmem_semaphores,), dtype=np.int32
         ),
     )
   # NOTE: new_out_shapes has out_shapes, then semaphores_shape and
@@ -960,7 +967,7 @@ def lower_jaxpr_to_module(
   module, new_out_shapes, _, launch_ctx = (
       mgpu_core._lower_as_gpu_kernel(
           body,
-          grid=mgpu_grid,
+          grid=cuda_grid,
           cluster=cluster,
           block=block,
           in_shapes=(*in_shapes, *semaphores_shape),
@@ -988,7 +995,7 @@ def lower_jaxpr_to_module(
   launch_ctx.scratch.finalize_size()
 
   return LoweringResult(
-      module, parallel_grid, block, new_out_shapes, prof_ctx, semaphores_shape
+      module, cuda_grid, block, new_out_shapes, prof_ctx, semaphores_shape
   )
 
 

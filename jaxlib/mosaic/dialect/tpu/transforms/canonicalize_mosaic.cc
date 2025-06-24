@@ -17,7 +17,6 @@ limitations under the License.
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -71,16 +70,50 @@ struct CanonicalizeContext {
   std::array<int64_t, 2> target_shape;
 };
 
-Value create_transpose_op(const CanonicalizeContext &ctx,
-                          ImplicitLocOpBuilder &builder, VectorType input_ty,
-                          Value input, ArrayRef<int64_t> permutation);
+using canonicalize_rule_type = std::function<FailureOr<Value>(
+    const CanonicalizeContext &ctx, Operation &op)>;
+const llvm::StringMap<canonicalize_rule_type> &rules();
+
+class CanonicalBuilder : public ImplicitLocOpBuilder {
+ public:
+  CanonicalBuilder(const CanonicalizeContext &ctx, Location loc, Operation *op)
+      : ImplicitLocOpBuilder(loc, op), ctx_(ctx), op_(op) {}
+
+  template <typename Op, typename... Args>
+  Value create(Location loc, Args &&...args) {
+    Op new_op = OpBuilder::create<Op>(loc, std::forward<Args>(args)...);
+    // We perform a one-level check to avoid infinite recursion when recreating
+    // the canonicalized operation. However, if there is an op that in its
+    // canonicalization rule creates another op and vice versa, it will still
+    // lead to infinite loops.
+    if (auto rule_it = rules().find(Op::getOperationName());
+        !isa<Op>(op_) && rule_it != rules().end()) {
+      const canonicalize_rule_type &rule = rule_it->getValue();
+      FailureOr<Value> result = rule(ctx_, *new_op);
+      // We should not be creating uncanonicalizable ops inside this pass.
+      CHECK(succeeded(result));
+      return *result;
+    }
+    return new_op.getResult();
+  }
+
+  template <typename Op, typename... Args>
+  Value create(Args &&...args) {
+    return create<Op>(getLoc(), std::forward<Args>(args)...);
+  }
+
+ private:
+  const CanonicalizeContext &ctx_;
+  Operation *op_;
+};
 
 bool need_elementwise_canonicalization(const CanonicalizeContext &ctx,
                                        Operation &op);
 
-LogicalResult tpu_matmul_rule(const CanonicalizeContext &ctx,
-                              tpu::MatmulOp op) {
-  ImplicitLocOpBuilder builder(op.getLoc(), op.getOperation());
+FailureOr<Value> canonicalize_matmul(const CanonicalizeContext &ctx,
+                                     Operation &raw_op) {
+  auto op = cast<tpu::MatmulOp>(raw_op);
+  CanonicalBuilder builder(ctx, op.getLoc(), op.getOperation());
 
   auto transpose_lhs = op.getTransposeLhs();
   auto transpose_rhs = op.getTransposeRhs();
@@ -150,11 +183,8 @@ LogicalResult tpu_matmul_rule(const CanonicalizeContext &ctx,
     if (ty.getElementType().getIntOrFloatBitWidth() == 32) {
       ext_ele = element;
     } else {
-      ext_ele = cast<TypedValue<VectorType>>(
-          builder
-              .create<arith::ExtSIOp>(
-                  VectorType::get(shape, builder.getI32Type()), element)
-              .getResult());
+      ext_ele = cast<TypedValue<VectorType>>(builder.create<arith::ExtSIOp>(
+          VectorType::get(shape, builder.getI32Type()), element));
     }
     // TODO(mvoz): Go to bf16 when hardware supported, requires adding support
     // for 16 bitwidth in extsiop in infer/apply.
@@ -183,12 +213,12 @@ LogicalResult tpu_matmul_rule(const CanonicalizeContext &ctx,
     if (lhs_element_type.isInteger()) {
       auto float_lhs = extsi_sitofp(lhs);
       op->setOperand(0, float_lhs);
-      lhs = cast<TypedValue<VectorType>>(float_lhs.getResult());
+      lhs = cast<TypedValue<VectorType>>(float_lhs);
     }
     if (rhs_element_type.isInteger()) {
       auto float_rhs = extsi_sitofp(rhs);
       op->setOperand(1, float_rhs);
-      rhs = cast<TypedValue<VectorType>>(float_rhs.getResult());
+      rhs = cast<TypedValue<VectorType>>(float_rhs);
     }
   }
   // TODO(mvoz): Add more invariants.
@@ -267,17 +297,16 @@ LogicalResult tpu_matmul_rule(const CanonicalizeContext &ctx,
 
       const SmallVector<int64_t> perm_vec =
           SmallVector<int64_t>(perm.begin(), perm.end());
-      lhs = create_transpose_op(ctx, builder, lhs_ty_transposed, lhs, perm_vec);
+      lhs = builder.create<tpu::TransposeOp>(lhs_ty_transposed, lhs, perm_vec);
     }
     auto ddn = defaultDimensionNumbers(builder, /*transpose_lhs=*/false,
                                        transpose_rhs);
     // transpose flags are always false here, because ddn takes precedence
     // after this pass.
-    auto matmul_res = builder.create<tpu::MatmulOp>(
+    return builder.create<tpu::MatmulOp>(
         op.getLoc(), acc.getType(), lhs, rhs, acc,
         /*transpose_lhs=*/false,
         /*transpose_rhs=*/false, precision_attr, ddn);
-    return matmul_res;
   };
 
   // If we have a batch_size, we want to slice rhs and lhs [:batch_size],
@@ -287,25 +316,21 @@ LogicalResult tpu_matmul_rule(const CanonicalizeContext &ctx,
     std::vector<Value> outputs;
 
     for (int64_t i = 0; i < batch_size; ++i) {
-      auto sliced_lhs = builder.create<vector::ExtractOp>(op.getLoc(), lhs,
-                                                          ArrayRef<int64_t>{i});
-      auto sliced_rhs = builder.create<vector::ExtractOp>(op.getLoc(), rhs,
-                                                          ArrayRef<int64_t>{i});
+      auto sliced_lhs =
+          builder.create<vector::ExtractOp>(lhs, ArrayRef<int64_t>{i});
+      auto sliced_rhs =
+          builder.create<vector::ExtractOp>(rhs, ArrayRef<int64_t>{i});
+      auto sliced_acc =
+          builder.create<vector::ExtractOp>(acc, ArrayRef<int64_t>{i});
 
-      auto sliced_acc = builder.create<vector::ExtractOp>(op.getLoc(), acc,
-                                                          ArrayRef<int64_t>{i});
-
-      auto matmul_res =
-          dot_dim_matmul(sliced_lhs.getResult(), sliced_rhs.getResult(),
-                         sliced_acc.getResult());
+      auto matmul_res = dot_dim_matmul(sliced_lhs, sliced_rhs, sliced_acc);
       auto res_ty = cast<VectorType>(matmul_res.getType());
       auto res_shape = res_ty.getShape();
       // reshape to 1x[prior_shape]
       auto reshape_shape = llvm::to_vector(res_shape);
       reshape_shape.insert(reshape_shape.begin(), 1);
       auto shape_cast = builder.create<vector::ShapeCastOp>(
-          op.getLoc(), VectorType::get(reshape_shape, res_ty.getElementType()),
-          matmul_res);
+          VectorType::get(reshape_shape, res_ty.getElementType()), matmul_res);
       outputs.push_back(shape_cast);
     }
     // Technically almost identical to the case where batch_size is 1, but
@@ -313,24 +338,24 @@ LogicalResult tpu_matmul_rule(const CanonicalizeContext &ctx,
     if (batch_size == 1) {
       op.replaceAllUsesWith(outputs[0]);
       op.erase();
-      return success();
+      return outputs[0];
     }
-    auto output = builder
-                      .create<tpu::ConcatenateOp>(op.getLoc(), acc_ty, outputs,
-                                                  /*dimension=*/0)
-                      .getResult();
+    auto output =
+        builder.create<tpu::ConcatenateOp>(acc_ty, outputs, /*dimension=*/0);
     op.replaceAllUsesWith(output);
     op.erase();
+    return output;
   } else {
-    auto matmul_res = dot_dim_matmul(lhs, rhs, acc).getResult();
+    auto matmul_res = dot_dim_matmul(lhs, rhs, acc);
     op.replaceAllUsesWith(matmul_res);
     op.erase();
+    return matmul_res;
   }
-  return success();
+  return op.getResult();
 };
 
-LogicalResult canonicalize_elementwise(const CanonicalizeContext &ctx,
-                                       Operation &op) {
+FailureOr<Value> canonicalize_elementwise(const CanonicalizeContext &ctx,
+                                          Operation &op) {
   OpBuilder builder(&op);
   auto operands = op.getOperands();
   auto res_ty = dyn_cast<VectorType>(op.getResult(0).getType());
@@ -398,21 +423,24 @@ LogicalResult canonicalize_elementwise(const CanonicalizeContext &ctx,
     auto new_res_ty =
         VectorType::get(shape, should_truncate ? builder.getF32Type()
                                                : res_ty.getElementType());
-    auto new_op = builder.create(op.getLoc(), op.getName().getIdentifier(),
-                                 new_operands, new_res_ty, op.getAttrs());
+    // NOTE: We don't canonicalize recursively here
+    Operation *new_op =
+        builder.create(op.getLoc(), op.getName().getIdentifier(), new_operands,
+                       new_res_ty, op.getAttrs());
     if (should_truncate) {
       new_op = builder.create<arith::TruncFOp>(op.getLoc(), res_ty,
                                                new_op->getResult(0));
     }
     op.replaceAllUsesWith(new_op);
     op.erase();
+    return new_op->getResult(0);
   }
-  return success();
+  return op.getResult(0);
 }
 
-LogicalResult canonicalize_multi_dim_reduction(const CanonicalizeContext &ctx,
-                                               Operation &operation) {
-  ImplicitLocOpBuilder builder(operation.getLoc(), &operation);
+FailureOr<Value> canonicalize_multi_dim_reduction(
+    const CanonicalizeContext &ctx, Operation &operation) {
+  CanonicalBuilder builder(ctx, operation.getLoc(), &operation);
   auto op = cast<vector::MultiDimReductionOp>(operation);
   auto source_ty = op.getSourceVectorType();
   auto result_ty = dyn_cast<VectorType>(op.getDestType());
@@ -422,7 +450,7 @@ LogicalResult canonicalize_multi_dim_reduction(const CanonicalizeContext &ctx,
 
   auto element_type = source_ty.getElementType();
   if (element_type.isF32()) {
-    return success();
+    return operation.getResult(0);
   } else if (element_type.isBF16()) {
     bool reduces_sublanes = false;
     for (int64_t dim : op.getReductionDims()) {
@@ -437,51 +465,32 @@ LogicalResult canonicalize_multi_dim_reduction(const CanonicalizeContext &ctx,
 
       auto result_ty_f32 =
           VectorType::get(result_ty.getShape(), builder.getF32Type());
-      auto acc_ext = builder.create<arith::ExtFOp>(result_ty_f32, op.getAcc());
-      Value new_acc = acc_ext.getResult();
-      // Try to constant fold.
-      if (auto const_acc = op.getAcc().getDefiningOp<arith::ConstantOp>()) {
-        auto result =
-            acc_ext.fold(arith::ExtFOp::FoldAdaptor(const_acc.getValue()));
-        if (!result.isNull() && result.is<Attribute>()) {
-          acc_ext->erase();
-          new_acc = builder.create<arith::ConstantOp>(
-              op.getLoc(), result_ty_f32,
-              cast<TypedAttr>(result.get<Attribute>()));
-        }
-      }
+      // createOrFold does not trigger recursive canonicalization, but
+      // extensions to f32 are always supported.
+      Value new_acc =
+          builder.createOrFold<arith::ExtFOp>(result_ty_f32, op.getAcc());
       auto new_op = builder.create<vector::MultiDimReductionOp>(
           op.getLoc(), new_acc.getType(), op.getKindAttr(), new_source, new_acc,
           DenseI64ArrayAttr::get(builder.getContext(), op.getReductionDims()));
-      auto new_result = builder.create<arith::TruncFOp>(op.getLoc(), result_ty,
-                                                        new_op.getResult());
-      op.replaceAllUsesWith(new_result.getResult());
+      auto new_result =
+          builder.create<arith::TruncFOp>(op.getLoc(), result_ty, new_op);
+      op.replaceAllUsesWith(new_result);
       op.erase();
+      return new_result;
     }
-    return success();
+    return operation.getResult(0);
   } else if (element_type.isSignlessInteger(32) &&
              // TODO(b/384774084): Add support for u32 reductions.
              (op.getKind() == vector::CombiningKind::ADD ||
               op.getKind() == vector::CombiningKind::MAXSI ||
               op.getKind() == vector::CombiningKind::MINSI)) {
-    return success();
+    return operation.getResult(0);
   }
-  op.emitOpError("Unsupported element type for the selected reduction");
-  return failure();
+  return op.emitOpError("Unsupported element type for the selected reduction");
 }
 
-LogicalResult canonicalize_matmul(const CanonicalizeContext &ctx,
-                                  Operation &op) {
-  auto matmul_op = dyn_cast<tpu::MatmulOp>(op);
-  if (!matmul_op) {
-    op.emitOpError("Invariant violated: Not a matmul");
-    return failure();
-  }
-  return tpu_matmul_rule(ctx, matmul_op);
-};
-
-LogicalResult canonicalize_contraction(const CanonicalizeContext &ctx,
-                                       Operation &op) {
+FailureOr<Value> canonicalize_contraction(const CanonicalizeContext &ctx,
+                                          Operation &op) {
   auto contraction_op = dyn_cast<vector::ContractionOp>(op);
   if (!contraction_op) {
     op.emitOpError("Invariant violated: Not a contraction");
@@ -502,8 +511,8 @@ LogicalResult canonicalize_contraction(const CanonicalizeContext &ctx,
     return failure();
   }
 
-  ImplicitLocOpBuilder builder(contraction_op->getLoc(),
-                               contraction_op.getOperation());
+  CanonicalBuilder builder(ctx, contraction_op->getLoc(),
+                           contraction_op.getOperation());
 
   MLIRContext *const mlir_ctx = contraction_op->getContext();
 
@@ -543,18 +552,17 @@ LogicalResult canonicalize_contraction(const CanonicalizeContext &ctx,
   const auto dot_dimension_numbers_attr =
       defaultDimensionNumbers(builder, false, transpose_rhs);
 
-  auto matmul_op = builder.create<tpu::MatmulOp>(
+  Value matmul = builder.create<tpu::MatmulOp>(
       contraction_op->getLoc(), acc_ty, lhs, rhs, acc,
       /*transpose_lhs=*/false,
       /*transpose_rhs=*/false, precision_attr, dot_dimension_numbers_attr);
-  contraction_op.replaceAllUsesWith(matmul_op.getResult());
+  contraction_op.replaceAllUsesWith(matmul);
   contraction_op.erase();
-  auto result = tpu_matmul_rule(ctx, matmul_op);
-  return result;
+  return matmul;
 }
 
-LogicalResult canonicalize_extract(const CanonicalizeContext &ctx,
-                                   Operation &raw_op) {
+FailureOr<Value> canonicalize_extract(const CanonicalizeContext &ctx,
+                                      Operation &raw_op) {
   auto op = dyn_cast<vector::ExtractOp>(raw_op);
   Type result_ty = op.getResult().getType();
   if (!isa<VectorType>(result_ty)) {
@@ -566,11 +574,11 @@ LogicalResult canonicalize_extract(const CanonicalizeContext &ctx,
           "32-bit type first.");
     }
   }
-  return success();
+  return raw_op.getResult(0);
 }
 
-LogicalResult canonicalize_broadcast(const CanonicalizeContext &ctx,
-                                     Operation &raw_op) {
+FailureOr<Value> canonicalize_broadcast(const CanonicalizeContext &ctx,
+                                        Operation &raw_op) {
   auto op = dyn_cast<vector::BroadcastOp>(raw_op);
   auto src_ty = op.getSource().getType();
   auto src_vty = dyn_cast<VectorType>(src_ty);
@@ -581,7 +589,7 @@ LogicalResult canonicalize_broadcast(const CanonicalizeContext &ctx,
     // directly.
     // Instead, convert i1 to i32 vector, broadcast i32, and then convert it
     // back to i1.
-    ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
+    CanonicalBuilder builder(ctx, op->getLoc(), op.getOperation());
     Value i32_src;
     if (src_vty) {
       i32_src = builder.create<arith::ExtUIOp>(
@@ -598,42 +606,39 @@ LogicalResult canonicalize_broadcast(const CanonicalizeContext &ctx,
         i32_res_vty,
         SplatElementsAttr::get(i32_res_vty,
                                builder.getOneAttr(builder.getI32Type())));
-    auto cmp =
+    Value cmp =
         builder.create<arith::CmpIOp>(arith::CmpIPredicate::eq, bcast, ones);
-    op.replaceAllUsesWith(cmp.getResult());
+    op.replaceAllUsesWith(cmp);
     op.erase();
-    return success();
+    return cmp;
   }
-  return success();
+  return raw_op.getResult(0);
 }
 
-LogicalResult canonicalize_select(const CanonicalizeContext &ctx,
-                                  Operation &raw_op) {
+FailureOr<Value> canonicalize_select(const CanonicalizeContext &ctx,
+                                     Operation &raw_op) {
   auto op = dyn_cast<arith::SelectOp>(raw_op);
   if (!isa<VectorType>(op.getType()) ||
       isa<VectorType>(op.getCondition().getType())) {
-    return success();
+    return raw_op.getResult(0);
   }
   // Canonicalize `i1 ? v1 : v2` -> `broadcast(i1) ? v1 : v2`.
-  ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
+  CanonicalBuilder builder(ctx, op->getLoc(), op.getOperation());
   auto cond_ty = VectorType::get(cast<VectorType>(op.getType()).getShape(),
                                  op.getCondition().getType());
   auto cond = builder.create<vector::BroadcastOp>(cond_ty, op.getCondition());
   auto new_op = builder.create<arith::SelectOp>(
       op.getLoc(), cond, op.getTrueValue(), op.getFalseValue());
-  op.replaceAllUsesWith(new_op.getResult());
+  op.replaceAllUsesWith(new_op);
   op.erase();
-  if (need_elementwise_canonicalization(ctx, *new_op.getOperation())) {
-    return canonicalize_elementwise(ctx, *new_op.getOperation());
-  }
-  return success();
+  return new_op;
 }
 
 // All conversions that change bitwidth must be canonicalized to tpu.fptosi.
-LogicalResult canonicalize_fptosi(const CanonicalizeContext &ctx,
-                                  Operation &raw_op) {
+FailureOr<Value> canonicalize_fptosi(const CanonicalizeContext &ctx,
+                                     Operation &raw_op) {
   auto op = cast<arith::FPToSIOp>(raw_op);
-  ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
+  CanonicalBuilder builder(ctx, op->getLoc(), op.getOperation());
   auto src_vty = dyn_cast<VectorType>(op.getIn().getType());
   auto dst_vty = dyn_cast<VectorType>(op.getType());
   if (static_cast<bool>(src_vty) != static_cast<bool>(dst_vty)) {
@@ -654,12 +659,15 @@ LogicalResult canonicalize_fptosi(const CanonicalizeContext &ctx,
        dst_vty.getElementType().isSignlessInteger(4))) {
     auto new_op = builder.create<tpu::FPToSIOp>(
         op.getType(), op.getIn(), tpu::RoundingMode::kTowardsZero);
-    op.replaceAllUsesWith(new_op.getResult());
+    op.replaceAllUsesWith(new_op);
     op.erase();
-    return success();
+    return new_op;
   }
 
-  if ((src_bitwidth < 32 || dst_bitwidth < 32) && !ctx.compatibility_mode) {
+  if (src_bitwidth == 32 && dst_bitwidth == 32) {
+    return raw_op.getResult(0);
+  }
+  if (!ctx.compatibility_mode) {
     return op.emitOpError(
         "On this target float-to-integer conversions can only happen on "
         "32-bit values. Enable compatibility mode or upcast to float32, cast "
@@ -708,13 +716,13 @@ LogicalResult canonicalize_fptosi(const CanonicalizeContext &ctx,
   }
   op.replaceAllUsesWith(x);
   op.erase();
-  return success();
+  return x;
 }
 
-LogicalResult canonicalize_sitofp(const CanonicalizeContext &ctx,
-                                  Operation &raw_op) {
+FailureOr<Value> canonicalize_sitofp(const CanonicalizeContext &ctx,
+                                     Operation &raw_op) {
   auto op = cast<arith::SIToFPOp>(raw_op);
-  ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
+  CanonicalBuilder builder(ctx, op->getLoc(), op.getOperation());
   auto src_vty = dyn_cast<VectorType>(op.getIn().getType());
   auto dst_vty = dyn_cast<VectorType>(op.getType());
   if (static_cast<bool>(src_vty) != static_cast<bool>(dst_vty)) {
@@ -733,12 +741,15 @@ LogicalResult canonicalize_sitofp(const CanonicalizeContext &ctx,
       dst_vty.getElementType().isBF16()) {
     auto new_op = builder.create<tpu::SIToFPOp>(
         op.getType(), op.getIn(), tpu::RoundingMode::kToNearestEven);
-    op.replaceAllUsesWith(new_op.getResult());
+    op.replaceAllUsesWith(new_op);
     op.erase();
-    return success();
+    return new_op;
   }
 
-  if ((src_bitwidth < 32 || dst_bitwidth < 32) && !ctx.compatibility_mode) {
+  if (src_bitwidth == 32 && dst_bitwidth == 32) {
+    return raw_op.getResult(0);
+  }
+  if (!ctx.compatibility_mode) {
     return op.emitOpError(
         "On this target integer-to-float conversions can only happen on "
         "32-bit values. Enable compatibility mode or upcast to int32, cast to "
@@ -768,11 +779,11 @@ LogicalResult canonicalize_sitofp(const CanonicalizeContext &ctx,
   }
   op.replaceAllUsesWith(x);
   op.erase();
-  return success();
+  return x;
 }
 
-LogicalResult canonicalize_repeat(const CanonicalizeContext &ctx,
-                                  Operation &raw_op) {
+FailureOr<Value> canonicalize_repeat(const CanonicalizeContext &ctx,
+                                     Operation &raw_op) {
   auto op = dyn_cast<tpu::RepeatOp>(raw_op);
   if (!isa<VectorType>(op.getType())) {
     return op.emitOpError("Only vector types supported");
@@ -784,36 +795,54 @@ LogicalResult canonicalize_repeat(const CanonicalizeContext &ctx,
     // flash_attention_backward tests.
     op.replaceAllUsesWith(operand);
     op.erase();
-    return success();
+    return operand;
   }
   auto operands = std::vector<Value>(times, operand);
-  ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
-  auto concat = builder.create<tpu::ConcatenateOp>(op.getLoc(), op.getType(),
-                                                   operands, op.getDimension());
-  op.replaceAllUsesWith(concat.getResult());
+  CanonicalBuilder builder(ctx, op->getLoc(), op.getOperation());
+  auto concat = builder.create<tpu::ConcatenateOp>(op.getType(), operands,
+                                                   op.getDimension());
+  op.replaceAllUsesWith(concat);
   op.erase();
-  return success();
+  return concat;
 }
 
-LogicalResult canonicalize_vector_transpose(const CanonicalizeContext &ctx,
-                                            Operation &raw_op) {
+FailureOr<Value> canonicalize_vector_transpose(const CanonicalizeContext &ctx,
+                                               Operation &raw_op) {
   auto op = cast<vector::TransposeOp>(raw_op);
-  ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
+  CanonicalBuilder builder(ctx, op->getLoc(), op.getOperation());
   auto new_op = builder.create<tpu::TransposeOp>(op.getType(), op.getVector(),
                                                  op.getPermutation());
-  op.replaceAllUsesWith(new_op.getResult());
+  op.replaceAllUsesWith(new_op);
   op.erase();
-  return success();
+  return new_op;
 }
 
-LogicalResult canonicalize_reshape(const CanonicalizeContext &ctx,
-                                   Operation &raw_op) {
+FailureOr<Value> canonicalize_reshape(const CanonicalizeContext &ctx,
+                                      Operation &raw_op) {
   auto op = cast<vector::ShapeCastOp>(raw_op);
-  // We can canonicalize some reshape(load(x)) -> strided load + ALU ops.
   auto src = op.getSource();
   auto src_ty = src.getType();
   auto tgt_ty = op.getType();
-  if (auto load_op = src.getDefiningOp<vector::LoadOp>()) {
+
+  vector::LoadOp load_op;
+  auto cur_traversal_val = src;
+  // This goes back up 5 levels of shape casts, this is because real world cases
+  // can look like load->reshape->reshape.
+  for (int i = 0; i < 5; ++i) {
+    auto defining_op = cur_traversal_val.getDefiningOp();
+    if (!defining_op) break;
+    if (auto load = dyn_cast<vector::LoadOp>(defining_op)) {
+      load_op = load;
+      break;
+    }
+    if (auto shape_cast = dyn_cast<vector::ShapeCastOp>(defining_op)) {
+      cur_traversal_val = shape_cast.getSource();
+    } else {
+      break;
+    }
+  }
+
+  if (load_op) {
     // Pattern match (..., M, N, 128) -> (..., M, N * 128).
     // This reshape can be folded into the load for any dtype and tiling
     // as long as the minormost dim is 128 and N is aligned to packing. The
@@ -837,16 +866,17 @@ LogicalResult canonicalize_reshape(const CanonicalizeContext &ctx,
     // ```
     // TODO(jevinjiang): we can extend this to support folding more dims to last
     // dim not just last 2 dims.
-    auto bitwidth = src_ty.getElementTypeBitWidth();
+    VectorType load_result_ty = load_op.getType();
+
+    auto bitwidth = load_result_ty.getElementTypeBitWidth();
     auto packing = 32 / bitwidth;
     if (packing <= 0) {
       return op.emitOpError("Unsupported bitwidth = ") << bitwidth;
     }
     // Memref bitcast is not supported if HW generation is below 4. We don't
     // return failure because we will rely on vector reshape.
-    if ((ctx.hardware_generation < 4 && packing > 1) ||
-        (ctx.hardware_generation == 4 && packing > 2)) {
-      return success();
+    if (ctx.hardware_generation < 4 && packing > 1) {
+      return raw_op.getResult(0);
     }
     auto ref = load_op.getBase();
     auto indices = load_op.getIndices();
@@ -856,28 +886,28 @@ LogicalResult canonicalize_reshape(const CanonicalizeContext &ctx,
     int ref_rank = ref_shape.size();
     int src_rank = src_shape.size();
     int tgt_rank = tgt_shape.size();
-    if (ref_rank != src_rank) {
+
+    if (ref_rank != load_result_ty.getRank()) {
       return op.emitOpError("Loaded vector rank and memref rank mismatch");
     }
-    // Check the memref's eligibility.
     if (!isContiguousMemref(ref) || ref_rank <= 2 ||
-        // TODO(jevinjiang): add support for partial load on last 2 dims where
-        // last 2 indices are not necessarily 0 or load shape is not full.
+        // TODO(jevinjiang, mvoz): add support for partial load on last 2 dims
+        // where last 2 indices are not necessarily 0 or load shape is not full.
         getIntConst(indices[ref_rank - 1]) != 0 ||
         getIntConst(indices[ref_rank - 2]) != 0 ||
-        ref_shape[ref_rank - 1] != src_shape[src_rank - 1] ||
-        ref_shape[ref_rank - 2] != src_shape[src_rank - 2]) {
-      return success();
+        ref_shape[ref_rank - 1] != load_result_ty.getShape()[ref_rank - 1] ||
+        ref_shape[ref_rank - 2] != load_result_ty.getShape()[ref_rank - 2]) {
+      return raw_op.getResult(0);
     }
-    // Check the reshape's eligibility.
-    if (src_rank != tgt_rank + 1 || src_shape[src_rank - 2] % packing != 0 ||
+
+    if (src_shape[src_rank - 2] % packing != 0 ||
         src_shape[src_rank - 1] != ctx.target_shape[1] ||
         src_shape[src_rank - 2] * src_shape[src_rank - 1] !=
             tgt_shape[tgt_rank - 1]) {
-      return success();
+      return raw_op.getResult(0);
     }
     // At this point, the pattern is matched.
-    ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
+    CanonicalBuilder builder(ctx, op->getLoc(), op.getOperation());
     auto loc = op.getLoc();
     // First, we bitcast and reshape src ref from (..., M, N, 128) to
     // i32(..., M * N / packing, 128).
@@ -890,36 +920,47 @@ LogicalResult canonicalize_reshape(const CanonicalizeContext &ctx,
     auto i32_ref = builder.create<tpu::MemRefBitcastOp>(
         MemRefType::get(bitcast_shape, builder.getI32Type()), ref);
 
-    SmallVector<int64_t> reshape_shape(ref_shape.begin(),
-                                       ref_shape.begin() + tgt_rank);
-    reshape_shape[tgt_rank - 1] = ctx.target_shape[1];
-    reshape_shape[tgt_rank - 2] = ref_shape[ref_rank - 3] * i32_2nd_minor_size;
+    auto i32_ref_shape = cast<MemRefType>(i32_ref.getType()).getShape();
+    SmallVector<int64_t> reshape_shape(i32_ref_shape.begin(),
+                                       i32_ref_shape.begin() + ref_rank - 3);
+    reshape_shape.push_back(i32_ref_shape[ref_rank - 3] * i32_2nd_minor_size);
+    reshape_shape.push_back(i32_ref_shape[ref_rank - 1]);
     auto reshape_ref = builder.create<tpu::MemRefReshapeOp>(
         MemRefType::get(reshape_shape, builder.getI32Type()), i32_ref);
 
-    // We also need to transform the indices while transforming the memref.
-    SmallVector<Value> new_indices(indices.begin(), indices.begin() + tgt_rank);
-    new_indices[tgt_rank - 1] = IdxConst(0, builder, loc);
-    new_indices[tgt_rank - 2] = builder.create<arith::MulIOp>(
-        builder.getIndexType(), indices[ref_rank - 3],
-        IdxConst(i32_2nd_minor_size, builder, loc));
     // Then, we strided load the bitcasted ref by stride (N / packing).
     int stride = i32_2nd_minor_size;
     // Expect to hold src_shape[src_rank - 2] number of chunks which have the
     // shape (..., src_shape[src_rank - 3], 128) and wait to be concatenated
     // along the last dim.
     SmallVector<Value> chunks(src_shape[src_rank - 2]);
-    SmallVector<int64_t> chunk_shape(tgt_shape);
-    chunk_shape[tgt_rank - 1] = ctx.target_shape[1];
-    SmallVector<int32_t> strides(tgt_rank, 1);
-    strides[tgt_rank - 2] = stride;
-    auto tgt_2nd_minor_idx = new_indices[tgt_rank - 2];
+
+    SmallVector<int64_t> chunk_shape(load_result_ty.getShape());
+    chunk_shape.pop_back();
+    chunk_shape.back() = ctx.target_shape[1];
+
+    SmallVector<int32_t> strides(reshape_shape.size(), 1);
+    strides[reshape_shape.size() - 2] = stride;
+    int num_prefix_dims = ref_rank - 3;
+    Value m_idx_base_offset = builder.create<arith::MulIOp>(
+        builder.getIndexType(), indices[num_prefix_dims],
+        IdxConst(stride, builder, loc));
+
+    SmallVector<Value> current_load_indices;
+    for (int j = 0; j < num_prefix_dims; ++j) {
+      current_load_indices.push_back(indices[j]);
+    }
+    // This will be replaced by the collapsed dim idx.
+    current_load_indices.push_back(0);
+    current_load_indices.push_back(IdxConst(0, builder, loc));
     for (int i = 0; i < stride; ++i) {
-      new_indices[tgt_rank - 2] = builder.create<arith::AddIOp>(
-          builder.getIndexType(), tgt_2nd_minor_idx, IdxConst(i, builder, loc));
+      Value collapsed_dim_idx = builder.create<arith::AddIOp>(
+          builder.getIndexType(), m_idx_base_offset, IdxConst(i, builder, loc));
+      current_load_indices[reshape_shape.size() - 2] = collapsed_dim_idx;
+
       auto chunk = builder.create<tpu::StridedLoadOp>(
           VectorType::get(chunk_shape, builder.getI32Type()), reshape_ref,
-          new_indices, strides);
+          current_load_indices, strides);
       for (int j = 0; j < packing; ++j) {
         int idx = i * packing + j;
         chunks[idx] = builder.create<arith::ShRUIOp>(
@@ -927,141 +968,89 @@ LogicalResult canonicalize_reshape(const CanonicalizeContext &ctx,
             I32Const(j * bitwidth, chunk_shape, builder, loc));
       }
     }
-    // Concatenate the chunks along the last dim to get i32(..., M, N * 128).
+
     CHECK_GT(chunks.size(), 0);
-    Value i32_tgt = chunks[0];
+    Value i32_tgt;
     if (chunks.size() > 1) {
+      SmallVector<int64_t> i32_concat_shape(chunk_shape);
+      int concat_dim = chunk_shape.size() - 1;
+      i32_concat_shape[concat_dim] = tgt_shape.back();
+
       i32_tgt = builder.create<tpu::ConcatenateOp>(
-          VectorType::get(tgt_shape, builder.getI32Type()), chunks,
-          /*dimension=*/tgt_rank - 1);
+          VectorType::get(i32_concat_shape, builder.getI32Type()), chunks,
+          concat_dim);
+    } else {
+      i32_tgt = chunks[0];
     }
+
     Value tgt = i32_tgt;
-    // Convert to target dtype.
     if (packing > 1) {
       tgt = builder.create<arith::TruncIOp>(
-          VectorType::get(tgt_shape, builder.getIntegerType(bitwidth)),
+          VectorType::get(cast<VectorType>(i32_tgt.getType()).getShape(),
+                          builder.getIntegerType(bitwidth)),
           i32_tgt);
     }
-    tgt = builder.create<arith::BitcastOp>(tgt_ty, tgt);
+
+    auto intermed_ty = VectorType::get(
+        cast<VectorType>(tgt.getType()).getShape(), tgt_ty.getElementType());
+    tgt = builder.create<arith::BitcastOp>(intermed_ty, tgt);
+
+    if (tgt.getType() != tgt_ty) {
+      tgt = builder.create<vector::ShapeCastOp>(tgt_ty, tgt);
+    }
+
     op.replaceAllUsesWith(tgt);
     op.erase();
+    return tgt;
   }
-  return success();
+  return raw_op.getResult(0);
 }
 
-namespace {
-// TODO(mvoz): We can refactor a lot of other canonicalization rules to use
-// these functions.
-// TODO(mvoz): I think we can eventually do direct conversion to bf16
-// without going through f32?
-Value upcastInt8ToBf16(ImplicitLocOpBuilder &builder, Value input) {
-  auto vty = cast<VectorType>(input.getType());
-  auto shape = vty.getShape();
-  auto int_ty = cast<IntegerType>(vty.getElementType());
-
-  auto i32_vty = VectorType::get(shape, builder.getI32Type());
-  auto val_i32 = int_ty.isUnsigned()
-                     ? builder.create<arith::ExtUIOp>(i32_vty, input)
-                     : builder.create<arith::ExtSIOp>(i32_vty, input);
-
-  auto f32_vty = VectorType::get(shape, builder.getF32Type());
-  auto val_f32 = builder.create<tpu::SIToFPOp>(
-      f32_vty, val_i32->getResult(0), tpu::RoundingMode::kToNearestEven);
-
-  auto bf16_vty = VectorType::get(shape, builder.getBF16Type());
-  return builder.create<arith::TruncFOp>(bf16_vty, val_f32);
-}
-
-Value downcastBf16ToInt8(ImplicitLocOpBuilder &builder, Value input_bf16,
-                         Type target_vty) {
-  auto shape = cast<VectorType>(input_bf16.getType()).getShape();
-
-  auto f32_vty = VectorType::get(shape, builder.getF32Type());
-  auto val_f32 = builder.create<arith::ExtFOp>(f32_vty, input_bf16);
-
-  auto i32_vty = VectorType::get(shape, builder.getI32Type());
-  auto val_i32 = builder.create<arith::FPToSIOp>(i32_vty, val_f32);
-
-  return builder.create<arith::TruncIOp>(target_vty, val_i32);
-}
-
-Value upcastFp8ToBf16(ImplicitLocOpBuilder &builder, Value input) {
-  auto shape = cast<VectorType>(input.getType()).getShape();
-  auto f32_vty = VectorType::get(shape, builder.getF32Type());
-  auto val_f32 = builder.create<arith::ExtFOp>(f32_vty, input);
-  auto bf16_vty = VectorType::get(shape, builder.getBF16Type());
-  return builder.create<arith::TruncFOp>(bf16_vty, val_f32);
-}
-
-Value downcastBf16ToFp8(ImplicitLocOpBuilder &builder, Value input_bf16,
-                        Type target_vty) {
-  auto shape = cast<VectorType>(input_bf16.getType()).getShape();
-  auto f32_vty = VectorType::get(shape, builder.getF32Type());
-  auto val_f32 = builder.create<arith::ExtFOp>(f32_vty, input_bf16);
-  return builder.create<arith::TruncFOp>(target_vty, val_f32);
-}
-}  // namespace
-
-// Note(mvoz): Returns optional to signal no replacement, simplifying downstream
-// .replace() and .erase() calls.
-std::optional<Value> canonicalize_transpose_impl(const CanonicalizeContext &ctx,
-                                                 ImplicitLocOpBuilder &builder,
-                                                 tpu::TransposeOp op) {
-  auto input_ty = dyn_cast<VectorType>(op.getOperand().getType());
-  auto element_type = input_ty.getElementType();
+// TODO(apaszke): Implement canonicalization for extf and truncf and use them
+// directly instead of inlining float ext/trunc into the body.
+FailureOr<Value> canonicalize_transpose(const CanonicalizeContext &ctx,
+                                        Operation &raw_op) {
+  auto op = cast<tpu::TransposeOp>(raw_op);
+  CanonicalBuilder builder(ctx, op->getLoc(), op.getOperation());
+  VectorType input_vty = op.getVector().getType();
+  VectorType output_vty = op.getType();
+  Type element_type = op.getVector().getType().getElementType();
   // TODO(mvoz): Even gen 7 support is spotty on all test targets.
   if (element_type.getIntOrFloatBitWidth() == 8 && ctx.compatibility_mode &&
       ctx.hardware_generation > 3) {
     Value val_bf16;
+    VectorType input_vty_bf16 =
+        VectorType::get(input_vty.getShape(), builder.getBF16Type());
     if (isa<IntegerType>(element_type)) {
-      val_bf16 = upcastInt8ToBf16(builder, op.getOperand());
+      val_bf16 =
+          builder.create<arith::SIToFPOp>(input_vty_bf16, op.getOperand());
     } else {
-      val_bf16 = upcastFp8ToBf16(builder, op.getOperand());
+      auto val_f32 = builder.create<arith::ExtFOp>(
+          VectorType::get(input_vty.getShape(), builder.getF32Type()),
+          op.getOperand());
+      val_bf16 = builder.create<arith::TruncFOp>(input_vty_bf16, val_f32);
     }
 
-    auto original_output_ty = cast<VectorType>(op.getType());
-    auto post_transpose_bf16_vty =
-        VectorType::get(original_output_ty.getShape(), builder.getBF16Type());
+    Value transposed_bf16 = builder.create<tpu::TransposeOp>(
+        VectorType::get(output_vty.getShape(), builder.getBF16Type()), val_bf16,
+        op.getPermutation());
 
-    auto new_t = builder.create<tpu::TransposeOp>(
-        post_transpose_bf16_vty, val_bf16, op.getPermutation());
-
-    Value final_val;
+    Value new_result;
     if (isa<IntegerType>(element_type)) {
-      final_val = downcastBf16ToInt8(builder, new_t.getResult(), op.getType());
+      new_result =
+          builder.create<arith::FPToSIOp>(op.getType(), transposed_bf16);
     } else {
-      final_val = downcastBf16ToFp8(builder, new_t.getResult(), op.getType());
+      auto transposed_f32 = builder.create<arith::ExtFOp>(
+          VectorType::get(output_vty.getShape(), builder.getF32Type()),
+          transposed_bf16);
+      new_result = builder.create<arith::TruncFOp>(output_vty, transposed_f32);
     }
-    return final_val;
-  }
-  return std::nullopt;
-}
-
-Value create_transpose_op(const CanonicalizeContext &ctx,
-                          ImplicitLocOpBuilder &builder, VectorType input_ty,
-                          Value input, ArrayRef<int64_t> permutation) {
-  auto t = builder.create<tpu::TransposeOp>(input_ty, input, permutation);
-  auto new_op_opt = canonicalize_transpose_impl(ctx, builder, t);
-  if (new_op_opt.has_value()) {
-    return new_op_opt.value();
-  }
-  return t;
-}
-
-LogicalResult canonicalize_transpose(const CanonicalizeContext &ctx,
-                                     Operation &raw_op) {
-  auto op = cast<tpu::TransposeOp>(raw_op);
-  auto builder = ImplicitLocOpBuilder(op->getLoc(), op.getOperation());
-  auto new_op_opt = canonicalize_transpose_impl(ctx, builder, op);
-  if (new_op_opt.has_value()) {
-    op.replaceAllUsesWith(new_op_opt.value());
+    op.replaceAllUsesWith(new_result);
     op.erase();
+    return new_result;
   }
-  return success();
+  return raw_op.getResult(0);
 }
-
-using canonicalize_rule_type =
-    std::function<LogicalResult(const CanonicalizeContext &ctx, Operation &op)>;
 
 const llvm::StringMap<canonicalize_rule_type> &rules() {
   static auto rules = new llvm::StringMap<canonicalize_rule_type>{
@@ -1082,7 +1071,6 @@ const llvm::StringMap<canonicalize_rule_type> &rules() {
 }
 
 const llvm::StringMap<int> &bf16_ops_min_supported_versions() {
-  constexpr int kAlwaysUpcast = std::numeric_limits<int>::max();
   static const auto m = new llvm::StringMap<int>{
       {arith::DivFOp::getOperationName(), 4},
       {arith::SelectOp::getOperationName(), 5},
@@ -1092,7 +1080,7 @@ const llvm::StringMap<int> &bf16_ops_min_supported_versions() {
       {arith::SubFOp::getOperationName(), 6},
       {arith::MaximumFOp::getOperationName(), 6},
       {arith::MinimumFOp::getOperationName(), 6},
-      {math::PowFOp::getOperationName(), kAlwaysUpcast},
+      {math::PowFOp::getOperationName(), 6},
       {math::TanhOp::getOperationName(), 6},
       {math::ExpOp::getOperationName(), 6},
       {math::Exp2Op::getOperationName(), 6},

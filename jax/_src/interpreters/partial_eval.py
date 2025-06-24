@@ -49,7 +49,7 @@ from jax._src.tree_util import (PyTreeDef, treedef_tuple, tree_flatten,
 from jax._src.util import (unzip2, safe_zip, safe_map, toposort, split_list,
                            merge_lists, partition_list, OrderedSet,
                            as_hashable_function, weakref_lru_cache, subs_list,
-                           HashableFunction, foreach)
+                           HashableFunction, foreach, cache)
 
 
 map, unsafe_map = safe_map, map
@@ -992,14 +992,16 @@ def partial_eval_jaxpr_nounits(
 def partial_eval_jaxpr_nounits_fwd(
     jaxpr: ClosedJaxpr, unknowns: Sequence[bool],
     instantiate: bool | Sequence[bool],
+    fwd: bool | Sequence[bool] = True,
 ) -> tuple[ClosedJaxpr, ClosedJaxpr, list[bool], list[AbstractValue], list[int | None]]:
   instantiate = tuple(instantiate) if isinstance(instantiate, list) else instantiate
-  return _partial_eval_jaxpr_nounits(jaxpr, tuple(unknowns), instantiate, True)
+  fwd = tuple(fwd) if isinstance(fwd, list) else fwd
+  return _partial_eval_jaxpr_nounits(jaxpr, tuple(unknowns), instantiate, fwd)
 
 @weakref_lru_cache
 def _partial_eval_jaxpr_nounits(
     jaxpr: ClosedJaxpr, in_unknowns: Sequence[bool],
-    instantiate: bool | Sequence[bool], fwd: bool):
+    instantiate: bool | Sequence[bool], fwd: bool | Sequence[bool]):
   f = lu.wrap_init(core.jaxpr_as_fun(jaxpr), debug_info=jaxpr.jaxpr.debug_info)
 
   cell = []
@@ -1013,13 +1015,19 @@ def _partial_eval_jaxpr_nounits(
         f, TraceTag(), jaxpr.jaxpr.debug_info, instantiate).call_wrapped(in_pvals)
     jaxpr_unknown = convert_constvars_jaxpr(jaxpr_unknown_)
     out_unknowns = [not pval.is_known() for pval in out_pvals]
-    if not fwd:
+    if type(fwd) is bool and not fwd:
       residuals_ = iter(residuals)
       residuals = [next(residuals_) if f is None else known_vals_in[f]
                    for f in fwds]
       assert next(residuals_, None) is None
       fwds = [None] * len(fwds)
     else:
+      if type(fwd) is tuple:
+        fwd_ = [f for f, uk in zip(fwd, in_unknowns) if not uk]
+        residuals_, residuals = iter(residuals), []
+        fwds = [residuals.append(next(residuals_)) if f is None else
+                residuals.append(known_vals_in[f]) if not fwd_[f] else
+                f for f in fwds]
       fwds, residuals = _include_consts_in_fwds(jaxpr.consts, fwds, residuals)
     res_avals = [core.get_aval(r) for r in residuals]
     cell.append((out_unknowns, jaxpr_unknown, res_avals, fwds))
@@ -1153,9 +1161,11 @@ def _partial_eval_jaxpr_custom_cached(
         outvars_copy = list[Atom](eqn.outvars)
         offload_eqn = core.JaxprEqn(
             outvars_copy, resvars, device_put_p,
-            dict(devices=[TransferToMemoryKind(policy.dst)
-                          ] * len(outvars_copy), srcs=[None],
-                 copy_semantics=[CopySemantics.COPY]),
+            dict(
+                devices=(TransferToMemoryKind(policy.dst),) * len(outvars_copy),
+                srcs=(None,),
+                copy_semantics=(CopySemantics.COPY,),
+            ),
             set(), source_info_util.new_source_info(),
             JaxprEqnContext(None, False))
         known_eqns.append(offload_eqn)
@@ -1164,9 +1174,11 @@ def _partial_eval_jaxpr_custom_cached(
         residuals.update(resvars)
         reload_eqn = core.JaxprEqn(
             resvars, eqn.outvars, device_put_p,
-            dict(devices=[TransferToMemoryKind(policy.src)
-                          ] * len(resvars), srcs=[None],
-                 copy_semantics=[CopySemantics.COPY]),
+            dict(
+              devices=(TransferToMemoryKind(policy.src),) * len(resvars),
+              srcs=(None,),
+              copy_semantics=(CopySemantics.COPY,)
+            ),
             set(), source_info_util.new_source_info(),
             JaxprEqnContext(None, False))
         staged_eqns.append(reload_eqn)
@@ -1651,6 +1663,8 @@ class DynamicJaxprTracer(core.Tracer):
   def full_lower(self):
     var = self._trace.frame.tracer_to_var.get(id(self))
     if var is None: return self
+    if isinstance(var, Literal):
+      return var.val
     val = self._trace.frame.constvar_to_val.get(var)
     if val is None: return self
     return core.full_lower(val)
@@ -1886,6 +1900,23 @@ def _drop_unused_vars(
   return jaxpr, list(constvals)
 
 
+@cache()
+def _cached_abstract_eval(primitive: core.Primitive, *aval_qdds, **params):
+  return primitive.abstract_eval(*aval_qdds, **params)
+
+
+def _verify_params_are_hashable(
+    primitive: core.Primitive, params: dict[str, Any]) -> None:
+  for k, v in params.items():
+    try:
+      hash(v)
+    except TypeError as e:
+      raise TypeError(
+        "As of JAX v0.7, parameters to jaxpr equations must have __hash__ and "
+        f"__eq__ methods. In a call to primitive {primitive}, the value of "
+        f"parameter {k} was not hashable: {v}") from e
+
+
 class DynamicJaxprTrace(core.Trace):
   __slots__ = ("frame", "tag", "parent_trace")
 
@@ -1998,7 +2029,25 @@ class DynamicJaxprTrace(core.Trace):
   def default_process_primitive(self, primitive, tracers, params,
                                 source_info=None):
     aval_qdds = [t.aval_mutable_qdd for t in tracers]
-    out_avals, effs = primitive.abstract_eval(*aval_qdds, **params)
+    # TODO(mattjj): make custom_lin have hashable params.
+    # TODO(dougalm): add an attribute to primitives to mark primitives with
+    # effectful abstract_eval rules.
+    if (
+        primitive.name == "custom_lin"
+        or config.dynamic_shapes.value
+        or any(
+            isinstance(aval, core.MutableQuasiDynamicData) for aval in aval_qdds
+        )
+    ):
+      out_avals, effs = primitive.abstract_eval(*aval_qdds, **params)
+    else:
+      try:
+        out_avals, effs = _cached_abstract_eval(primitive, *aval_qdds, **params)
+      except Exception as e:
+        # TODO(phawkins): remove this 3 months after the release of JAX v0.7.
+        _verify_params_are_hashable(primitive, params)
+        raise
+
     if isinstance(out_avals, (tuple, list)) != primitive.multiple_results:
       raise ValueError(f"{primitive}.abstract_eval() method should return "
                        f"a tuple or a list iff {primitive}.multiple_results.")

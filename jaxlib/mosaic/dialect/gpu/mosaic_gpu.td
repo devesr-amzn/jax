@@ -157,12 +157,12 @@ def MosaicGPU_TiledLayout : AttrDef<MosaicGPU_Dialect, "TiledLayout", []> {
 
   let parameters = (ins
     "::mlir::ArrayAttr":$tiling,
-    "::mlir::Attribute":$warp_dim,
+    "::mlir::ArrayAttr":$warp_dims,
     "::mlir::ArrayAttr":$lane_dims,
     "int":$vector_dim
   );
   let mnemonic = "TiledLayout";
-  let assemblyFormat = "`<` $tiling `,` `warp_dim` `=` $warp_dim `,` "
+  let assemblyFormat = "`<` $tiling `,` `warp_dims` `=` $warp_dims `,` "
       "`lane_dims` `=` $lane_dims `,` `vector_dim` `=` $vector_dim `>`";
 }
 
@@ -530,6 +530,22 @@ def MosaicGPU_CustomPrimitiveOp : Op<MosaicGPU_Dialect, "custom_primitive", []> 
   let regions = (region AnyRegion:$body);
 
   let hasVerifier = 1;
+}
+
+def MosaicGPU_WithTransformsOp : Op<MosaicGPU_Dialect, "with_transforms",
+    [SameOperandsAndResultType]> {
+  let summary = "A noop that allows manually setting transforms on a memref.";
+  let description = [{
+    This op enforces the provided transforms on the parameter memref.
+  }];
+
+  let arguments = (
+    ins MemRefOf<[AnyType]>:$ref,
+    // Attributes
+    ArrayAttr:$transforms
+  );
+
+  let results = (outs MemRefOf<[AnyType]>);
 }
 
 #endif // THIRD_PARTY_PY_JAX_JAXLIB_MOSAIC_DIALECT_GPU_MOSAIC_GPU_TD_

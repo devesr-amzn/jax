@@ -38,7 +38,6 @@ import numpy as np
 from contextlib import contextmanager
 
 from jax._src import api_util
-from jax._src import deprecations
 from jax._src import linear_util as lu
 from jax._src import stages
 from jax._src.tree_util import (
@@ -148,37 +147,6 @@ config.debug_infs._add_hooks(_update_debug_special_global,
 float0 = dtypes.float0
 
 
-# TODO(jakevdp): remove this for v0.7.0 (~July 2025)
-def _allow_deprecated_jit_signature(f: F) -> F:
-  """Temporary decorator for the jit signature deprecation."""
-  @wraps(f)
-  def wrapped(*args, **kwargs):
-    if len(args) == 1 or deprecations.is_accelerated('jax-jit-positional-args'):
-      # Fast path for typical usage.
-      return f(*args, **kwargs)
-    if 'fun' in kwargs:
-      deprecations.warn(
-        'jax-jit-positional-args',
-        ('jax.jit: passing fun by keyword is deprecated.'
-         ' Pass it by position to silence this warning.'),
-        stacklevel=2
-      )
-      return f(kwargs.pop('fun'), **kwargs)
-    if len(args) > 1:
-      deprecations.warn(
-        'jax-jit-positional-args',
-        ('jax.jit: passing optional arguments by position is deprecated. '
-         ' Pass them by keyword to silence this warning.'),
-        stacklevel=2
-      )
-      sig = inspect.signature(f)
-      kwds = dict(unsafe_zip((p.name for p in sig.parameters.values()), args))
-      return f(kwds.pop('fun'), **kwds, **kwargs)
-    return f(*args, **kwargs)
-  return cast(F, wrapped)
-
-
-@_allow_deprecated_jit_signature
 def jit(
   fun: Callable, /, *,
   in_shardings: Any = sharding_impls.UNSPECIFIED,
@@ -2611,8 +2579,8 @@ def device_put(
     for xf, d in zip(x_flat, device_flat):
       _check_sharding(shaped_abstractify(xf), d)
     out_flat = dispatch.device_put_p.bind(
-        *x_flat, devices=device_flat, srcs=src_flat,
-        copy_semantics=copy_semantics)
+        *x_flat, devices=tuple(device_flat), srcs=tuple(src_flat),
+        copy_semantics=tuple(copy_semantics))
     return tree_unflatten(treedef, out_flat)
 
 
@@ -2836,9 +2804,9 @@ class ShapeDtypeStruct:
           f" `jax.experimental.layout.Format`. Got {sharding} of type"
           f" {type(sharding)}.")
     if (isinstance(sharding, Format) and
-        isinstance(sharding.device_local_layout, AutoLayout)):
+        isinstance(sharding.layout, AutoLayout)):
       raise TypeError(
-          "`DeviceLocalLayout.AUTO` cannot be used in place of a device-local"
+          "`Layout.AUTO` cannot be used in place of a device-local"
           f" layout in a `ShapeDtypeStruct`. Got {sharding}")
     if isinstance(sharding, Format):
       self.sharding = sharding.sharding
@@ -2853,7 +2821,7 @@ class ShapeDtypeStruct:
       self.sharding = NamedSharding(cur_mesh, sharding)
     else:
       self.sharding = sharding
-    self._dll = (sharding.device_local_layout if isinstance(sharding, Format)
+    self._dll = (sharding.layout if isinstance(sharding, Format)
                  else None)
     self.weak_type = weak_type
     if vma is not None and not isinstance(vma, (set, frozenset)):
@@ -2868,8 +2836,6 @@ class ShapeDtypeStruct:
   @property
   def format(self):
     return Format(self._dll, self.sharding)
-
-  layout = format
 
   def __len__(self):
     try:

@@ -69,7 +69,7 @@ from jax._src.sharding_impls import (
     SingleDeviceSharding, PmapSharding, AUTO, UNSPECIFIED, UnspecifiedValue,
     prepare_axis_resources, parse_flatten_op_sharding, canonicalize_sharding,
     flatten_spec, _internal_use_concrete_mesh)
-from jax._src.layout import Format, DeviceLocalLayout, AutoLayout
+from jax._src.layout import Format, Layout, AutoLayout
 from jax._src.state.types import RefEffect
 from jax._src.traceback_util import api_boundary
 from jax._src.tree_util import (
@@ -375,9 +375,9 @@ def _split_layout_and_sharding(entries):
 
   for e in entries_flat:
     if isinstance(e, Format):
-      layouts.append(e.device_local_layout)
+      layouts.append(e.layout)
       shardings.append(e.sharding)
-    elif isinstance(e, (DeviceLocalLayout, AutoLayout)):
+    elif isinstance(e, (Layout, AutoLayout)):
       raise ValueError(
           '`jax.jit` does not accept device-local layouts directly. Create '
           'a `Format` instance wrapping this device-local layout and pass '
@@ -1656,7 +1656,7 @@ def _resolve_in_layouts(args, jit_in_layouts, resolved_in_shardings, in_avals):
     # `dispatch_arg_layout` replaces default layouts with `None` to simplify
     # dispatch and lowering logic downstream.
     if hasattr(arg, 'format'):
-      arg_layout = arg.format.device_local_layout
+      arg_layout = arg.format.layout
       dispatch_arg_layout = (None if pxla.is_default_layout(arg_layout, rs, aval)
                              else arg_layout)
     else:
@@ -1683,11 +1683,11 @@ def _resolve_in_layouts(args, jit_in_layouts, resolved_in_shardings, in_avals):
         extra_msg = ''
         if isinstance(jit_in_l, AutoLayout):
           extra_msg = (
-              ' The layout given to `jax.jit` is `DeviceLocalLayout.AUTO` but'
+              ' The layout given to `jax.jit` is `Layout.AUTO` but'
               ' the corresponding argument passed is a `jax.Array` with a'
               ' concrete layout. Consider passing a `jax.ShapeDtypeStruct`'
               ' instead of `jax.Array` as an argument to the jitted function '
-              ' when using `DeviceLocalLayout.AUTO`.'
+              ' when using `Layout.AUTO`.'
           )
         raise ValueError('Layout passed to jit does not match the layout '
                           'on the respective arg. '
@@ -1695,7 +1695,7 @@ def _resolve_in_layouts(args, jit_in_layouts, resolved_in_shardings, in_avals):
                           f'arg layout: {arg_layout} for '
                           f'arg shape: {core.shaped_abstractify(arg).str_short()}.'
                           f'{extra_msg}')
-      jit_in_l = (None if isinstance(jit_in_l, DeviceLocalLayout) and
+      jit_in_l = (None if isinstance(jit_in_l, Layout) and
                   pxla.is_default_layout(jit_in_l, rs, aval) else jit_in_l)
       resolved_in_layouts.append(jit_in_l)
   return tuple(resolved_in_layouts)
@@ -1705,7 +1705,7 @@ def _resolve_out_layouts(out_layouts, out_shardings, out_avals):
   for out_l, out_s, out_aval in safe_zip(out_layouts, out_shardings, out_avals):
     if out_l is None:
       new_out_layouts.append(None)
-    elif (isinstance(out_l, DeviceLocalLayout) and
+    elif (isinstance(out_l, Layout) and
           pxla.is_default_layout(out_l, out_s, out_aval)):
       new_out_layouts.append(None)
     else:
@@ -2766,7 +2766,7 @@ def with_sharding_constraint(x, shardings):
   # TODO(bartchr): remove `unconstrained_dims` after migrating to Shardy. It's
   # already part of the shardings.
   unconstrained_dims = [get_unconstrained_dims(s)
-                        if isinstance(s, NamedSharding) else {}
+                        if isinstance(s, NamedSharding) else frozenset()
                         for s in shardings_flat]
 
   pjit_check_aval_sharding(
@@ -2821,7 +2821,7 @@ def _sharding_constraint_impl(x, sharding, layout, context_mesh,
     # Run a jit here to raise good errors when device assignment don't match.
     return api.jit(_identity_fn, out_shardings=sharding)(x)
   else:
-    if (hasattr(x, 'format') and x.format.device_local_layout == layout and
+    if (hasattr(x, 'format') and x.format.layout == layout and
         x.sharding.is_equivalent_to(sharding, x.ndim)):
       return x
     return api.jit(_identity_fn, out_shardings=Format(layout, sharding))(x)
@@ -2892,7 +2892,7 @@ def _sharding_constraint_batcher(
       sharding=vmapped_sharding,
       layout=layout,
       context_mesh=context_mesh,
-      unconstrained_dims=unconstrained_dims)
+      unconstrained_dims=frozenset(unconstrained_dims))
   return y, d
 batching.fancy_primitive_batchers[sharding_constraint_p] = _sharding_constraint_batcher
 batching.skippable_batchers[sharding_constraint_p] = lambda _: ()
@@ -2993,7 +2993,7 @@ def reshard(xs, out_shardings):
           'Reshard should only be used with out_shardings which are non-None '
           f'and have a nonempty mesh. Got sharding {s}.'
       )
-    ds = ds.with_spec(ds.spec._normalized_spec_for_aval(x_aval.ndim))  # pytype: disable=attribute-error
+    ds = ds.update(spec=ds.spec._normalized_spec_for_aval(x_aval.ndim))  # pytype: disable=attribute-error
     out_flat.append(reshard_p.bind(x, dst_sharding=ds))
   return tree_unflatten(treedef, out_flat)
 
@@ -3011,6 +3011,9 @@ def _reshard_abstract_eval(aval, dst_sharding):
 reshard_p.def_abstract_eval(_reshard_abstract_eval)
 
 def _reshard_impl(x, dst_sharding):
+  cur_concrete_mesh = mesh_lib.get_concrete_mesh()
+  if cur_concrete_mesh is not None and not cur_concrete_mesh.is_multi_process:
+    return api.device_put(x, dst_sharding.spec)
   return dispatch.apply_primitive(reshard_p, x, dst_sharding=dst_sharding)
 reshard_p.def_impl(_reshard_impl)
 
@@ -3148,10 +3151,10 @@ def with_layout_constraint(x, layouts):
   x_avals_flat = [core.shaped_abstractify(x) for x in x_flat]
   layouts_flat = tuple(flatten_axes("with_layout_constraint layouts", tree,
                                     layouts))
-  if any(not isinstance(l, DeviceLocalLayout) for l in layouts_flat):
+  if any(not isinstance(l, Layout) for l in layouts_flat):
     raise ValueError(
         'layouts passed to `with_layout_constraint` must be of type'
-        f' `DeviceLocalLayout`. Got {[type(l) for l in layouts_flat]}')
+        f' `Layout`. Got {[type(l) for l in layouts_flat]}')
   check_aval_layout_compatibility(
       layouts_flat, x_avals_flat, ("",) * len(layouts_flat),
       "with_layout_constraint arguments")
@@ -3169,7 +3172,7 @@ def _layout_constraint_impl(x, *, layout):
     raise ValueError(
         'with_layout_constraint in eager mode can only be applied to'
         f' jax.Arrays. Got {type(x)}')
-  if x.format.device_local_layout == layout:  # type: ignore
+  if x.format.layout == layout:  # type: ignore
     return x
   return api.jit(_identity_fn, out_shardings=Format(layout, x.sharding))(x)
 layout_constraint_p.def_impl(_layout_constraint_impl)
@@ -3190,8 +3193,8 @@ batching.skippable_batchers[layout_constraint_p] = lambda _: ()
 
 def get_unconstrained_dims(sharding: NamedSharding):
   assert sharding.spec is not None
-  return {i for i, axes in enumerate(sharding.spec)
-          if axes is PartitionSpec.UNCONSTRAINED}
+  return frozenset(i for i, axes in enumerate(sharding.spec)
+                   if axes is PartitionSpec.UNCONSTRAINED)
 
 # -------------------- attrs etc --------------------
 
